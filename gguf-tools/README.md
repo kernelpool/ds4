@@ -119,6 +119,45 @@ gguf-tools/deepseek4-quantize \
 `--compare-tensor` regenerates a single tensor and byte-compares it against the
 template or `--compare-gguf`.  `--threads N` controls routed-expert workers.
 
+## Native MXFP4 Experts
+
+DeepSeek ships the routed experts as MXFP4: 32 weights per block, each an E2M1
+code, sharing one E8M0 power-of-two scale.  That is 4.25 bits per weight.  Every
+other target type has to decode those weights to f32 and re-encode them, which
+both grows the file and adds rounding error.  `mxfp4` avoids the round trip:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --hf <0731 snapshot dir> \
+  --template MODEL.gguf \
+  --experts mxfp4 --attention-proj q8_0 --attention f16 \
+  --shared q8_0 --output q8_0 --embedding f16 --dense f16 \
+  --out DeepSeek-V4-Flash-0731-MXFP4Experts.gguf
+```
+
+GGML's MXFP4 block (type 39) is 17 bytes: the E8M0 byte followed by 16 nibble
+bytes, with byte `j` holding elements `j` and `j+16`.  DeepSeek instead packs
+adjacent pairs and keeps scales in a separate plane.  Both use the same E2M1
+code ordering and the same scale meaning, so conversion is a nibble permutation
+plus a copy of the exponent byte — no value is decoded or rounded.  Verify with:
+
+```sh
+gguf-tools/deepseek4-quantize --self-test-mxfp4
+```
+
+which round-trips every code through both nibble lanes and requires exact
+equality with the reference FP4 dequantizer.
+
+This target only works where the checkpoint already stores FP4, which means the
+routed experts.  Pointing it at any other family fails with a clear error, since
+there is no f32 to MXFP4 encoder.
+
+DS4 runs the result on Metal: `dequantize_mxfp4` and `kernel_mul_mv_mxfp4_f32_impl`
+live in `metal/dense.metal`, with the MoE matvec and matmul instantiated in
+`metal/moe.metal`.  On an M3 Ultra the MXFP4 build of Flash 0731 is half the size
+of the Q8 build and decodes about 8% faster, while carrying DeepSeek's exact
+released weights.  CUDA and ROCm do not have MXFP4 expert kernels yet.
+
 ## Convert A DSpark Support Checkpoint
 
 The DSpark Flash checkpoint is published as Hugging Face safetensors and stores

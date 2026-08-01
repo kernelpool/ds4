@@ -1089,7 +1089,9 @@ static ds4q_type parse_type(const char *raw) {
 }
 
 static bool is_quantizable_target(ds4q_type type) {
-    return type == DS4Q_TYPE_F32 || type == DS4Q_TYPE_F16 || type == DS4Q_TYPE_BF16 || ds4q_can_quantize(type);
+    /* MXFP4 has no f32 encoder; it is only ever repacked from native FP4. */
+    return type == DS4Q_TYPE_F32 || type == DS4Q_TYPE_F16 || type == DS4Q_TYPE_BF16 ||
+           type == DS4Q_TYPE_MXFP4 || ds4q_can_quantize(type);
 }
 
 /* =====
@@ -1122,6 +1124,9 @@ static byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t
         ds4q_f32_to_bf16_row(src, (uint16_t *)out.data, n);
         return out;
     }
+    if (type == DS4Q_TYPE_MXFP4) {
+        die("mxfp4 is only supported for routed experts stored as FP4 in the checkpoint");
+    }
     if (!ds4q_can_quantize(type)) die("unsupported quant target type");
     if (ncols % ds4q_block_size(type) != 0) die("ncols is not divisible by quant block size");
     const int64_t nrows = n / ncols;
@@ -1142,6 +1147,138 @@ static byte_buf f32_to_type(const float *src, int64_t n, ds4q_type type, int64_t
     free(synthetic);
     if (written != out.size) die("ds4q_quantize_chunk wrote unexpected byte count");
     return out;
+}
+
+/* Repack DeepSeek's native FP4 routed-expert weights into GGML MXFP4 blocks.
+ * Both are 32 weights per E8M0 scale with the same E2M1 codes, so nothing is
+ * decoded or rounded; only the packing differs.  Source: weights [out][in/2]
+ * with byte j holding elements 2j and 2j+1, plus a separate scale plane.  GGML:
+ * one 17-byte block, the scale byte then 16 nibble bytes where byte j holds
+ * element j and j+16.  GGML doubles its table and halves the scale to match, so
+ * the exponent byte transfers unchanged. */
+static byte_buf fp4_repack_mxfp4(const st_value *w, const st_value *scale) {
+    if (strcmp(w->dtype, "I8") != 0 || strcmp(scale->dtype, "F8_E8M0") != 0)
+        die("mxfp4 passthrough expects I8 weights with F8_E8M0 scales");
+    if (w->n_dims != 2 || scale->n_dims != 2) die("mxfp4 passthrough expects 2D tensors");
+    const int64_t out_dim = w->shape[0];
+    const int64_t in_dim = w->shape[1] * 2;
+    if (in_dim % 32) die("mxfp4 in_dim is not divisible by 32");
+    const int64_t n_blocks = in_dim / 32;
+    if (scale->shape[0] != out_dim || scale->shape[1] != n_blocks)
+        die("mxfp4 scale shape mismatch");
+    if (w->nbytes < (size_t)out_dim * (size_t)n_blocks * 16) die("short FP4 weight payload");
+    if (scale->nbytes < (size_t)out_dim * (size_t)n_blocks) die("short FP4 scale payload");
+
+    byte_buf out = {0};
+    out.size = (size_t)out_dim * (size_t)n_blocks * 17;
+    out.data = xmalloc(out.size);
+    for (int64_t r = 0; r < out_dim; r++) {
+        for (int64_t b = 0; b < n_blocks; b++) {
+            const size_t blk_index = (size_t)r * (size_t)n_blocks + (size_t)b;
+            const uint8_t *src = w->data + blk_index * 16;
+            uint8_t *blk = out.data + blk_index * 17;
+            blk[0] = scale->data[blk_index];
+            for (int64_t j = 0; j < 16; j++) {
+                const uint8_t lo_byte = src[(size_t)(j >> 1)];
+                const uint8_t hi_byte = src[(size_t)((j + 16) >> 1)];
+                const uint8_t lo = (j & 1) ? (uint8_t)(lo_byte >> 4) : (uint8_t)(lo_byte & 0x0f);
+                const uint8_t hi = ((j + 16) & 1) ? (uint8_t)(hi_byte >> 4)
+                                                  : (uint8_t)(hi_byte & 0x0f);
+                blk[1 + j] = (uint8_t)(lo | (uint8_t)(hi << 4));
+            }
+        }
+    }
+    return out;
+}
+
+/* Decode one MXFP4 code as a GGML reader does: doubled table, halved scale. */
+static float mxfp4_code_to_f32(uint8_t e, uint8_t code) {
+    static const int8_t kvalues[16] = {
+        0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+    };
+    return (float)kvalues[code & 0x0f] * (e8m0_to_f32(e) * 0.5f);
+}
+
+/* Every E2M1 code, in both nibble lanes, must decode to the exact float
+ * dequant_fp4_weight() produces.  Drives fp4_repack_mxfp4() itself. */
+static int self_test_mxfp4(void) {
+    const int64_t out_dim = 3;
+    const int64_t n_blocks = 2;
+    const int64_t in_dim = n_blocks * 32;
+    st_value w = { .dtype = xstrdup("I8"), .n_dims = 2 };
+    w.shape[0] = out_dim;
+    w.shape[1] = in_dim / 2;
+    w.nbytes = (size_t)out_dim * (size_t)n_blocks * 16;
+    w.data = xmalloc(w.nbytes);
+    for (size_t i = 0; i < w.nbytes; i++) {
+        /* Element e gets code (e + block) mod 16, putting all 16 codes in
+         * elements 0..15 and again in 16..31: the two destination lanes. */
+        const size_t j = i % 16;
+        const size_t blk = i / 16;
+        const unsigned lo = (unsigned)((2u * j + blk) & 0x0f);
+        const unsigned hi = (unsigned)((2u * j + 1u + blk) & 0x0f);
+        w.data[i] = (uint8_t)(lo | (hi << 4));
+    }
+    st_value s = { .dtype = xstrdup("F8_E8M0"), .n_dims = 2 };
+    s.shape[0] = out_dim;
+    s.shape[1] = n_blocks;
+    s.nbytes = (size_t)out_dim * (size_t)n_blocks;
+    s.data = xmalloc(s.nbytes);
+    for (size_t i = 0; i < s.nbytes; i++) s.data[i] = (uint8_t)(120 + i * 3);
+
+    int64_t n = 0;
+    float *reference = dequant_fp4_weight(&w, &s, &n);
+    byte_buf packed = fp4_repack_mxfp4(&w, &s);
+
+    int failures = 0;
+    if (n != out_dim * in_dim) { fprintf(stderr, "mxfp4 self-test: bad reference length\n"); failures++; }
+    if (packed.size != (size_t)out_dim * (size_t)n_blocks * 17) {
+        fprintf(stderr, "mxfp4 self-test: packed size %zu, expected %lld\n",
+                packed.size, (long long)(out_dim * n_blocks * 17));
+        failures++;
+    }
+    /* Assert the coverage the success message claims. */
+    uint32_t lo_seen = 0;
+    uint32_t hi_seen = 0;
+    for (int64_t r = 0; r < out_dim && failures < 8; r++) {
+        for (int64_t b = 0; b < n_blocks && failures < 8; b++) {
+            const uint8_t *blk = packed.data + ((size_t)r * (size_t)n_blocks + (size_t)b) * 17;
+            for (int64_t j = 0; j < 16; j++) {
+                const uint8_t lo_code = blk[1 + j] & 0x0f;
+                const uint8_t hi_code = (uint8_t)(blk[1 + j] >> 4);
+                lo_seen |= 1u << lo_code;
+                hi_seen |= 1u << hi_code;
+                const float lo = mxfp4_code_to_f32(blk[0], lo_code);
+                const float hi = mxfp4_code_to_f32(blk[0], hi_code);
+                const float *row = reference + (size_t)r * (size_t)in_dim + (size_t)b * 32;
+                if (memcmp(&lo, &row[j], sizeof(float)) != 0 ||
+                    memcmp(&hi, &row[j + 16], sizeof(float)) != 0)
+                {
+                    fprintf(stderr,
+                            "mxfp4 self-test: mismatch r=%lld b=%lld j=%lld got %g/%g want %g/%g\n",
+                            (long long)r, (long long)b, (long long)j,
+                            (double)lo, (double)hi, (double)row[j], (double)row[j + 16]);
+                    failures++;
+                    break;
+                }
+            }
+        }
+    }
+    /* Codes 0 and 8 are both zero, so a swap between them is unobservable. */
+    if (lo_seen != 0xffffu || hi_seen != 0xffffu) {
+        fprintf(stderr,
+                "mxfp4 self-test: incomplete code coverage, low lane 0x%04x high lane 0x%04x\n",
+                lo_seen, hi_seen);
+        failures++;
+    }
+    free(packed.data);
+    free(reference);
+    st_value_free(&w);
+    st_value_free(&s);
+    if (failures) { printf("mxfp4 self-test: FAIL (%d)\n", failures); return 1; }
+    printf("mxfp4 self-test: OK (%lld weights, all 16 codes verified in both nibble lanes)\n",
+           (long long)(out_dim * in_dim));
+    return 0;
 }
 
 static byte_buf i64_to_i32(const st_value *src) {
@@ -1274,6 +1411,17 @@ static void generate_one_expert(expert_job *j, int xid) {
     if (strcmp(w.dtype, "I8") == 0) {
         st_value s = db_read(j->db, scale_name);
         if (w.n_dims != 2 || w.shape[0] != j->nrows || w.shape[1] * 2 != j->ncols) die("expert shape mismatch");
+        if (j->target == DS4Q_TYPE_MXFP4) {
+            /* Same format on both sides: repack the bits and skip the
+             * dequantize/requantize round trip entirely. */
+            byte_buf packed = fp4_repack_mxfp4(&w, &s);
+            if (packed.size != j->per_expert) die("mxfp4 expert size mismatch");
+            memcpy(j->out->data + (size_t)xid * j->per_expert, packed.data, packed.size);
+            free(packed.data);
+            st_value_free(&s);
+            st_value_free(&w);
+            return;
+        }
         f32 = dequant_fp4_weight(&w, &s, &n);
         st_value_free(&s);
     } else {
@@ -2468,6 +2616,7 @@ static void usage(const char *argv0) {
     printf("  --overwrite            replace --out if it already exists\n");
     printf("  --dry-run              print output plan; DSpark support mode reads shard headers only\n");
     printf("  --dspark-manifest      print DSpark HF->GGUF tensor-name manifest and exit\n");
+    printf("  --self-test-mxfp4      verify the FP4 -> MXFP4 repack is lossless and exit\n");
     printf("  --dspark-support       write a standalone DSpark support GGUF from mtp.* tensors\n");
     printf("  --dspark-block-size N  DSpark draft block size metadata, default 5\n");
     printf("  --dspark-markov-rank N DSpark Markov rank metadata, default 256\n");
@@ -2623,6 +2772,34 @@ static params parse_args(int argc, char **argv) {
             exit(1);
         }
     }
+    /* MXFP4 is legal only for the routed expert families.  Reject here: the
+     * f32 guard fires only after the output file is created. */
+    {
+        const struct { const char *flag; ds4q_type type; } families[] = {
+            { "--attention-proj", p.policy.attention_proj },
+            { "--attention",      p.policy.attention },
+            { "--shared",         p.policy.shared },
+            { "--embedding",      p.policy.embedding },
+            { "--output",         p.policy.output },
+            { "--dense",          p.policy.dense },
+        };
+        for (size_t i = 0; i < sizeof(families) / sizeof(families[0]); i++) {
+            if (families[i].type == DS4Q_TYPE_MXFP4) {
+                fprintf(stderr, "error: %s mxfp4 is not supported; mxfp4 applies only to "
+                                "routed experts, which the checkpoint already stores as FP4\n",
+                        families[i].flag);
+                exit(1);
+            }
+        }
+        for (int i = 0; i < p.policy.n_overrides; i++) {
+            if (p.policy.overrides[i].type == DS4Q_TYPE_MXFP4) {
+                fprintf(stderr, "error: --tensor-type %s=mxfp4 is not supported; mxfp4 applies "
+                                "only to routed experts, which the checkpoint already stores as FP4\n",
+                        p.policy.overrides[i].prefix);
+                exit(1);
+            }
+        }
+    }
     if (!p.hf_dir) die("--hf is required");
     if (p.dspark_manifest && p.dspark_support) die("--dspark-manifest and --dspark-support are mutually exclusive");
     if (p.dspark_manifest) return p;
@@ -2744,6 +2921,10 @@ static void compare_dspark_support_tensor(st_db *db, const dspark_support_plan *
 }
 
 int main(int argc, char **argv) {
+    /* Checked before argument parsing so the self-test needs no --hf. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--self-test-mxfp4") == 0) return self_test_mxfp4();
+    }
     params p = parse_args(argc, argv);
     if (p.dspark_manifest) {
         print_dspark_manifest(p.hf_dir);

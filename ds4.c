@@ -2041,6 +2041,8 @@ static const gguf_type_info gguf_types[] = {
     [28] = {"f64",      1,   8},
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
+    /* One E8M0 scale byte plus 16 packed E2M1 nibbles per 32 weights. */
+    [39] = {"mxfp4",   32,  17},
 };
 
 enum {
@@ -2055,6 +2057,7 @@ enum {
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
+    DS4_TENSOR_MXFP4    = 39,
 };
 
 typedef struct {
@@ -4376,7 +4379,8 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
            type == DS4_TENSOR_Q2_K ||
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q5_K ||
-           type == DS4_TENSOR_Q6_K;
+           type == DS4_TENSOR_Q6_K ||
+           type == DS4_TENSOR_MXFP4;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
@@ -4387,6 +4391,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
     case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
+    case DS4_TENSOR_MXFP4:   return 17;
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
@@ -55633,6 +55638,30 @@ static int ds4_engine_open_internal(ds4_engine **out,
                  load_layer_end,
                  load_output,
                  load_output_optional);
+
+    /* MXFP4 routed experts have kernels on Metal only; reject before any
+     * residency work rather than aborting later in the dispatcher. */
+    if (e->backend != DS4_BACKEND_METAL) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            /* The three routed families are quantized independently. */
+            const ds4_tensor *exps[3] = {
+                e->weights.layer[il].ffn_gate_exps,
+                e->weights.layer[il].ffn_up_exps,
+                e->weights.layer[il].ffn_down_exps,
+            };
+            const ds4_tensor *g = NULL;
+            for (size_t k = 0; k < 3; k++) {
+                if (exps[k] && exps[k]->type == DS4_TENSOR_MXFP4) { g = exps[k]; break; }
+            }
+            if (g) {
+                fprintf(stderr,
+                        "ds4: this model stores routed experts as mxfp4, which currently has "
+                        "expert kernels only on Metal; use --metal, or a q4_K/q8_0/iq2_xxs "
+                        "build of the same checkpoint\n");
+                exit(1);
+            }
+        }
+    }
 
     /* TP always maps one contiguous routed-expert half per rank. Decide
      * immediately after binding so memory guards account only the bytes this

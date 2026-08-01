@@ -42,6 +42,7 @@ enum {
     DS4_METAL_TENSOR_Q6_K    = 14,
     DS4_METAL_TENSOR_Q8_K    = 15,
     DS4_METAL_TENSOR_IQ2_XXS = 16,
+    DS4_METAL_TENSOR_MXFP4   = 39,
 };
 
 @class DS4MetalQ4ExpertTable;
@@ -3625,6 +3626,8 @@ static const char *ds4_gpu_source =
 "#define MIN(x, y) ((x) < (y) ? (x) : (y))\n"
 "#define SWAP(x, y) { auto tmp = (x); (x) = (y); (y) = tmp; }\n"
 "#define QK8_0 32\n"
+"#define QK_MXFP4 32\n"
+"#define N_R0_MXFP4 4\n"
 "#ifndef QK_K\n"
 "#define QK_K 256\n"
 "#endif\n"
@@ -3666,6 +3669,24 @@ static const char *ds4_gpu_source =
 "    int8_t qs[QK_K];\n"
 "    int16_t bsums[QK_K / 16];\n"
 "};\n"
+"\n"
+"// MXFP4: 32 weights per E8M0 exponent byte; byte j holds element j (low\n"
+"// nibble) and j+16 (high).  The table is the E2M1 grid doubled and the block\n"
+"// scale halved to match, which keeps decoding exact.\n"
+"struct block_mxfp4 {\n"
+"    uint8_t e;\n"
+"    uint8_t qs[QK_MXFP4/2];\n"
+"};\n"
+"\n"
+"constant int8_t ds4_kvalues_mxfp4[16] = {\n"
+"    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,\n"
+"};\n"
+"\n"
+"// 2^(e-127) / 2; below e == 2 that is denormal, so build the bits directly.\n"
+"inline float ds4_e8m0_to_f32_half(uint8_t e) {\n"
+"    const uint32_t bits = (e < 2) ? (0x00200000u << e) : ((uint32_t)(e - 1) << 23);\n"
+"    return as_type<float>(bits);\n"
+"}\n"
 "\n"
 "\n";
 
@@ -6788,6 +6809,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
+
 
         error = nil;
         fn = [library newFunctionWithName:@"kernel_mul_mv_id_q4_K_sum6_f32"
@@ -26478,6 +26500,7 @@ static uint32_t ds4_gpu_routed_mv_nr0(uint32_t type) {
     case DS4_METAL_TENSOR_Q8_0:    return 2;
     case DS4_METAL_TENSOR_Q8_K:    return 2;
     case DS4_METAL_TENSOR_Q4_K:    return 2;
+    case DS4_METAL_TENSOR_MXFP4:   return 4;
     case DS4_METAL_TENSOR_Q2_K:
     case DS4_METAL_TENSOR_IQ2_XXS: return 4;
     default:                       return 0;
@@ -26491,6 +26514,7 @@ static const char *ds4_gpu_metal_tensor_type_name(uint32_t type) {
     case DS4_METAL_TENSOR_Q4_K:    return "q4_k";
     case DS4_METAL_TENSOR_Q5_K:    return "q5_k";
     case DS4_METAL_TENSOR_Q6_K:    return "q6_k";
+    case DS4_METAL_TENSOR_MXFP4:   return "mxfp4";
     default:                       return "unknown";
     }
 }
@@ -26570,8 +26594,9 @@ static bool ds4_gpu_stage_profile_enabled_for_layer(const char *flag_env_name,
 }
 
 static NSUInteger ds4_gpu_routed_mv_smem(uint32_t type) {
+    /* MXFP4 reduces with simd_sum per simdgroup, so it needs no scratch. */
     if (type == DS4_METAL_TENSOR_Q8_0) {
-        return 32u * 2u * sizeof(float);
+        return 32u * (NSUInteger)ds4_gpu_routed_mv_nr0(type) * sizeof(float);
     }
     if (type == DS4_METAL_TENSOR_IQ2_XXS) {
         return 256u * sizeof(uint64_t) + 128u * sizeof(uint8_t);
@@ -26580,7 +26605,7 @@ static NSUInteger ds4_gpu_routed_mv_smem(uint32_t type) {
 }
 
 static NSUInteger ds4_gpu_routed_mv_nsg(uint32_t type) {
-    return type == DS4_METAL_TENSOR_Q8_0 ? 4u : 2u;
+    return (type == DS4_METAL_TENSOR_Q8_0 || type == DS4_METAL_TENSOR_MXFP4) ? 4u : 2u;
 }
 
 static bool ds4_gpu_routed_mv_rows_per_group_is_nr0(uint32_t type) {
@@ -26593,6 +26618,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mv_pipeline(uint32_t type) {
         return ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_id_q8_0_f32", 4);
     case DS4_METAL_TENSOR_Q8_K:
         return ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_id_q8_K_f32", 2);
+    case DS4_METAL_TENSOR_MXFP4:
+        return ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_id_mxfp4_f32", 4);
     case DS4_METAL_TENSOR_IQ2_XXS: return g_moe_mul_mv_id_iq2_xxs_pipeline;
     case DS4_METAL_TENSOR_Q2_K:    return g_moe_mul_mv_id_q2_k_pipeline;
     case DS4_METAL_TENSOR_Q4_K:    return g_moe_mul_mv_id_q4_k_pipeline;
@@ -26606,6 +26633,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q8_0_f32", false);
     case DS4_METAL_TENSOR_Q8_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q8_K_f32", false);
+    case DS4_METAL_TENSOR_MXFP4:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_mxfp4_f32", false);
     case DS4_METAL_TENSOR_IQ2_XXS:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f32", false);
     case DS4_METAL_TENSOR_Q2_K:
@@ -26638,6 +26667,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t t
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q8_0_f16", false);
     case DS4_METAL_TENSOR_Q8_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q8_K_f16", false);
+    case DS4_METAL_TENSOR_MXFP4:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_mxfp4_f16", false);
     case DS4_METAL_TENSOR_IQ2_XXS:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f16", false);
     case DS4_METAL_TENSOR_Q2_K:

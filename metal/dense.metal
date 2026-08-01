@@ -210,6 +210,89 @@ kernel void kernel_mul_mv_q8_0_f32_r4(
     kernel_mul_mv_q8_0_f32_impl<4, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+/* MXFP4 matrix-vector multiply.  A lane takes NB bytes and uses both nibbles of
+ * each: byte j holds element j and element j+16, so its activations are two runs
+ * NB apart.  Two lanes cover a block; rows are owned per simdgroup. */
+template<short NR0, typename args_t>
+void kernel_mul_mv_mxfp4_f32_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NL = 2;                     // lanes cooperating on one block
+    constexpr short NB = QK_MXFP4/2/NL;         // weight bytes per lane
+    constexpr short NBLK = NW/NL;               // blocks per simdgroup step
+
+    const int nb = args.ne00/QK_MXFP4;
+
+    const int r0 = (tgpig.x*NSG + sgitg)*NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    device const float * y = (device const float *) (src1 + offset1);
+
+    device const block_mxfp4 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+        ax[row] = (device const block_mxfp4 *) ((device char *) src0 + offset0);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/NL;
+    const short il = tiisg%NL;
+
+    float yl[2*NB];
+
+    device const float * yb = y + ix*QK_MXFP4 + il*NB;
+
+    for (int ib = ix; ib < nb; ib += NBLK) {
+        for (short i = 0; i < NB; ++i) {
+            yl[i]      = yb[i];
+            yl[NB + i] = yb[QK_MXFP4/2 + i];
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            device const uint8_t * qs = ax[row][ib].qs + il*NB;
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NB; ++i) {
+                const uint8_t q = qs[i];
+                sumq += ds4_kvalues_mxfp4[q & 0x0F]*yl[i] +
+                        ds4_kvalues_mxfp4[q >>   4]*yl[NB + i];
+            }
+
+            sumf[row] += sumq*ds4_e8m0_to_f32_half(ax[row][ib].e);
+        }
+
+        yb += NBLK*QK_MXFP4;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    for (short row = 0; row < NR0 && r0 + row < args.ne01; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst_f32[r0 + row] = tot;
+        }
+    }
+
+    (void)shmem;
+}
+
 // Output projection alias used by the optimized host dispatch.
 [[host_name("kernel_mul_mv_q8_0_f32_nr4")]]
 kernel void kernel_mul_mv_q8_0_f32_nr4(
@@ -1045,6 +1128,22 @@ void dequantize_f32(device const float4x4 * src, short il, thread type4x4 & reg)
 template <typename type4x4>
 void dequantize_f16(device const half4x4 * src, short il, thread type4x4 & reg) {
     reg = (type4x4)(*src);
+}
+
+/* il picks the 16-element half: 0 = low nibbles, 1 = high. */
+template <typename type4x4>
+void dequantize_mxfp4(device const block_mxfp4 *xb, short il, thread type4x4 & reg) {
+    device const uint8_t * qs = xb->qs;
+    const float d = ds4_e8m0_to_f32_half(xb->e);
+    const short shift = il*4;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 16; i++) {
+        reg_f[i/4][i%4] = ds4_kvalues_mxfp4[(qs[i] >> shift) & 0x0F] * d;
+    }
+
+    reg = (type4x4) reg_f;
 }
 
 template <typename type4x4>
