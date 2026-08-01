@@ -284,8 +284,19 @@ static ds4_think_mode cli_effective_think_mode(const cli_generation_options *gen
 }
 
 static bool cli_think_max_downgraded(const cli_generation_options *gen) {
-    return gen->think_mode == DS4_THINK_MAX &&
-           cli_effective_think_mode(gen) != DS4_THINK_MAX;
+    return (gen->think_mode == DS4_THINK_MAX ||
+            gen->think_mode == DS4_THINK_HIGH) &&
+           cli_effective_think_mode(gen) != gen->think_mode;
+}
+
+static const char *cli_think_flag_name(ds4_think_mode mode) {
+    switch (mode) {
+    case DS4_THINK_HIGH: return "--think-high";
+    case DS4_THINK_MAX:  return "--think-max";
+    case DS4_THINK_LOW:  return "--think";
+    case DS4_THINK_NONE: return "--nothink";
+    }
+    return "--think";
 }
 
 static void cli_warn_think_max_downgraded(const cli_generation_options *gen, const char *name) {
@@ -1270,8 +1281,9 @@ static char *trim_inplace(char *s) {
 static void print_repl_help(void) {
     puts("Commands:");
     puts("  /help          Show this help.");
-    puts("  /think         Use normal thinking mode.");
-    puts("  /think-max     Use Think Max only when context is at least 393216 tokens.");
+    puts("  /think         Use normal thinking mode (low effort, no prefix).");
+    puts("  /think-high    Use high reasoning effort when context is at least 393216 tokens.");
+    puts("  /think-max     Use max reasoning effort when context is at least 393216 tokens.");
     puts("  /nothink       Disable thinking mode.");
     puts("  /ctx N         Set context size for following prompts.");
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
@@ -1331,6 +1343,7 @@ static void tokens_remove(ds4_tokens *dst, int pos, int n) {
 
 static const char *repl_glm_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
+    case DS4_THINK_LOW:  return "Reasoning Effort: High";
     case DS4_THINK_HIGH: return "Reasoning Effort: High";
     case DS4_THINK_MAX:  return "Reasoning Effort: Max";
     case DS4_THINK_NONE: return NULL;
@@ -1344,8 +1357,8 @@ static void repl_chat_build_think_prefix(ds4_engine *engine,
     if (ds4_engine_is_glm_dsa(engine)) {
         const char *effort = repl_glm_reasoning_effort_text(mode);
         if (effort) ds4_chat_append_message(engine, prefix, "system", effort);
-    } else if (mode == DS4_THINK_MAX) {
-        ds4_chat_append_max_effort_prefix(engine, prefix);
+    } else {
+        ds4_chat_append_effort_prefix(engine, prefix, mode);
     }
 }
 
@@ -1622,17 +1635,19 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
         if (!strcmp(cmd, "/help")) {
             print_repl_help();
         } else if (!strcmp(cmd, "/think")) {
-            cfg->gen.think_mode = DS4_THINK_HIGH;
-            repl_chat_apply_think_prefix(engine, &chat, DS4_THINK_HIGH);
-            puts("Thinking mode: high.");
-        } else if (!strcmp(cmd, "/think-max")) {
-            cfg->gen.think_mode = DS4_THINK_MAX;
-            bool active = ds4_think_mode_for_context(cfg->gen.think_mode,
-                                                     chat.ctx_size) == DS4_THINK_MAX;
-            repl_chat_apply_think_prefix(engine, &chat,
-                                         active ? DS4_THINK_MAX : DS4_THINK_HIGH);
-            cli_warn_think_max_downgraded(&cfg->gen, "/think-max");
-            printf("Thinking mode: %s.\n", active ? "max" : "high (ctx below 393216)");
+            cfg->gen.think_mode = DS4_THINK_LOW;
+            repl_chat_apply_think_prefix(engine, &chat, DS4_THINK_LOW);
+            printf("Thinking mode: %s.\n", ds4_think_mode_name(DS4_THINK_LOW));
+        } else if (!strcmp(cmd, "/think-high") || !strcmp(cmd, "/think-max")) {
+            ds4_think_mode want = !strcmp(cmd, "/think-max") ?
+                                  DS4_THINK_MAX : DS4_THINK_HIGH;
+            cfg->gen.think_mode = want;
+            ds4_think_mode active = ds4_think_mode_for_context(want, chat.ctx_size);
+            repl_chat_apply_think_prefix(engine, &chat, active);
+            cli_warn_think_max_downgraded(&cfg->gen, cmd);
+            printf("Thinking mode: %s%s.\n",
+                   ds4_think_mode_name(active),
+                   active == want ? "" : " (ctx below 393216)");
         } else if (!strcmp(cmd, "/nothink")) {
             cfg->gen.think_mode = DS4_THINK_NONE;
             repl_chat_apply_think_prefix(engine, &chat, DS4_THINK_NONE);
@@ -1771,7 +1786,7 @@ static cli_config parse_options(int argc, char **argv) {
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
             .dump_logprobs_top_k = 20,
-            .think_mode = DS4_THINK_HIGH,
+            .think_mode = DS4_THINK_LOW,
         },
     };
 
@@ -1974,6 +1989,8 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--imatrix-max-tokens")) {
             c.gen.imatrix_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
+            c.gen.think_mode = DS4_THINK_LOW;
+        } else if (!strcmp(arg, "--think-high")) {
             c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
             c.gen.think_mode = DS4_THINK_MAX;
@@ -2177,7 +2194,7 @@ int main(int argc, char **argv) {
                            cfg.gen.ctx_size,
                            ds4_engine_prefill_chunk(engine),
                            cfg.engine.ssd_streaming);
-        cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
+        cli_warn_think_max_downgraded(&cfg.gen, cli_think_flag_name(cfg.gen.think_mode));
     }
     int rc = 0;
     if (cfg.inspect) {

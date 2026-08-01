@@ -87,16 +87,21 @@ for MoE expert parameters and FP8 for most other parameters.
 
 ## Reasoning Modes
 
-The instruct models support three reasoning-effort modes:
+The instruct models support a non-thinking mode plus three reasoning-effort
+levels realized as prompt prefixes:
 
 | Mode | Intended behavior | Output shape |
 |---|---|---|
 | Non-think | Fast, intuitive replies | `</think>` summary |
-| High | Deliberate reasoning for harder tasks | `<think>... </think>` summary |
-| Max | Largest reasoning budget | Special system prompt plus thinking and summary |
+| Low (default) | Ordinary thinking, no effort prefix | `<think>... </think>` summary |
+| High | Deliberate reasoning via Absolute-maximum prefix | prefix + `<think>... </think>` summary |
+| Max | Largest reasoning budget via Beyond-maximum prefix | prefix + `<think>... </think>` summary |
 
-The model card recommends using at least a 384K-token context window for Think
-Max.
+DS4 gates these levels on the allocated context size (`--ctx >= 393216`) as a
+proxy for that budget, since it cannot know the eventual output length.
+
+The model card recommends using at least a 384K-token output budget for the
+`high` and `max` reasoning effort levels.
 
 ## Important Flash Benchmarks
 
@@ -182,9 +187,10 @@ Completed assistant thinking turns are rendered as reasoning content inside
 
 By default, the Python renderer drops earlier assistant reasoning content before
 the last user message. If tools are present on any message, it disables that
-reasoning drop and keeps the full reasoning/tool context. `reasoning_effort=max`
-also prepends a special high-effort instruction prefix before the first rendered
-message in thinking mode.
+reasoning drop and keeps the full reasoning/tool context. `reasoning_effort`
+also prepends a special effort instruction prefix before the first rendered
+message in thinking mode: the 0731 checkpoint defines one prefix for `high` and
+a stronger one for `max`, while its default `low` level prepends nothing.
 
 Tool definitions are passed in OpenAI-compatible function schema form, but the
 model is instructed to emit DSML. A tool call is rendered as a DSML
@@ -219,7 +225,8 @@ For local deployment, it recommends:
 
 - `temperature = 1.0`
 - `top_p = 1.0`
-- At least 384K context for Think Max
+- At least a 384K-token output budget for the `high` and `max` reasoning effort
+  levels; DS4 gates on allocated context (`--ctx >= 393216`) as its proxy
 
 These are deployment recommendations from the model card, not necessarily the
 same settings used for deterministic benchmarking. DS4 keeps `top_p=1.0` but

@@ -204,8 +204,9 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "--min-p F", "Keep tokens scoring at least F times the top token.");
     opt(fp, c, "--seed N", "Sampling seed for reproducible non-greedy runs.");
     para(fp, c, "GLM CLI and agent runs default to temperature 1.0, top-p 0.95, and min-p 0 unless those options are set explicitly.");
-    opt(fp, c, "--think", "Use normal thinking mode.");
-    opt(fp, c, "--think-max", "Use Think Max when context is large enough.");
+    opt(fp, c, "--think", "Use normal thinking mode (low effort, no prefix).");
+    opt(fp, c, "--think-high", "Use high reasoning effort when context is large enough.");
+    opt(fp, c, "--think-max", "Use max reasoning effort when context is large enough.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
     if (full) {
         opt(fp, c, "-sys, --system TEXT", "System prompt. Empty string disables the default where supported.");
@@ -290,7 +291,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
 static void print_cli_commands(FILE *fp, const help_colors *c) {
     title_red(fp, c, "Interactive Commands");
     opt(fp, c, "/help", "Show interactive commands.");
-    opt(fp, c, "/think, /think-max, /nothink", "Switch thinking mode.");
+    opt(fp, c, "/think, /think-high, /think-max, /nothink", "Switch thinking mode.");
     opt(fp, c, "/ctx N", "Restart the interactive session with a new context size.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
     opt(fp, c, "/read FILE", "Read FILE and submit it as the next user message.");
@@ -339,9 +340,10 @@ static void print_server_api(FILE *fp, const help_colors *c) {
 
 static void print_server_thinking(FILE *fp, const help_colors *c) {
     title(fp, c, "Server Thinking Defaults");
-    para(fp, c, "DeepSeek-compatible chat requests default to high-effort thinking.");
-    para(fp, c, "reasoning_effort=max or output_config.effort=max requests Think Max.");
-    para(fp, c, "Think Max requires --ctx >= 393216; smaller contexts use high.");
+    para(fp, c, "DeepSeek-compatible chat requests default to low-effort thinking with no effort prefix.");
+    para(fp, c, "reasoning_effort=high (or OpenAI xhigh) selects the high effort prefix.");
+    para(fp, c, "reasoning_effort=max or output_config.effort=max requests max effort.");
+    para(fp, c, "Both prefixed levels require --ctx >= 393216; smaller contexts use low.");
     para(fp, c, "thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.");
     para(fp, c, "In thinking mode, client sampling knobs are ignored like the official API.");
     fputc('\n', fp);

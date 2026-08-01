@@ -206,6 +206,20 @@ about 5.6 GiB. It is not a standalone model. Download it once:
 ./download_model.sh dspark-support
 ```
 
+The DeepSeek V4 Flash 0731 release ships the same three-stage DSpark module
+inside the main checkpoint instead of as a side release, so its support GGUF
+can be built directly from those weights and needs no separate download:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --hf <0731 snapshot dir> \
+  --dspark-support \
+  --out gguf/DeepSeek-V4-Flash-0731-DSpark-support.gguf
+```
+
+Pair a support GGUF with the checkpoint it was built from; the draft module
+reads hidden states from the main model.
+
 The same support file can be used with the Flash `q2-imatrix`,
 `q2-q4-imatrix`, and `q4-imatrix` models listed above. For now **DeepSeek
 V4 PRO** is not supported. On Metal, the main model may be resident or use
@@ -950,9 +964,9 @@ ds4>
 
 The interactive CLI is a real multi-turn chat. It keeps the rendered chat
 transcript and the live graph KV checkpoint, so each turn extends the previous
-conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
-`/ctx N`, `/read FILE`, and `/quit`. Ctrl+C interrupts the current generation
-and returns to `ds4>`.
+conversation. Useful commands are `/help`, `/think`, `/think-high`,
+`/think-max`, `/nothink`, `/ctx N`, `/read FILE`, and `/quit`. Ctrl+C interrupts
+the current generation and returns to `ds4>`.
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
 answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative
@@ -1190,7 +1204,7 @@ For **Pi**, add a provider to `~/.pi/agent/models.json`:
             "low": "low",
             "medium": "medium",
             "high": "high",
-            "xhigh": "xhigh"
+            "xhigh": "high"
           },
           "input": ["text"],
           "contextWindow": 100000,
@@ -1267,11 +1281,20 @@ the saved prefix instead of processing the whole prompt again.
 
 ## Thinking Modes
 
-DeepSeek V4 Flash has distinct non-thinking, thinking, and Think Max modes.
-The server defaults to thinking mode. `reasoning_effort=max` requests Think
-Max, but it is only applied when the context size is large enough for the model
-card recommendation; smaller contexts fall back to normal thinking. OpenAI
-`reasoning_effort=xhigh` still maps to normal thinking, not Think Max.
+DeepSeek V4 Flash has a non-thinking mode plus three reasoning effort levels.
+Effort is realized purely as a text prefix at the very start of the prompt: the
+default `low` level adds nothing, and `high` / `max` each prepend their own
+paragraph. DS4 exposes them as `--think` / `/think` (low),
+`--think-high` / `/think-high`, and `--think-max` / `/think-max`.
+
+The server defaults to low-effort thinking. `reasoning_effort=high` and
+`reasoning_effort=max` request the two prefixed levels, but only when the
+allocated context is at least 384K, DS4's proxy for the model card's
+recommended output budget; smaller contexts fall back to low. OpenAI
+`xhigh` aliases `high`, and `medium` and `minimal` map to low.
+
+The 0731 checkpoint renamed the preview's `max` prompt to `high` and added a
+stronger `max`, so against preview weights `--think-high` is the old Think Max.
 
 For direct replies, use `thinking: {"type":"disabled"}`, `think:false`, or a
 non-thinking model alias such as `deepseek-chat`.

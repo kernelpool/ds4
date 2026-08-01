@@ -574,7 +574,7 @@ static agent_config parse_options(int argc, char **argv) {
             .temperature = DS4_DEFAULT_TEMPERATURE,
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
-            .think_mode = DS4_THINK_HIGH,
+            .think_mode = DS4_THINK_LOW,
         },
     };
 
@@ -653,6 +653,8 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
+            c.gen.think_mode = DS4_THINK_LOW;
+        } else if (!strcmp(arg, "--think-high")) {
             c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
             c.gen.think_mode = DS4_THINK_MAX;
@@ -4381,9 +4383,9 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     if (agent_tool_syntax_for_engine(w->engine) == AGENT_TOOL_SYNTAX_GLM) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
         if (effort) ds4_chat_append_message(w->engine, out, "system", effort);
-    } else if (w->cfg->gen.think_mode == DS4_THINK_MAX &&
-               think_mode == DS4_THINK_MAX) {
-        ds4_chat_append_max_effort_prefix(w->engine, out);
+    } else if (w->cfg->gen.think_mode == think_mode) {
+        /* Only prefix when the requested level survived the context check. */
+        ds4_chat_append_effort_prefix(w->engine, out, think_mode);
     }
     agent_append_system_prompt(w->engine, out, w->cfg->gen.system);
 }
@@ -6923,6 +6925,8 @@ static void test_agent_glm_template_policy(void) {
         AGENT_TOOL_SYNTAX_GLM));
     AGENT_TEST_ASSERT(agent_tool_syntax_assistant_turn_uses_eos(
         AGENT_TOOL_SYNTAX_DSML));
+    AGENT_TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_LOW),
+                              "Reasoning Effort: High"));
     AGENT_TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_HIGH),
                               "Reasoning Effort: High"));
     AGENT_TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_MAX),

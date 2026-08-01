@@ -22,8 +22,11 @@ typedef enum {
     DS4_BACKEND_CPU,
 } ds4_backend;
 
+/* Reasoning effort levels matching DeepSeek V4 Flash 0731: LOW is ordinary
+ * thinking with no prefix; HIGH and MAX each prepend their own paragraph. */
 typedef enum {
     DS4_THINK_NONE,
+    DS4_THINK_LOW,
     DS4_THINK_HIGH,
     DS4_THINK_MAX,
 } ds4_think_mode;
@@ -250,7 +253,8 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
-const char *ds4_think_max_prefix(void);
+/* Effort prompt prefix for a mode, or NULL when the mode adds no prefix. */
+const char *ds4_think_effort_prefix(ds4_think_mode mode);
 const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode);
 uint32_t ds4_think_max_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
@@ -304,7 +308,8 @@ void ds4_encode_chat_prompt(
         const char *prompt,
         ds4_think_mode think_mode,
         ds4_tokens *out);
-void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens);
+void ds4_chat_append_effort_prefix(ds4_engine *e, ds4_tokens *tokens,
+                                   ds4_think_mode mode);
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content);
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode);
 
