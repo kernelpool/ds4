@@ -216,6 +216,12 @@ int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t
  * after every eval (and after a sync) on the control socket. */
 int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count);
 int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count);
+/* Cooperative teardown: make any in-flight exchange wait loop bail
+ * immediately instead of sitting out the transport timeout.  Called
+ * before joining the gate service thread. */
+void ds4_tp_request_abort(ds4_tp *tp);
+/* --debug-hash interval (0 = disabled). */
+int ds4_tp_debug_hash_every(const ds4_tp *tp);
 
 /* Speculative verify mirroring.  The leader announces a draft block right
  * before both ranks run the expert-split batch verify; the worker then blocks

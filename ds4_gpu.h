@@ -233,9 +233,18 @@ int ds4_gpu_tp_init(uint32_t rank,
                     ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
                     ds4_gpu_tp_exchange_fn fn, void *ud);
 void ds4_gpu_tp_shutdown(void);
+/* Row-gate payload span inside the slab (out-slot base offset, bytes per
+ * slot).  Enables the fast spin-kernel release for row flag gates; without
+ * it (or with DS4_TP_EVENT_RELEASE set) the shared-event release is used. */
+void ds4_gpu_tp_set_row_payload(uint64_t out_off, uint64_t vec_bytes);
+/* Batch-gate payload span (batch out region base, rows per layer); enables
+ * the fast release for verify/session batch gates. */
+void ds4_gpu_tp_set_batch_payload(uint64_t batch_out_off, uint32_t max_rows);
 /* Multi-session TP reuses slab slots across several encoded graph tapes.
- * Shared-event arrival is required in that mode to make each partial vector
- * CPU-visible before the transport thread reads it. */
+ * With the shared-event machinery, event arrival is required in that mode
+ * to make each partial vector CPU-visible before the transport thread
+ * reads it; the fast-release path instead publishes payload and flag
+ * through system-coherent stores and keeps the flag protocol. */
 void ds4_gpu_tp_set_session_batch_mode(int enabled);
 /* The coordinator-only DSpark support model does not participate in TP.
  * Suspend ownership only while encoding it; base-model verification remains

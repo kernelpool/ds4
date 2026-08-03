@@ -24,6 +24,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -39,7 +40,7 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 7u
+#define DS4_TP_PROTOCOL_VERSION 8u
 
 /* Default gate timeout is generous: the first gate after a sync waits for
  * the peer's whole (possibly cold page cache) prefill. */
@@ -75,6 +76,7 @@ typedef struct {
     uint32_t qpn;
     uint32_t psn;
     uint32_t mtu;
+    uint32_t max_msg;   /* largest single message this side will post */
     uint16_t lid;
     uint8_t gid[16];
     uint8_t link_layer;
@@ -118,17 +120,44 @@ typedef struct {
 /* AppleThunderboltRDMA quirks (validated with scratchpad probes,
  * 2026-07-06): only UC queue pairs exist (RC/UD: ENOTSUP); RDMA WRITE work
  * requests are accepted but never execute, so the data plane is two-sided
- * SEND/RECV like Apple's own JACCL; messages above 16KB are not delivered;
- * RTR requires GRH addressing with the IPv4-mapped GID that appears only
- * once the Thunderbolt member interface has an IPv4 address of its own.
+ * SEND/RECV like Apple's own JACCL; messages above 16KB are not delivered
+ * before macOS 26.3 (26.3+ delivers up to 1MiB — measured on 26.5; JACCL
+ * gates its 512KiB frames the same way), and total posted-recv bytes per
+ * QP are bounded to a few MiB; RTR requires GRH addressing with the
+ * IPv4-mapped GID that appears only once the Thunderbolt member interface
+ * has an IPv4 address of its own.
  * UC delivery is in-order and the gate sequence is globally deterministic
  * (86 gates per token, fixed order). After any initial bulk prefill, decode
  * keeps a receive window posted by sequence number: recv for seq s lands in
  * the slab in-slot (s-1) % slots and its completion IS the arrival signal. */
 #define DS4_TP_RDMA_MAX_MSG 16384
+#define DS4_TP_RDMA_MAX_MSG_LARGE 524288
 #define DS4_TP_RDMA_RECV_WINDOW 16
 #define DS4_TP_RDMA_BULK_SLOTS 64
+#define DS4_TP_RDMA_BULK_ROUND_BYTES (2u * 1024u * 1024u)
 #define DS4_TP_RDMA_BULK_WR_TAG (UINT64_C(1) << 63)
+
+/* Largest single message this build will post: 16KB below macOS 26.3, 512KiB
+ * from 26.3 on (peers exchange theirs and use the minimum, so the framing
+ * stays identical on both ends).  DS4_TP_RDMA_MAX_MSG env overrides. */
+static uint32_t tp_rdma_local_max_msg(void) {
+    const char *env = getenv("DS4_TP_RDMA_MAX_MSG");
+    if (env) {
+        long v = atol(env);
+        if (v < DS4_TP_RDMA_MAX_MSG) v = DS4_TP_RDMA_MAX_MSG;
+        if (v > 1048576) v = 1048576;
+        return (uint32_t)v;
+    }
+    char ver[32] = "";
+    size_t len = sizeof(ver);
+    if (sysctlbyname("kern.osproductversion", ver, &len, NULL, 0) == 0) {
+        int major = 0, minor = 0;
+        if (sscanf(ver, "%d.%d", &major, &minor) >= 1 &&
+            (major > 26 || (major == 26 && minor >= 3)))
+            return DS4_TP_RDMA_MAX_MSG_LARGE;
+    }
+    return DS4_TP_RDMA_MAX_MSG;
+}
 
 typedef struct {
     ds4_tp_verbs_api api;
@@ -141,6 +170,7 @@ typedef struct {
     union ibv_gid gid;
     int gid_index;
     uint32_t max_inline;
+    uint32_t max_msg;           /* negotiated single-message ceiling */
     ds4_tp_rdma_info peer;
     uint32_t send_outstanding;  /* signaled sends not yet reaped */
     uint64_t recv_done;         /* highest gate seq whose recv completed */
@@ -178,6 +208,10 @@ struct ds4_tp {
     uint64_t batch_in_off;      /* [layer][row] verify-block peer partials */
     uint64_t timeout_sec;
     atomic_bool failed;
+    /* Cooperative teardown: set by ds4_tp_request_abort so an exchange
+     * wait loop bails immediately instead of sitting out timeout_sec
+     * while the engine tries to join the gate service thread. */
+    atomic_bool abort_requested;
 #ifdef DS4_TP_HAVE_VERBS
     ds4_tp_rdma rdma;
 #endif
@@ -246,6 +280,23 @@ static void tp_socket_tune(int fd) {
     int sz = 4 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+    /* A silent link partition (yanked cable, no FIN) otherwise stalls the
+     * exchange wait loops for the full timeout: tp_peer_closed() only sees
+     * a graceful close.  Aggressive keepalive turns that into a socket
+     * error within ~10 seconds. */
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#ifdef TCP_KEEPALIVE
+    int idle = 5;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
+#endif
+#ifdef TCP_KEEPINTVL
+    int intvl = 2;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+#endif
+#ifdef TCP_KEEPCNT
+    int cnt = 3;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
 }
 
 #ifdef DS4_TP_HAVE_VERBS
@@ -259,6 +310,10 @@ static int tp_peer_closed(const ds4_tp *tp) {
     if (n == 0) return 1;
     if (n > 0) return 0;
     return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+}
+
+static int tp_aborted(const ds4_tp *tp) {
+    return atomic_load_explicit(&tp->abort_requested, memory_order_relaxed);
 }
 #endif
 
@@ -360,7 +415,8 @@ void ds4_tp_usage(FILE *fp) {
         "  --rdma-gid-index <n>        Select the local verbs GID index.\n"
         "  --tensor-parallel-token-prefill\n"
         "                              GLM diagnostic: prefill one token at a time.\n"
-        "  --debug-hash <n>            Cross-check hidden state every n tokens.\n");
+        "  --debug-hash <n>            Log a logits FNV-64 hash every n tokens on each rank\n"
+        "                              (position-keyed; diff the logs across runs/configs).\n");
 }
 
 int ds4_tp_parse_cli_arg(
@@ -720,6 +776,7 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
         return 0;
     }
     r->max_inline = qia.cap.max_inline_data;
+    r->max_msg = DS4_TP_RDMA_MAX_MSG;   /* raised after the info exchange */
 
     pthread_mutex_init(&r->post_lock, NULL);
     return 1;
@@ -743,6 +800,7 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     mine.qpn = r->qp->qp_num;
     mine.psn = (uint32_t)(getpid() ^ (uintptr_t)tp) & 0xffffff;
     mine.mtu = (uint32_t)r->port.active_mtu;
+    mine.max_msg = tp_rdma_local_max_msg();
     mine.lid = r->port.lid;
     memcpy(mine.gid, r->gid.raw, 16);
     mine.link_layer = r->port.link_layer;
@@ -795,18 +853,21 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
         tp_set_err(err, errlen, "tp rdma: modify RTS: %s", strerror(errno));
         return 0;
     }
-    if (tp->vec_bytes > 2ull * DS4_TP_RDMA_MAX_MSG) {
+    r->max_msg = mine.max_msg < r->peer.max_msg ? mine.max_msg
+                                                : r->peer.max_msg;
+    if (r->max_msg < DS4_TP_RDMA_MAX_MSG) r->max_msg = DS4_TP_RDMA_MAX_MSG;
+    if (tp->vec_bytes > 2ull * r->max_msg) {
         tp_set_err(err, errlen,
                    "tp rdma: gate vector %llu bytes exceeds twice the driver's "
                    "%u message limit",
-                   (unsigned long long)tp->vec_bytes, DS4_TP_RDMA_MAX_MSG);
+                   (unsigned long long)tp->vec_bytes, r->max_msg);
         return 0;
     }
-    if (tp->vec_bytes > DS4_TP_RDMA_MAX_MSG) {
+    if (tp->vec_bytes > r->max_msg) {
         fprintf(stderr,
                 "ds4-tp: rdma gate vectors ride as 2 chunked messages "
                 "(%llu bytes > %u limit)\n",
-                (unsigned long long)tp->vec_bytes, DS4_TP_RDMA_MAX_MSG);
+                (unsigned long long)tp->vec_bytes, r->max_msg);
     }
     /* Leave the receive queue empty for an initial bulk prefill.  The first
      * decode gate arms the normal lookahead window after prefill finishes. */
@@ -880,8 +941,8 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq) {
      * wr_id, so the arrival watermark advances when the slot is whole. */
     uint64_t off = 0;
     while (off < tp->vec_bytes) {
-        const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
-            DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
+        const uint64_t len = tp->vec_bytes - off > r->max_msg ?
+            r->max_msg : tp->vec_bytes - off;
         const int last = off + len == tp->vec_bytes;
         struct ibv_sge sge;
         struct ibv_recv_wr wr, *bad = NULL;
@@ -927,8 +988,8 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
         if (ok) r->recv_window_active = true;
     }
     for (uint64_t off = 0; ok && off < tp->vec_bytes; ) {
-        const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
-            DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
+        const uint64_t len = tp->vec_bytes - off > r->max_msg ?
+            r->max_msg : tp->vec_bytes - off;
         struct ibv_sge sge;
         struct ibv_send_wr wr, *bad = NULL;
         memset(&wr, 0, sizeof(wr));
@@ -953,6 +1014,10 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
     uint32_t peer_poll = 0;
     while (ok && r->recv_done < seq) {
         ok = tp_rdma_drain_cq(tp);
+        if (ok && tp_aborted(tp)) {
+            fprintf(stderr, "ds4-tp: RDMA gate wait aborted for teardown\n");
+            ok = 0;
+        }
         if (ok && (peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
             fprintf(stderr, "ds4-tp: peer disconnected during RDMA gate\n");
             ok = 0;
@@ -970,9 +1035,19 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
     return ok;
 }
 
+/* A bulk round posts at most DS4_TP_RDMA_BULK_ROUND_BYTES of receives (the
+ * driver bounds total outstanding recv bytes per QP) and stages through the
+ * batch region, so that region must hold one full round. */
+static uint32_t tp_rdma_bulk_round_chunks(const ds4_tp *tp) {
+    uint32_t chunks = DS4_TP_RDMA_BULK_ROUND_BYTES / tp->rdma.max_msg;
+    if (chunks == 0) chunks = 1;
+    if (chunks > DS4_TP_RDMA_BULK_SLOTS) chunks = DS4_TP_RDMA_BULK_SLOTS;
+    return chunks;
+}
+
 static int tp_rdma_big_gate_capable(const ds4_tp *tp) {
     const uint64_t stage_bytes =
-        (uint64_t)DS4_TP_RDMA_BULK_SLOTS * DS4_TP_RDMA_MAX_MSG;
+        (uint64_t)tp_rdma_bulk_round_chunks(tp) * tp->rdma.max_msg;
     const uint64_t batch_region_bytes =
         (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
     return tp->rdma.qp && tp->rdma.mr && batch_region_bytes >= stage_bytes;
@@ -987,8 +1062,7 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
     if (!r->recv_window_active) return 1;
 
     const uint32_t chunks_per_gate =
-        (uint32_t)((tp->vec_bytes + DS4_TP_RDMA_MAX_MSG - 1u) /
-                   DS4_TP_RDMA_MAX_MSG);
+        (uint32_t)((tp->vec_bytes + r->max_msg - 1u) / r->max_msg);
     const uint32_t nwr = DS4_TP_RDMA_RECV_WINDOW * chunks_per_gate;
     struct ibv_sge sge[DS4_TP_RDMA_RECV_WINDOW * 2u];
     struct ibv_send_wr wr[DS4_TP_RDMA_RECV_WINDOW * 2u];
@@ -997,8 +1071,8 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
     uint32_t wi = 0;
     for (uint32_t gate = 0; gate < DS4_TP_RDMA_RECV_WINDOW; gate++) {
         for (uint64_t off = 0; off < tp->vec_bytes; ) {
-            const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
-                DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
+            const uint64_t len = tp->vec_bytes - off > r->max_msg ?
+                r->max_msg : tp->vec_bytes - off;
             sge[wi] = (struct ibv_sge) {
                 .addr = (uintptr_t)(scratch + off),
                 .length = (uint32_t)len,
@@ -1051,6 +1125,12 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
                 r->send_outstanding--;
             }
         }
+        if (tp_aborted(tp)) {
+            fprintf(stderr,
+                    "ds4-tp: RDMA receive drain aborted for teardown\n");
+            pthread_mutex_unlock(&r->post_lock);
+            return 0;
+        }
         if ((peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
             fprintf(stderr,
                     "ds4-tp: peer disconnected while draining RDMA receives\n");
@@ -1095,23 +1175,23 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         in_lo >= slab_lo && in_lo <= slab_hi && bytes <= slab_hi - in_lo;
     uint8_t *stage_send = tp->slab + tp->batch_out_off;
     uint8_t *stage_recv = tp->slab + tp->batch_in_off;
+    const uint32_t round_chunks = tp_rdma_bulk_round_chunks(tp);
     uint64_t off = 0;
     while (off < bytes) {
         const uint64_t remaining = bytes - off;
-        uint32_t chunks = (uint32_t)((remaining + DS4_TP_RDMA_MAX_MSG - 1u) /
-                                     DS4_TP_RDMA_MAX_MSG);
-        if (chunks > DS4_TP_RDMA_BULK_SLOTS)
-            chunks = DS4_TP_RDMA_BULK_SLOTS;
+        uint32_t chunks = (uint32_t)((remaining + r->max_msg - 1u) /
+                                     r->max_msg);
+        if (chunks > round_chunks)
+            chunks = round_chunks;
 
         uint32_t lens[DS4_TP_RDMA_BULK_SLOTS];
         uint64_t chunk_off[DS4_TP_RDMA_BULK_SLOTS];
         uint64_t round_bytes = 0;
         for (uint32_t i = 0; i < chunks; i++) {
             const uint64_t left = remaining - round_bytes;
-            lens[i] = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ?
-                                 DS4_TP_RDMA_MAX_MSG : left);
+            lens[i] = (uint32_t)(left > r->max_msg ? r->max_msg : left);
             chunk_off[i] = direct ? round_bytes :
-                (uint64_t)i * DS4_TP_RDMA_MAX_MSG;
+                (uint64_t)i * r->max_msg;
             if (!direct) {
                 memcpy(stage_send + chunk_off[i],
                        (const uint8_t *)out + off + round_bytes, lens[i]);
@@ -1194,6 +1274,11 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                 }
                 if (wc[i].opcode & IBV_WC_RECV) recv_done++;
                 else send_done = 1;
+            }
+            if (tp_aborted(tp)) {
+                fprintf(stderr,
+                        "ds4-tp: bulk RDMA gate aborted for teardown\n");
+                return 0;
             }
             if ((peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
                 fprintf(stderr,
@@ -1332,7 +1417,7 @@ int ds4_tp_create(
     int rdma_ok = 0;
 #ifdef DS4_TP_HAVE_VERBS
     if (opt->transport != DS4_TP_TRANSPORT_TCP &&
-        (uint64_t)id->n_embd * sizeof(float) <= 2ull * DS4_TP_RDMA_MAX_MSG)
+        (uint64_t)id->n_embd * sizeof(float) <= 2ull * tp_rdma_local_max_msg())
         rdma_ok = tp_rdma_probe(&tp->rdma.api);
 #endif
 
@@ -1412,6 +1497,15 @@ void ds4_tp_free(ds4_tp *tp) {
 }
 
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
+
+void ds4_tp_request_abort(ds4_tp *tp) {
+    if (tp) atomic_store(&tp->abort_requested, true);
+}
+
+int ds4_tp_debug_hash_every(const ds4_tp *tp) {
+    return tp ? tp->opt.debug_hash : 0;
+}
+
 bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) { return tp->peer_ctx; }
 bool ds4_tp_failed(const ds4_tp *tp) {

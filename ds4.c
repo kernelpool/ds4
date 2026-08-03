@@ -49606,7 +49606,13 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
         if (!gate) continue;
-        return gate->type == DS4_TENSOR_Q4_K ? 4 : 2;
+        switch (gate->type) {
+        case DS4_TENSOR_Q8_0: return 8;
+        case DS4_TENSOR_Q6_K: return 6;
+        case DS4_TENSOR_Q5_K: return 5;
+        case DS4_TENSOR_Q4_K: return 4;
+        default:              return 2;
+        }
     }
     return 0;
 }
@@ -56880,6 +56886,9 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         snprintf(err, errlen, "tp: gate service init failed");
         return 0;
     }
+    ds4_gpu_tp_set_row_payload(ds4_tp_slab_out_offset(tp, 0, 0), vec_bytes);
+    ds4_gpu_tp_set_batch_payload(ds4_tp_slab_batch_out_offset(tp, 0),
+                                 DS4_TP_BATCH_MAX_ROWS);
     ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
     /* GLM keeps its replicated output head unsplit in v0: the
@@ -56905,6 +56914,10 @@ void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
     if (e->tp.active) {
+        /* Unblock any exchange the service thread is waiting in before
+         * joining it; otherwise a dead peer holds teardown for the full
+         * transport timeout. */
+        ds4_tp_request_abort(e->tp.ctx);
         ds4_gpu_tp_shutdown();
         const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
         for (uint32_t i = 0; i < slots; i++) {
@@ -60234,6 +60247,36 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
                 snprintf(err, errlen, "tp: logits half send failed");
                 return 1;
             }
+        }
+    }
+    /* --debug-hash N: log an FNV-64 of the logits every N positions.
+     * Rank 0 hashes the merged full vector (covering both ranks'
+     * compute and the transport); rank 1 hashes the half it produced.
+     * The streams are position-keyed, so two runs (fast vs event
+     * release, or before/after a change) can be diffed directly. */
+    if (rc == 0 && s->engine && s->engine->tp.active) {
+        const int every = ds4_tp_debug_hash_every(s->engine->tp.ctx);
+        const uint32_t pos = (uint32_t)s->checkpoint.len;
+        /* Rank 1 only has logits when the head is vocab-split (GLM keeps
+         * the replicated head on the leader). */
+        if (every > 0 && pos > 0 && pos % (uint32_t)every == 0u &&
+            (s->engine->tp.rank == 0 || s->engine->tp.vocab_split)) {
+            const int full = s->engine->tp.rank == 0;
+            const uint32_t n = s->engine->tp.vocab_split && !full ?
+                (uint32_t)DS4_N_VOCAB / 2u : (uint32_t)DS4_N_VOCAB;
+            const float *base = s->engine->tp.vocab_split && !full ?
+                s->logits + (uint32_t)DS4_N_VOCAB / 2u : s->logits;
+            const uint8_t *bytes = (const uint8_t *)base;
+            uint64_t h = 0xcbf29ce484222325ull;
+            for (size_t i = 0; i < (size_t)n * sizeof(float); i++) {
+                h ^= bytes[i];
+                h *= 0x100000001b3ull;
+            }
+            ds4_log(stderr, DS4_LOG_DEFAULT,
+                    "ds4-tp: debug-hash pos=%u rank=%d %s=%016llx",
+                    pos, s->engine->tp.rank,
+                    full ? "logits" : "logits-half",
+                    (unsigned long long)h);
         }
     }
     return rc;
