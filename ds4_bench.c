@@ -2,6 +2,7 @@
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
+#include "ds4_tp.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -51,6 +52,7 @@ typedef struct {
     double step_mul;
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
+    ds4_tp_options tp;
     bool warm_weights;
     bool quality;
     bool ssd_streaming;
@@ -234,6 +236,22 @@ static bench_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse = ds4_tp_parse_cli_arg(arg,
+                                                                &i,
+                                                                argc,
+                                                                argv,
+                                                                &c.tp,
+                                                                tp_parse_err,
+                                                                sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-bench: %s\n",
+                    tp_parse_err[0] ? tp_parse_err : "invalid tensor-parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--prompt-file")) {
@@ -360,14 +378,18 @@ static bench_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
         exit(2);
     }
-    char dist_err[256];
-    if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
-        fprintf(stderr, "ds4-bench: %s\n", dist_err);
-        exit(2);
-    }
-    if (c.dist.role == DS4_DISTRIBUTED_WORKER) {
-        fprintf(stderr, "ds4-bench: --role worker is a serving mode; start workers with ./ds4\n");
-        exit(2);
+    /* Under --tensor-parallel the --role/--listen flags belong to the TP
+     * adopt step in main, not the layer-sharding validator. */
+    if (!c.tp.requested) {
+        char dist_err[256];
+        if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
+            fprintf(stderr, "ds4-bench: %s\n", dist_err);
+            exit(2);
+        }
+        if (c.dist.role == DS4_DISTRIBUTED_WORKER) {
+            fprintf(stderr, "ds4-bench: --role worker is a serving mode; start workers with ./ds4\n");
+            exit(2);
+        }
     }
     return c;
 }
@@ -554,6 +576,18 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
 
+    char tp_adopt_err[256];
+    if (!ds4_tp_adopt_distributed_options(&cfg.tp, &cfg.dist,
+                                          tp_adopt_err, sizeof(tp_adopt_err))) {
+        fprintf(stderr, "ds4-bench: %s\n", tp_adopt_err);
+        return 2;
+    }
+    if (cfg.tp.role == DS4_TP_WORKER) {
+        fprintf(stderr,
+                "ds4-bench: run the plain ds4 binary as the tensor-parallel worker\n");
+        return 2;
+    }
+
     /* Hint the packer at the largest ctx this bench run will exercise
      * so per-layer KV bytes are priced for the real session size, not
      * a stale 4096 default. Single-tier and CPU paths ignore this. */
@@ -589,6 +623,7 @@ int main(int argc, char **argv) {
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
         .cuda_tensor_parallel = cfg.cuda_tensor_parallel,
+        .tp = cfg.tp,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
@@ -598,6 +633,11 @@ int main(int argc, char **argv) {
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-bench: %s\n", dist_err);
+        return 2;
+    }
+    char tp_err[256];
+    if (!ds4_tp_validate_engine_options(&opt, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-bench: %s\n", tp_err);
         return 2;
     }
     ds4_engine *engine = NULL;
@@ -621,6 +661,30 @@ int main(int argc, char **argv) {
                        ds4_engine_prefill_chunk(engine),
                        cfg.ssd_streaming);
 
+    ds4_tp *tp_leader = NULL;
+    if (opt.tp.role == DS4_TP_LEADER) {
+        ds4_tp_identity tp_id = {
+            .gguf_bytes = ds4_engine_model_bytes(engine),
+            .model_id = (uint32_t)ds4_engine_model_id(engine),
+            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
+            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
+            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
+            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+            .ctx_size = (uint32_t)placement_ctx_hint,
+        };
+        ds4_engine_tp_gate_schedule(engine,
+                                    &tp_id.gate_slot_start,
+                                    &tp_id.gate_slot_step,
+                                    &tp_id.gates_per_token);
+        if (!ds4_tp_create(&tp_leader, &opt.tp, &tp_id, tp_err, sizeof(tp_err)) ||
+            !ds4_engine_tp_bind(engine, tp_leader, tp_err, sizeof(tp_err))) {
+            fprintf(stderr, "ds4-bench: %s\n", tp_err);
+            ds4_tp_free(tp_leader);
+            ds4_engine_close(engine);
+            return 1;
+        }
+    }
+
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};
     if (cfg.chat_prompt_path) {
@@ -636,7 +700,9 @@ int main(int argc, char **argv) {
                 prompt.len,
                 cfg.ctx_max);
         ds4_tokens_free(&prompt);
+        if (tp_leader) ds4_tp_send_stop(tp_leader);
         ds4_engine_close(engine);
+        ds4_tp_free(tp_leader);
         return 1;
     }
 
@@ -644,7 +710,9 @@ int main(int argc, char **argv) {
     if (ds4_session_create(&session, engine, cfg.ctx_alloc) != 0) {
         fprintf(stderr, "ds4-bench: failed to create session\n");
         ds4_tokens_free(&prompt);
+        if (tp_leader) ds4_tp_send_stop(tp_leader);
         ds4_engine_close(engine);
+        ds4_tp_free(tp_leader);
         return 1;
     }
     if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
@@ -664,7 +732,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ds4-bench: failed to open %s: %s\n", cfg.csv_path, strerror(errno));
             ds4_session_free(session);
             ds4_tokens_free(&prompt);
+            if (tp_leader) ds4_tp_send_stop(tp_leader);
             ds4_engine_close(engine);
+            ds4_tp_free(tp_leader);
             return 1;
         }
     }
@@ -672,7 +742,8 @@ int main(int argc, char **argv) {
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
-    const bool distributed = cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR;
+    const bool distributed = cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR ||
+                             tp_leader != NULL;
     ds4_session_snapshot snap = {0};
     const uint64_t snapshot_max_bytes = bench_snapshot_max_bytes();
     bool warned_large_snapshot = false;
@@ -817,6 +888,8 @@ int main(int argc, char **argv) {
     ds4_session_snapshot_free(&snap);
     ds4_session_free(session);
     ds4_tokens_free(&prompt);
+    if (tp_leader) ds4_tp_send_stop(tp_leader);
     ds4_engine_close(engine);
+    ds4_tp_free(tp_leader);
     return rc;
 }
