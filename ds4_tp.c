@@ -1123,10 +1123,12 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
     }
 
     uint32_t recv_done = 0;
-    int send_done = 0;
+    uint32_t send_done = 0;
     const double deadline = tp_now_sec() + (double)tp->timeout_sec;
     uint32_t peer_poll = 0;
-    while (recv_done < nwr || !send_done) {
+    /* Every send completes whether or not it asked to, so count them:
+     * releasing early leaves in-flight sends reading the scratch. */
+    while (recv_done < nwr || send_done < nwr) {
         struct ibv_wc wc[DS4_TP_RDMA_RECV_WINDOW * 2u + 1u];
         int n = ibv_poll_cq(r->cq,
                            (int)(DS4_TP_RDMA_RECV_WINDOW * 2u + 1u), wc);
@@ -1144,7 +1146,7 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
             if (wc[i].opcode & IBV_WC_RECV) {
                 recv_done++;
             } else if (wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) {
-                send_done = 1;
+                send_done++;
             } else if (r->send_outstanding > 0) {
                 r->send_outstanding--;
             }
@@ -1270,10 +1272,10 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         }
 
         uint32_t recv_done = 0;
-        int send_done = 0;
+        uint32_t send_done = 0;
         const double deadline = tp_now_sec() + (double)tp->timeout_sec;
         uint32_t peer_poll = 0;
-        while (recv_done < chunks || !send_done) {
+        while (recv_done < chunks || send_done < chunks) {
             struct ibv_wc wc[DS4_TP_RDMA_BULK_SLOTS + 1u];
             int n = ibv_poll_cq(r->cq,
                                (int)(DS4_TP_RDMA_BULK_SLOTS + 1u), wc);
@@ -1297,7 +1299,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                     continue;
                 }
                 if (wc[i].opcode & IBV_WC_RECV) recv_done++;
-                else send_done = 1;
+                else send_done++;
             }
             if (tp_aborted(tp)) {
                 fprintf(stderr,
@@ -1312,8 +1314,8 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             if (tp_now_sec() > deadline) {
                 fprintf(stderr,
                         "ds4-tp: timeout waiting for bulk RDMA round "
-                        "(%u/%u recvs, send=%d)\n",
-                        recv_done, chunks, send_done);
+                        "(%u/%u recvs, %u/%u sends)\n",
+                        recv_done, chunks, send_done, chunks);
                 return 0;
             }
         }
