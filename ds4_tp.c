@@ -235,7 +235,30 @@ static void tp_set_err(char *err, size_t errlen, const char *fmt, ...) {
     va_end(ap);
 }
 
+/* Gate diagnostics sit on the per-gate path, so their env lookups are
+ * resolved once rather than per call. */
+static int tp_trace_flag(const char *name, int *cache) {
+    if (*cache < 0) *cache = getenv(name) != NULL;
+    return *cache;
+}
+static int tp_big_trace(void) {
+    static int c = -1;
+    return tp_trace_flag("DS4_TP_BIG_TRACE", &c);
+}
+
+/* DS4_TP_DATA_TRACE: running byte ledger per control/data socket. */
+static uint64_t tp_io_tot[2][64];
+static void tp_io_trace(int fd, int wr, size_t len) {
+    static int c = -1;
+    if (!tp_trace_flag("DS4_TP_DATA_TRACE", &c) || fd < 0 || fd >= 64) return;
+    tp_io_tot[wr][fd] += len;
+    fprintf(stderr, "ds4-tp: io %c fd=%d n=%zu tot=%llu\n",
+            wr ? 'W' : 'R', fd, len,
+            (unsigned long long)tp_io_tot[wr][fd]);
+}
+
 static int tp_write_full(int fd, const void *buf, size_t len) {
+    tp_io_trace(fd, 1, len);
     const char *p = buf;
     while (len) {
 #ifdef MSG_NOSIGNAL
@@ -255,6 +278,7 @@ static int tp_write_full(int fd, const void *buf, size_t len) {
 }
 
 static int tp_read_full(int fd, void *buf, size_t len) {
+    tp_io_trace(fd, 0, len);
     char *p = buf;
     while (len) {
         ssize_t r = read(fd, p, len);
@@ -1569,6 +1593,11 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                                uint64_t seq) {
     if (tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
     const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
+    if (tp_big_trace()) {
+        fprintf(stderr, "ds4-tp: batch gate l=%u rows=%u seq=%llu bytes=%llu\n",
+                layer, rows, (unsigned long long)seq,
+                (unsigned long long)bytes);
+    }
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
                              (uint16_t)rows, seq };
 #ifdef DS4_TP_HAVE_VERBS
@@ -1639,6 +1668,11 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
+    if (tp_big_trace()) {
+        fprintf(stderr, "ds4-tp: big gate l=%u seq=%llu bytes=%llu t=%.3f\n",
+                layer, (unsigned long long)seq, (unsigned long long)bytes,
+                tp_now_sec());
+    }
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
     ds4_tp_gate_header ph;

@@ -8517,6 +8517,7 @@ static void *ds4_gpu_tp_keepalive_thread(void *arg) {
 static void *ds4_gpu_tp_service_thread(void *arg) {
     (void)arg;
     const bool profile = getenv("DS4_TP_GATE_PROFILE") != NULL;
+    const bool trace2 = getenv("DS4_TP_GATE_TRACE2") != NULL;
     while (1) {
         pthread_mutex_lock(&g_tp_mutex);
         while (g_tp_queue_count == 0 && !g_tp_shutdown)
@@ -8601,6 +8602,15 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
         } else {
             g_tp_cpu_event.signaledValue = req.seq;
         }
+        if (trace2) {
+            const double t2 = ds4_gpu_now_ms();
+            fprintf(stderr,
+                    "ds4: gate2 l=%u g=%u seq=%llu rows=%u big=%llu ok=%d "
+                    "arrive=%.1f exch=%.1f t=%.3f\n",
+                    req.layer, req.gate, (unsigned long long)req.seq,
+                    req.rows, (unsigned long long)req.big_bytes, ok,
+                    t1 - t0, t2 - t1, t2 / 1000.0);
+        }
         if (profile) {
             g_tp_stat_gpu_wait_ms += t1 - t0;
             g_tp_stat_exchange_ms += ds4_gpu_now_ms() - t1;
@@ -8611,6 +8621,16 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
              * release store. */
             if (req.fast_release && g_tp_release_ptr)
                 g_tp_stat_spin_iters += g_tp_release_ptr[req.rows > 0 ? 4 : 1];
+            /* Windowed per-parity split (gate 0 = ATTN, 1 = FFN): resets
+             * every print so cold-start/prefill costs cannot pollute the
+             * steady-state read the way the cumulative averages do. */
+            static double win_wait[2], win_exch[2];
+            static uint64_t win_n[2];
+            if (req.rows == 0 && req.big_bytes == 0 && req.gate < 2) {
+                win_wait[req.gate] += t1 - t0;
+                win_exch[req.gate] += ds4_gpu_now_ms() - t1;
+                win_n[req.gate]++;
+            }
             if (++g_tp_stat_gates % 860 == 0) {
                 fprintf(stderr,
                         "ds4: TP gates %llu: avg gpu-wait %.1f us, avg exchange %.1f us, avg spin-iters %.0f\n",
@@ -8618,6 +8638,19 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                         g_tp_stat_gpu_wait_ms / (double)g_tp_stat_gates * 1000.0,
                         g_tp_stat_exchange_ms / (double)g_tp_stat_gates * 1000.0,
                         (double)g_tp_stat_spin_iters / (double)g_tp_stat_gates);
+                if (win_n[0] && win_n[1]) {
+                    fprintf(stderr,
+                            "ds4: TP window: ATTN wait %.1f exch %.1f us (n=%llu) | FFN wait %.1f exch %.1f us (n=%llu)\n",
+                            win_wait[0] / (double)win_n[0] * 1000.0,
+                            win_exch[0] / (double)win_n[0] * 1000.0,
+                            (unsigned long long)win_n[0],
+                            win_wait[1] / (double)win_n[1] * 1000.0,
+                            win_exch[1] / (double)win_n[1] * 1000.0,
+                            (unsigned long long)win_n[1]);
+                }
+                win_wait[0] = win_wait[1] = 0.0;
+                win_exch[0] = win_exch[1] = 0.0;
+                win_n[0] = win_n[1] = 0;
             }
         }
     }
