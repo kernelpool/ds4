@@ -61367,6 +61367,8 @@ static int ds4_session_eval_dspark_speculative_argmax(
                 s->dspark_stats.verifier_fused_head++;
             }
         }
+        /* A timed-out gate spin leaves the verifier tops stale. */
+        if (ok && ds4_gpu_tp_failed()) ok = false;
     }
 
     int commit_drafts = 0;
@@ -61665,6 +61667,7 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                                              draft_n > 1 ? row_tops : NULL,
                                              NULL,
                                              NULL);
+    if (ok && ds4_gpu_tp_failed()) ok = false;
     int32_t full_accept = 0, replay_n = 0;
     if (!ds4_tp_recv_verify_commit(e->tp.ctx, &full_accept, &replay_n)) {
         spec_frontier_free(&frontier);
