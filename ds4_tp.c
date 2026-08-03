@@ -118,12 +118,10 @@ typedef struct {
 } ds4_tp_verbs_api;
 
 /* AppleThunderboltRDMA quirks (validated with scratchpad probes,
- * 2026-07-06): only UC queue pairs exist (RC/UD: ENOTSUP); RDMA WRITE work
- * requests are accepted but never execute, so the data plane is two-sided
- * SEND/RECV like Apple's own JACCL; messages above 16KB are not delivered
- * before macOS 26.3 (26.3+ delivers up to 1MiB — measured on 26.5; JACCL
- * gates its 512KiB frames the same way), and total posted-recv bytes per
- * QP are bounded to a few MiB; RTR requires GRH addressing with the
+ * 2026-07-06): only UC queue pairs exist (RC/UD: ENOTSUP); wr->opcode is
+ * never read, so every work request goes out as a two-sided SEND like
+ * Apple's own JACCL; messages above 16KB are not delivered before macOS
+ * 26.3 (26.3+ delivers up to 1MiB); RTR requires GRH addressing with the
  * IPv4-mapped GID that appears only once the Thunderbolt member interface
  * has an IPv4 address of its own.
  * UC delivery is in-order and the gate sequence is globally deterministic
@@ -208,9 +206,8 @@ struct ds4_tp {
     uint64_t batch_in_off;      /* [layer][row] verify-block peer partials */
     uint64_t timeout_sec;
     atomic_bool failed;
-    /* Cooperative teardown: set by ds4_tp_request_abort so an exchange
-     * wait loop bails immediately instead of sitting out timeout_sec
-     * while the engine tries to join the gate service thread. */
+    /* Set by ds4_tp_request_abort: bail wait loops, don't sit out
+     * timeout_sec while the engine joins the service thread. */
     atomic_bool abort_requested;
 #ifdef DS4_TP_HAVE_VERBS
     ds4_tp_rdma rdma;
@@ -304,10 +301,8 @@ static void tp_socket_tune(int fd) {
     int sz = 4 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
-    /* A silent link partition (yanked cable, no FIN) otherwise stalls the
-     * exchange wait loops for the full timeout: tp_peer_closed() only sees
-     * a graceful close.  Aggressive keepalive turns that into a socket
-     * error within ~10 seconds. */
+    /* tp_peer_closed() only sees a graceful close, so a silent partition
+     * would stall the wait loops for the full timeout without this. */
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
 #ifdef TCP_KEEPALIVE
     int idle = 5;
@@ -1059,9 +1054,9 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
     return ok;
 }
 
-/* A bulk round posts at most DS4_TP_RDMA_BULK_ROUND_BYTES of receives (the
- * driver bounds total outstanding recv bytes per QP) and stages through the
- * batch region, so that region must hold one full round. */
+/* A bulk round posts at most DS4_TP_RDMA_BULK_ROUND_BYTES of receives (one
+ * 1023-frame ring bounds outstanding recvs, sends and max message) and
+ * stages through the batch region, so that region must hold one round. */
 static uint32_t tp_rdma_bulk_round_chunks(const ds4_tp *tp) {
     uint32_t chunks = DS4_TP_RDMA_BULK_ROUND_BYTES / tp->rdma.max_msg;
     if (chunks == 0) chunks = 1;

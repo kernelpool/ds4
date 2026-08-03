@@ -60249,11 +60249,9 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
             }
         }
     }
-    /* --debug-hash N: log an FNV-64 of the logits every N positions.
-     * Rank 0 hashes the merged full vector (covering both ranks'
-     * compute and the transport); rank 1 hashes the half it produced.
-     * The streams are position-keyed, so two runs (fast vs event
-     * release, or before/after a change) can be diffed directly. */
+    /* --debug-hash N: FNV-64 of the logits every N positions.  Rank 0
+     * hashes the merged vector, rank 1 its half; the streams are
+     * position-keyed so two runs can be diffed directly. */
     if (rc == 0 && s->engine && s->engine->tp.active) {
         const int every = ds4_tp_debug_hash_every(s->engine->tp.ctx);
         const uint32_t pos = (uint32_t)s->checkpoint.len;

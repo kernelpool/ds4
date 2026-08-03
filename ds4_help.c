@@ -248,7 +248,7 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     opt(fp, c, "--rdma-device NAME", "Select a verbs device when auto-detection is ambiguous.");
     opt(fp, c, "--rdma-gid-index N", "Select the local verbs GID index.");
     opt(fp, c, "--tensor-parallel-token-prefill", "GLM diagnostic: prefill one token at a time for exact arithmetic.");
-    opt(fp, c, "--debug-hash N", "Cross-check hidden state every N tokens.");
+    opt(fp, c, "--debug-hash N", "Log an FNV-64 of the logits every N positions.");
     fputc('\n', fp);
 }
 

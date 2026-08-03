@@ -8394,26 +8394,22 @@ static void ds4_gpu_tp_attn_head_range(uint32_t n_head,
  * hundreds of microseconds earlier than signaledValue polling.  The
  * CPU->GPU release direction stays on the shared event. */
 static bool g_tp_flag_gates;
-/* Fast release (DS4_TP_EVENT_RELEASE disables): the CPU->GPU release
- * direction is a plain store to a shared word observed by
- * kernel_dsv4_tp_release_wait, instead of an MTLSharedEvent wait the
- * firmware has to park and re-arm the command stream for (~40us idle,
- * ~400us under decode load, vs ~1us for the spin kernel).  Row and
- * verify/session batch flag gates use it; big and event-arrival gates
- * keep the shared event (their multi-ms exchanges amortize it). */
+/* Fast release (DS4_TP_EVENT_RELEASE disables): the CPU releases the GPU
+ * with a plain store observed by kernel_dsv4_tp_release_wait instead of an
+ * MTLSharedEvent the firmware must park and re-arm (~40us idle, ~400us
+ * under load, vs ~1us).  Row and batch flag gates use it; big and
+ * event-arrival gates keep the event, their exchanges amortize it. */
 static bool g_tp_fast_release;
 static id<MTLBuffer> g_tp_release_buffer;
 static volatile uint32_t *g_tp_release_ptr;
 static const char *g_tp_release_kernel_name;
 static uint64_t g_tp_stat_spin_iters;
-/* Row-gate payload span inside the slab (base offset + bytes per slot),
- * needed to force the partial output to system visibility before the
- * flag publish.  Set by ds4_gpu_tp_set_row_payload after binding. */
+/* Row-gate payload span in the slab; the fast release publishes it to
+ * system visibility before the flag. Set by ds4_gpu_tp_set_row_payload. */
 static uint64_t g_tp_row_out_off;
 static uint64_t g_tp_row_vec_bytes;
-/* Batch-gate payload span: per-layer batch out region (base + layer *
- * max_rows * vec_bytes; actual payload is rows * vec_bytes).  Set by
- * ds4_gpu_tp_set_batch_payload; zero disables the batch fast path. */
+/* Batch-gate payload span: per-layer out region, layer stride
+ * max_rows * vec_bytes.  Zero disables the batch fast path. */
 static uint64_t g_tp_batch_out_off;
 static uint32_t g_tp_batch_max_rows;
 static id<MTLBuffer> g_tp_slab_buffer;
@@ -8614,16 +8610,12 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
         if (profile) {
             g_tp_stat_gpu_wait_ms += t1 - t0;
             g_tp_stat_exchange_ms += ds4_gpu_now_ms() - t1;
-            /* Sample the previous fast gate's spin-iteration count.  The
-             * word holds the count of whichever spin exited last; as a
-             * per-gate average over hundreds of gates it is accurate
-             * enough to separate a starved threadgroup from a late
-             * release store. */
+            /* Whichever spin exited last; averaged over hundreds of gates
+             * it separates a starved threadgroup from a late release. */
             if (req.fast_release && g_tp_release_ptr)
                 g_tp_stat_spin_iters += g_tp_release_ptr[req.rows > 0 ? 4 : 1];
-            /* Windowed per-parity split (gate 0 = ATTN, 1 = FFN): resets
-             * every print so cold-start/prefill costs cannot pollute the
-             * steady-state read the way the cumulative averages do. */
+            /* Per-parity split (gate 0 = ATTN, 1 = FFN), reset each print
+             * so prefill cost cannot pollute the steady-state read. */
             static double win_wait[2], win_exch[2];
             static uint64_t win_n[2];
             if (req.rows == 0 && req.big_bytes == 0 && req.gate < 2) {
@@ -8726,11 +8718,9 @@ int ds4_gpu_tp_init(uint32_t rank,
     }
     pthread_attr_destroy(&attr);
     g_tp_thread_running = 1;
-    /* The keep-alive exists to stop the GPU power-gating while the
-     * command stream parks at event waits.  The fast release never
-     * parks (the spin kernel keeps the GPU active), and the ~6ms
-     * keep-alive kernels timeslice against the gate spins for a
-     * measured ~10x decode regression — so fast release forces it off. */
+    /* The keep-alive stops power-gating while the stream parks at event
+     * waits.  Fast release never parks, and the ~6ms keep-alive kernels
+     * timeslice against the spins for a measured ~10x regression. */
     if (getenv("DS4_TP_NO_KEEPALIVE") == NULL && !g_tp_fast_release) {
         uint32_t ka_tgs = ds4_gpu_tp_keepalive_tgs_from_env();
         g_tp_keepalive_queue = [g_device newCommandQueue];
@@ -8776,18 +8766,15 @@ void ds4_gpu_tp_shutdown(void) {
     g_tp_batch_max_rows = 0;
 }
 
-/* Row-gate payload location inside the slab: out-slot base offset and
- * bytes per slot (slot = layer * 2 + gate, matching ds4_tp's layout).
- * The fast release path needs it to publish the partial output to
- * system-visible memory; without it row gates fall back to the event. */
+/* Out-slot base and bytes per slot (slot = layer * 2 + gate, matching
+ * ds4_tp's layout); without it row gates fall back to the event. */
 void ds4_gpu_tp_set_row_payload(uint64_t out_off, uint64_t vec_bytes) {
     g_tp_row_out_off = out_off;
     g_tp_row_vec_bytes = vec_bytes;
 }
 
-/* Batch-gate payload location: per-layer batch out region base and the
- * row capacity per layer (layer stride = max_rows * vec_bytes).  Enables
- * the fast release for verify/session batch gates. */
+/* Per-layer batch out region base and row capacity, enabling the fast
+ * release for verify/session batch gates. */
 void ds4_gpu_tp_set_batch_payload(uint64_t batch_out_off, uint32_t max_rows) {
     g_tp_batch_out_off = batch_out_off;
     g_tp_batch_max_rows = max_rows;
@@ -8809,12 +8796,9 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         return 0;
     }
     const uint64_t seq = ++g_tp_seq;
-    /* Session-batch mode historically forced event arrival because the
-     * flag store carried no payload-visibility guarantee; the fast path
-     * publishes payload and flag through system-coherent stores, so it
-     * keeps the flag protocol even with multiple session tapes sharing
-     * the slab slots (the release spin blocks the slot exactly like the
-     * event wait did). */
+    /* Session-batch mode forced event arrival because the flag store had
+     * no payload-visibility guarantee; the coherent publish pair restores
+     * it, so the flag protocol holds even with shared slab slots. */
     const bool fast_capable = g_tp_fast_release && g_tp_flag_gates &&
                               g_tp_row_vec_bytes > 0;
     const bool event_arrival = !g_tp_flag_gates ||
@@ -8828,22 +8812,17 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb || owned) return 0;
-        /* Fast release publishes the flag through the system-coherent
-         * kernel: without the event park right behind it, the plain
-         * relaxed store of kernel_dsv4_tp_flag_set can linger in GPU
-         * caches for milliseconds before the service thread sees it. */
+        /* Without the event park behind it, kernel_dsv4_tp_flag_set's
+         * relaxed store can linger in GPU caches for milliseconds. */
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_pipeline(fast_release ?
                 "kernel_dsv4_tp_flag_publish" : "kernel_dsv4_tp_flag_set");
         if (!pipeline) return 0;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         if (fast_release) {
-            /* The event park behind the flag store is what used to make the
-             * payload CPU-visible; without it the flag can win the race to
-             * memory (see the big-gate kick comment).  Re-store the out-slot
-             * through a coherent(system) view first; the flag dispatch is
+            /* Re-store the out-slot coherently first: the flag dispatch is
              * hazard-ordered behind it, so flag visibility implies payload
-             * visibility. */
+             * visibility, which the event park used to guarantee. */
             id<MTLComputePipelineState> publish_pipeline =
                 ds4_gpu_get_pipeline("kernel_dsv4_tp_payload_publish");
             if (!publish_pipeline) return 0;
@@ -8865,11 +8844,9 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         if (fast_release) {
-            /* Encode the release spin in the same encoder and leave it
-             * open: no cb-level event wait, no stream park.  The barrier
-             * is required — hazard tracking cannot see the CPU-side
-             * dependency, so nothing else orders the combine reads after
-             * the spin observes the release store. */
+            /* Spin in the same encoder, left open: no cb-level wait, no
+             * park.  The barrier is required — hazard tracking cannot see
+             * the CPU-side dependency that orders the combine reads. */
             id<MTLComputePipelineState> wait_pipeline =
                 ds4_gpu_get_pipeline(g_tp_release_kernel_name);
             if (!wait_pipeline) return 0;
@@ -8924,10 +8901,7 @@ int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
     if (!g_batch_cb) return 0;
     if (!g_tp_thread_running || rows == 0) return 0;
     const uint64_t seq = ++g_tp_batch_seq;
-    /* Same visibility reasoning as the row gate: the coherent publish
-     * pair replaces the payload/flag guarantees the event machinery
-     * provided, so the fast path stays on the flag protocol even in
-     * session-batch mode. */
+    /* Same visibility reasoning as the row gate. */
     const bool fast_release = g_tp_fast_release && g_tp_flag_gates &&
                               g_tp_row_vec_bytes > 0 &&
                               g_tp_batch_max_rows > 0 &&
@@ -9084,9 +9058,8 @@ int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
 }
 
 int ds4_gpu_tp_failed(void) {
-    /* A bounded release spin that timed out opened its gate without the
-     * peer payload; the eval that contains it must fail rather than
-     * return silently corrupted logits. */
+    /* A timed-out release spin opened its gate without the peer payload;
+     * the eval must fail rather than return corrupted logits. */
     if (!g_tp_failed_flag && g_tp_release_ptr &&
         (g_tp_release_ptr[2] != 0 || g_tp_release_ptr[5] != 0)) {
         fprintf(stderr,

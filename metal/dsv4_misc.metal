@@ -6342,14 +6342,9 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
 
 // --- Tensor-parallel fast gate release ---------------------------------
 //
-// The event-release path parks the command stream at a cb-level
-// MTLSharedEvent wait; the firmware re-arm costs ~40-100us per gate
-// (measured ~42us idle, ~400us under decode load).  These kernels
-// replace it with the MLX fence pattern: the CPU releases the GPU by a
-// plain store to a system-scope coherent word that a one-thread kernel
-// spin-reads, and payload visibility to the CPU (which the event park
-// used to guarantee) is forced explicitly by re-storing the partial
-// block output through a coherent(system) view before the flag publish.
+// Replaces the cb-level MTLSharedEvent wait, whose firmware re-arm costs
+// ~40-100us per gate, with the MLX fence pattern: the CPU releases the GPU
+// by storing to a coherent(system) word that a one-thread kernel spin-reads.
 #pragma METAL internals : enable
 #ifndef __METAL_MEMORY_SCOPE_SYSTEM__
 #define __METAL_MEMORY_SCOPE_SYSTEM__ 3
@@ -6359,13 +6354,9 @@ constexpr constant metal::thread_scope thread_scope_system =
     static_cast<thread_scope>(__METAL_MEMORY_SCOPE_SYSTEM__);
 }
 
-// Push the gate payload out to system-visible memory.  Without the event
-// park behind the flag store, the CPU can observe the flag before the
-// producing kernels' stores reach CPU-visible memory (see the big-gate
-// kick comment); re-storing every word through a coherent(system)
-// pointer plus a system-scope fence closes that window.  The flag-set
-// dispatch is hazard-ordered after this kernel, so any flag visibility
-// implies payload visibility.
+// Re-store the payload through a coherent(system) view so the CPU cannot
+// see the arrival flag before the data; the flag dispatch is hazard-ordered
+// after this one, so flag visibility implies payload visibility.
 kernel void kernel_dsv4_tp_payload_publish(
         volatile coherent(system) device uint * payload,
         constant uint & n_words,
@@ -6377,20 +6368,11 @@ kernel void kernel_dsv4_tp_payload_publish(
 }
 
 // Spin until the CPU-written release word reaches this gate's sequence
-// value.  Wrap-safe compare: sequence values increase monotonically.
-// The service thread stores the release word even on exchange failure,
-// so a live process always releases promptly.  The spin is BOUNDED: if
-// the owning process dies mid-gate (SIGKILL, crash) nothing will ever
-// store the release word, and an unbounded loop would strand this
-// kernel in GPU firmware pegging the device until reboot (observed).
-// The bound must balance two failure modes: a live gate never takes
-// more than a few ms (bound >> exchange), but after a hard kill up to
-// 86 stranded spins burn out SERIALLY (barriers order them), so the
-// per-gate bound times 86 is the worst-case GPU-pegged window — and
-// while burning, the fence loop degrades the whole machine (observed:
-// system-scope fences contend the coherence fabric).  2M iterations
-// (~0.1-0.5s measured loop rate) keeps worst-case burnout under ~40s
-// while still 100x beyond any live exchange.
+// (wrap-safe compare).  BOUNDED: if the process dies mid-gate nothing ever
+// stores the word, and an unbounded loop strands the kernel in firmware and
+// pegs the GPU until reboot (observed).  Up to 86 stranded spins burn
+// serially, so 2M iterations caps that at ~40s while staying far beyond any
+// live exchange.
 kernel void kernel_dsv4_tp_release_wait(
         volatile coherent(system) device uint * release_word,
         constant uint & value) {
@@ -6401,28 +6383,18 @@ kernel void kernel_dsv4_tp_release_wait(
                                    metal::thread_scope_system);
         if ((int)(release_word[0] - value) >= 0) break;
     }
-    /* Telemetry: loop iterations burned before the release was observed
-     * (read by the service thread under DS4_TP_GATE_PROFILE).  Small
-     * count with long wall time = the threadgroup was starved; huge
-     * count = the loop ran but the CPU store arrived late. */
-    release_word[1] = i;
-    /* A timed-out spin opened the gate WITHOUT the peer payload: the
-     * combine below it reads stale data.  Record it so the CPU-side
-     * failure check aborts the eval instead of silently corrupting.
-     * Spins are serialized by the encoder, so the plain increment is
-     * race-free. */
+    release_word[1] = i;   // spin telemetry, read under DS4_TP_GATE_PROFILE
+    // A timed-out spin opened the gate without the peer payload; record it
+    // so the CPU-side check fails the eval instead of combining stale data.
     if (i >= 2000000u) release_word[2] = release_word[2] + 1u;
     metal::atomic_thread_fence(metal::mem_flags::mem_device,
                                metal::memory_order_seq_cst,
                                metal::thread_scope_system);
 }
 
-// Coherent arrival-flag publish for fast-release gates.  The event park
-// behind kernel_dsv4_tp_flag_set is what made its relaxed device-scope
-// store promptly CPU-visible; the fast-release path removes the park,
-// so the flag itself must be pushed to system visibility exactly like
-// MLX's fence_update: store through a coherent(system) view plus a
-// seq_cst system-scope fence.
+// The event park is what made kernel_dsv4_tp_flag_set's relaxed store
+// promptly CPU-visible; without it the flag needs the coherent store and
+// system-scope fence itself (MLX's fence_update).
 kernel void kernel_dsv4_tp_flag_publish(
         volatile coherent(system) device uint * flag,
         constant uint & value) {
