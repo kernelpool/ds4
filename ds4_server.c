@@ -19950,6 +19950,41 @@ static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_eviction_supersedes_high_hit_prefix(void) {
+    /* Production thrash: a long conversation's older, shorter handover
+     * checkpoint (reason=evict) had accumulated hits, while its fresh, longer
+     * continuation being stored has none.  The older one is a strict prefix of
+     * the incoming checkpoint, so it is redundant and must be the first victim
+     * despite its hits, instead of the growing tip being evicted every turn. */
+    const char *prefix_text = "system: shared preamble\nturns 1-5 of the conversation";
+    const char *incoming_text = "system: shared preamble\nturns 1-5 of the conversation\nturns 6-8";
+    const uint64_t now = 2000u;
+    const uint64_t big = 4200ull * 1024 * 1024;
+    kv_entry older = {.reason = KV_REASON_EVICT, .tokens = 120000, .hits = 20,
+                      .file_size = big, .last_used = now, .ctx_size = 32768,
+                      .model_id = 0, .quant_bits = 2,
+                      .text_bytes = strlen(prefix_text)};
+    sha1_bytes_hex(prefix_text, strlen(prefix_text), older.sha);
+    kv_entry other = {.reason = KV_REASON_EVICT, .tokens = 120000, .hits = 0,
+                      .file_size = big, .last_used = now, .ctx_size = 32768,
+                      .model_id = 0, .quant_bits = 2,
+                      .text_bytes = strlen("an unrelated conversation")};
+    sha1_bytes_hex("an unrelated conversation", strlen("an unrelated conversation"), other.sha);
+    ds4_kvstore_eviction_context incoming = {
+        .text = incoming_text, .text_len = strlen(incoming_text),
+        .model_id = 0, .quant_bits = 2, .ctx_size = 32768,
+        .reject_different_quant = false};
+
+    double dominated = kv_entry_eviction_score(&older, NULL, now, &incoming);
+    double independent = kv_entry_eviction_score(&other, NULL, now, &incoming);
+    TEST_ASSERT(dominated == 0.0);
+    TEST_ASSERT(dominated < independent);
+
+    /* An unrelated conversation that merely shares the system preamble is not a
+     * prefix of the incoming checkpoint, so it keeps its normal score. */
+    TEST_ASSERT(independent > 0.0);
+}
+
 static void test_kv_cache_eviction_score_decays_stale_hits(void) {
     /* stale: lower tokens-per-byte (e.g. tool-heavy prompt) but boosted by
      * 10 hits well in the past.  fresh: higher tokens-per-byte and zero hits,
@@ -20520,6 +20555,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
+    test_kv_cache_eviction_supersedes_high_hit_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();

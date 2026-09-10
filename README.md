@@ -254,41 +254,24 @@ the stock `ggml-org` Q8_0 GGUF also loads once its two parts are merged with
 ```sh
 python gguf-tools/qwen4_exp_convert.py --src /path/to/Qwen3.8-Flash-Next \
   --out gguf/Qwen3.8-Flash-Next-Q8.gguf --outtype q8_0            # about 192 GB
-python gguf-tools/qwen4_exp_convert.py --src /path/to/Qwen3.8-Flash-Next \
-  --out gguf/Qwen3.8-Flash-Next-MXFP4.gguf --outtype q8_0 --experts mxfp4  # about 126 GB
 llama-quantize --allow-requantize --tensor-type hc_=f16 --tensor-type ffn_gate_exps=Q4_K \
   --tensor-type ffn_up_exps=Q4_K --tensor-type per_layer_token_embd=Q4_0 \
   gguf/Qwen3.8-Flash-Next-Q8.gguf gguf/Qwen3.8-Flash-Next-Q4K.gguf Q8_0  # about 124 GB
-llama-quantize --allow-requantize --tensor-type hc_=f16 --tensor-type ffn_gate_exps=Q2_K \
-  --tensor-type ffn_up_exps=Q2_K --tensor-type ffn_down_exps=MXFP4 \
-  --tensor-type per_layer_token_embd=Q4_0 \
-  gguf/Qwen3.8-Flash-Next-Q8.gguf gguf/Qwen3.8-Flash-Next-Q2K.gguf Q8_0   # about 83 GB
-llama-quantize --imatrix imatrix.gguf --allow-requantize --tensor-type hc_=f16 \
-  --tensor-type blk.48.ffn_gate_exps=MXFP4 --tensor-type blk.48.ffn_up_exps=MXFP4 \
-  --tensor-type ffn_gate_exps=IQ2_XXS --tensor-type ffn_up_exps=IQ2_XXS \
-  --tensor-type ffn_down_exps=MXFP4 --tensor-type per_layer_token_embd=Q4_0 \
-  gguf/Qwen3.8-Flash-Next-Q8.gguf gguf/Qwen3.8-Flash-Next-IQ2.gguf Q8_0   # about 77 GB
 ```
 
-The Q8 file keeps every weight at 8 bits except the QSA indexer projections,
-which stay at the released BF16. The MXFP4 file keeps the routed experts in
-native MXFP4 blocks, the Q4K file requantizes the expert gate/up projections
-to Q4_K, and the two-bit files take them to Q2_K or, with an importance
-matrix from `llama-imatrix`, IQ2_XXS; the 640-wide expert down projections
-are too narrow for 256-value blocks and go to MXFP4. The first matching
-`--tensor-type` wins, and the MTP block's experts (`blk.48`) stay MXFP4
-because an importance matrix collected with llama.cpp never sees them. Keep
-the `hc_=f16` override: the Q8_0 base type would otherwise requantize the
-hyper-connection mixers, which slows prefill. Q2K is the better two-bit
-choice unless the last few GB matter. All need a Mac with more unified memory
-than the file size.
+The Q8 file is the reference build: every weight at 8 bits except the QSA
+indexer projections, which stay at the released BF16. The Q4K file
+requantizes the expert gate/up projections to Q4_K and the n-gram table to
+Q4_0; keep the `hc_=f16` override so the hyper-connection mixers are not
+requantized, which would slow prefill. Lower-bit tiers are future work. Both
+need a Mac with more unified memory than the file size.
 
 ```sh
 ./ds4 -m gguf/Qwen3.8-Flash-Next-Q8.gguf --ctx 32768
 ./ds4 -m gguf/Qwen3.8-Flash-Next-Q8.gguf --mtp --temp 0
 ./ds4-server -m gguf/Qwen3.8-Flash-Next-Q8.gguf --ctx 65536 --kv-disk-dir ~/.ds4/server-kv
 ./ds4-server -m gguf/Qwen3.8-Flash-Next-Q8.gguf --vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf
-./ds4-agent -m gguf/Qwen3.8-Flash-Next-MXFP4.gguf
+./ds4-agent -m gguf/Qwen3.8-Flash-Next-Q8.gguf
 ./ds4-server -m gguf/Qwen3.8-Flash-Next-Q4K.gguf --mtp --mtp-exact-sampling --vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf
 ```
 

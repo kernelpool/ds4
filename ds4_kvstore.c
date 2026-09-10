@@ -43,12 +43,6 @@
 /* Disk-hit counts are evidence that a checkpoint was useful, but only while
  * the workload still resembles the one that produced those hits. */
 #define KV_CACHE_MIN_EFFECTIVE_HITS 0.01
-/* A continued checkpoint that is a strict prefix of the incoming store is a
- * routine waypoint on the same path. Keep recent hits meaningful, but make
- * never-hit or stale waypoints cheap victims while pre-evicting for the new
- * store. */
-#define KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR 0.05
-#define KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR 0.45
 /* Cold/evict/shutdown checkpoints are intentional anchors, not just automatic
  * waypoints in a single growing conversation. Give them a soft prior so they
  * survive comparable continued entries, while still allowing pressure and poor
@@ -507,11 +501,14 @@ bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
     return ok;
 }
 
-static bool kv_cache_incoming_supersedes_continued(
+static bool kv_cache_incoming_supersedes(
         const ds4_kvstore_entry *e,
         const ds4_kvstore_eviction_context *incoming) {
     if (!e || !incoming || !incoming->text) return false;
-    if (e->reason != DS4_KVSTORE_REASON_CONTINUED) return false;
+    /* Agent system/session checkpoints are shared bases that other
+     * conversations resume from; never treat them as superseded. */
+    if (e->reason == DS4_KVSTORE_REASON_AGENT_SYSTEM ||
+        e->reason == DS4_KVSTORE_REASON_AGENT_SESSION) return false;
     if (e->text_bytes == 0 || e->text_bytes > SIZE_MAX) return false;
     if ((size_t)e->text_bytes >= incoming->text_len) return false;
     if (e->model_id != incoming->model_id) return false;
@@ -555,11 +552,10 @@ double ds4_kvstore_entry_eviction_score(
                    (double)e->tokens / (double)e->file_size;
     if (kv_cache_reason_is_anchor(e->reason))
         score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
-    if (kv_cache_incoming_supersedes_continued(e, incoming)) {
-        double h = effective_hits > 0.0 ?
-            effective_hits / (effective_hits + 1.0) : 0.0;
-        score *= KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR +
-                 KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR * h;
+    if (kv_cache_incoming_supersedes(e, incoming)) {
+        /* Redundant: the incoming longer checkpoint covers this prefix, so make
+         * it the first victim under pressure rather than the fresh tip. */
+        return 0.0;
     }
     return score;
 }
