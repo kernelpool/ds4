@@ -1928,6 +1928,7 @@ int main(void) {
     fail |= run_radix("1M-ctx", 1048576u, 512u, 0.30f);
     fail |= run_radix_rows("rows", 20000u, 512u, 0.30f, 3u);
     fail |= run_radix_rows("rows-64k", 65536u, 512u, 0.20f, 2u);
+    fail |= run_radix_rows("rows-1M", 1048576u, 512u, 0.30f, 1u);
     /* the O(n^2) rank select must REFUSE sizes it cannot serve, not run them slowly:
      * block selection at long context (clen/8 blocks) lands here and needs a different
      * algorithm, so the guard has to be real */

@@ -1050,6 +1050,79 @@ kernel void kernel_dsv41_radix_scan_rows(
     for (uint b = 0; b < 256u; b++) hist[b] = 0u;
 }
 
+// One threadgroup per row runs every radix pass over a histogram in threadgroup memory:
+// a select is one dispatch and its atomics never leave the core.  The digits, the
+// prefix classes and the tie order are those of the multi-pass kernels, so the two agree
+// exactly; state lives in registers, uniform across the threadgroup.
+kernel void kernel_dsv41_radix_rows_tg(
+        constant dsv41_rows_args &a,
+        device const float       *scores,   // [rows, stride]
+        device int               *keep,     // [rows, stride]
+        threadgroup uint         *hist [[threadgroup(0)]],   // [256 + 32 + 2]
+        uint   tgpig [[threadgroup_position_in_grid]],
+        uint   tpitg [[thread_position_in_threadgroup]],
+        uint   ntg   [[threads_per_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    const uint t = tgpig;
+    if (t >= a.rows) return;
+    const uint n = dsv41_row_n(a, t);
+    scores += (ulong)t * a.stride;
+    keep += (ulong)t * a.stride;
+    threadgroup uint *red = hist + 256u;      // [32] simdgroup partials
+    threadgroup uint *pick = hist + 288u;     // the chosen bin and the count above it
+    threadgroup atomic_uint *ah = (threadgroup atomic_uint *)hist;
+
+    uint prefix = 0u, k_rem = min(a.k_max, n), thresh = 0u;
+    for (uint mode = 0; mode < 2u; mode++) {
+        for (uint shift = 24u; ; shift -= 8u) {
+            const bool first = shift == 24u;
+            for (uint b = tpitg; b < 256u; b += ntg) hist[b] = 0u;
+            if (tpitg == 0u) { pick[0] = 0u; pick[1] = 0u; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint j = tpitg; j < n; j += ntg) {
+                const uint u = dsv41_sortable(scores[j]);
+                if (mode != 0u && u != thresh) continue;
+                const uint key = mode == 0u ? u : j;
+                if (!first && (key >> (shift + 8u)) != prefix) continue;
+                atomic_fetch_add_explicit(&ah[(key >> shift) & 255u], 1u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // the bin where the count from the top reaches k_rem: bins descend along
+            // the first 256 threads, each holding the count above and including its own
+            const uint v = tpitg < 256u ? hist[255u - tpitg] : 0u;
+            const uint incl = simd_prefix_inclusive_sum(v);
+            const uint in_sg = simd_sum(v);
+            if (lane == 0u && sg < 8u) red[sg] = in_sg;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint above = 0u, total = 0u;
+            for (ushort i = 0; i < 8u; i++) {
+                const uint c = red[i];
+                above += i < sg ? c : 0u;
+                total += c;
+            }
+            const uint cum_incl = above + incl, cum_excl = cum_incl - v;
+            if (tpitg < 256u && v != 0u && cum_excl < k_rem && cum_incl >= k_rem) {
+                pick[0] = 255u - tpitg;
+                pick[1] = cum_excl;
+            } else if (tpitg == 0u && total < k_rem) {
+                pick[1] = total;                  // nothing reaches k_rem: digit 0, as the scan kernel
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint chosen = pick[0], cum = pick[1];
+            prefix = first ? chosen : ((prefix << 8u) | chosen);
+            k_rem -= cum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (shift == 0u) break;
+        }
+        if (mode == 0u) thresh = prefix;
+    }
+    for (uint j = tpitg; j < n; j += ntg) {
+        const uint u = dsv41_sortable(scores[j]);
+        keep[j] = (u > thresh || (u == thresh && j >= prefix)) ? 1 : 0;
+    }
+}
+
 kernel void kernel_dsv41_radix_keep_rows(
         constant dsv41_rows_args       &a,
         device const float             *scores,

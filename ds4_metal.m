@@ -46668,6 +46668,11 @@ static int dsv41_gpu_force_radix(void) {
     if (cached < 0) cached = getenv("DS4_DSV41_FORCE_RADIX") != NULL;
     return cached;
 }
+static int dsv41_gpu_radix_multi(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_DSV41_RADIX_MULTI") != NULL;
+    return cached;
+}
 
 /* Exact top-k for candidate sets past the O(n^2) rank pass's reach.  Four 8-bit passes
  * settle the score, four more settle the index among the elements that tie with it, and
@@ -47301,8 +47306,8 @@ int ds4_gpu_dsv41_select_rows(uint32_t rows,
     };
     if (rows == 0 || ratio == 0 || k_max == 0 || (blocks && block == 0)) return 0;
     const uint32_t n_max = dsv41_gpu_row_n(&a, rows - 1u);
-    /* the O(n^2) rank pass loses to the radix passes from about 12k candidates */
-    const int radix = n_max > 12288u || dsv41_gpu_force_radix();
+    /* the O(n^2) rank pass loses to the one-threadgroup radix from about 2k candidates */
+    const int radix = n_max > 2048u || dsv41_gpu_force_radix();
     if (stride < n_max || (n_max && !scores) ||
         (n_max && !glm53_gpu_tensor_has(scores, (uint64_t)(rows - 1u) * stride + n_max, sizeof(float))) ||
         (n_max && !glm53_gpu_tensor_has(keep, (uint64_t)(rows - 1u) * stride + n_max, sizeof(int32_t))) ||
@@ -47330,6 +47335,16 @@ int ds4_gpu_dsv41_select_rows(uint32_t rows,
             dsv41_gpu_rows_bind(enc, &a, p_rank, scores, keep, NULL);
             [enc dispatchThreadgroups:MTLSizeMake((n_max + nsg - 1u) / nsg, rows, 1)
                 threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        } else if (n_max && n_max <= 131072u && !dsv41_gpu_radix_multi()) {
+            /* one threadgroup per row up to 128k candidates; the multi-pass kernels win beyond */
+            id<MTLComputePipelineState> p_tg = ds4_gpu_get_pipeline("kernel_dsv41_radix_rows_tg");
+            if (!p_tg) return 0;
+            enc = ds4_gpu_compute_encoder(cb);
+            dsv41_gpu_rows_bind(enc, &a, p_tg, scores, keep, NULL);
+            [enc setThreadgroupMemoryLength:(256u + 32u + 2u) * sizeof(uint32_t) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
         } else if (n_max) {
             enc = ds4_gpu_compute_encoder(cb);
