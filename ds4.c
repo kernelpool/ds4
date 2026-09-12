@@ -65778,6 +65778,7 @@ static bool dsv41_env(const char *name, int *cache) {
 }
 static int g_dsv41_env_host_select = -1, g_dsv41_env_attn_only = -1;
 static int g_dsv41_env_moe_only = -1, g_dsv41_env_moe_grouped = -1;
+static int g_dsv41_env_moe_per_token = -1;
 
 /* A model-resident mat-vec at whatever precision the checkpoint stores: the mini model is
  * F32 throughout, the released one mixes F16 and Q8_0. */
@@ -65874,6 +65875,25 @@ static bool dsv41_gpu_moe_fused(const ds4_model *m, const ds4_layer_weights *l, 
                                         DS4_SWIGLU_CLAMP_EXP, x, il, rows,
                                         &mid_f16, false) != 0) {
         /* the batched kernel has no addend, so the shared expert lands after it */
+        ok = ds4_gpu_add_tensor(out, out, b_sh.t,
+                                (uint32_t)((uint64_t)rows * dim)) != 0;
+        goto done;
+    }
+
+    /* The whole chunk through the one-token kernels in a single pass: the id pair+sum6
+     * kernels already index the token, so this is the same arithmetic per row with a
+     * grid of tokens x experts instead of one thin row -- exact, unlike the grouped
+     * matmul above.  The entry declines where only the one-token routes exist. */
+    if (ok && rows > 1u && !dsv41_env("DS4_DSV41_MOE_PER_TOKEN", &g_dsv41_env_moe_per_token) &&
+        ds4_gpu_routed_moe_tokens_tensor(out, b_g.t, b_u.t, b_mid.t, b_dn.t,
+                                         m->map, m->size,
+                                         l->ffn_gate_exps->abs_offset,
+                                         l->ffn_up_exps->abs_offset,
+                                         l->ffn_down_exps->abs_offset,
+                                         l->ffn_gate_exps->type, l->ffn_down_exps->type,
+                                         g_exp, g_row, d_exp, d_row,
+                                         dim, ff, dim, sel, wts, n_exp, topk,
+                                         DS4_SWIGLU_CLAMP_EXP, x, il, rows) != 0) {
         ok = ds4_gpu_add_tensor(out, out, b_sh.t,
                                 (uint32_t)((uint64_t)rows * dim)) != 0;
         goto done;

@@ -39921,7 +39921,7 @@ static bool ds4_gpu_mxfp4_moe_decode_nsg1_enabled(uint32_t n_tokens) {
            getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_NSG1") == NULL;
 }
 
-int ds4_gpu_routed_moe_one_tensor(
+static int ds4_gpu_routed_moe_tokens_impl(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -39949,11 +39949,20 @@ int ds4_gpu_routed_moe_one_tensor(
         const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *add_in,
         uint32_t                layer_index,
-        bool                    force_resident) {
+        bool                    force_resident,
+        uint32_t                n_tokens) {
     BOOL parallel_ffn_scope
         __attribute__((cleanup(ds4_gpu_parallel_ffn_scope_cleanup))) =
             g_parallel_q8_pending;
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* Several tokens ride the generic id pair+sum6 pair alone: the kernels index the
+     * token (nei1 / nb12 / nb1), the specialised pipelines all gate on one token, and the
+     * sum6 addend has no per-token stride.  Anything else stays one token at a time. */
+    if (n_tokens == 0) return 0;
+    if (n_tokens > 1 && (add_in || g_tp_split_world > 1 || g_ssd_streaming_mode ||
+                         g_parallel_q8_pending || g_quality_mode)) {
+        return 0;
+    }
     /* TP sharding: only the owned contiguous expert range is mapped,
      * so bind from the owned base, validate only its bytes, and tell the
      * kernels the first expert id present at that base. */
@@ -39987,23 +39996,23 @@ int ds4_gpu_routed_moe_one_tensor(
         id<MTLBuffer> selected_exec_buf = selectedbuf;
         NSUInteger selected_exec_off = ds4_gpu_tensor_offset(selected);
         id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(weights);
-        const uint64_t x_bytes = (uint64_t)expert_in_dim * sizeof(float);
-        const uint64_t mid_bytes = (uint64_t)n_expert * expert_mid_dim * sizeof(float);
-        const uint64_t out_bytes = (uint64_t)out_dim * sizeof(float);
+        const uint64_t x_bytes = (uint64_t)n_tokens * expert_in_dim * sizeof(float);
+        const uint64_t mid_bytes = (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float);
+        const uint64_t out_bytes = (uint64_t)n_tokens * out_dim * sizeof(float);
         if (!xbuf || !gatebuf || !upbuf || !midbuf || !outbuf || !selectedbuf || !weightsbuf ||
             ds4_gpu_tensor_bytes(x) < x_bytes ||
             ds4_gpu_tensor_bytes(gate) < mid_bytes ||
             ds4_gpu_tensor_bytes(up) < mid_bytes ||
             ds4_gpu_tensor_bytes(mid) < mid_bytes ||
             ds4_gpu_tensor_bytes(out) < out_bytes ||
-            ds4_gpu_tensor_bytes(selected) < (uint64_t)n_expert * sizeof(int) ||
-            ds4_gpu_tensor_bytes(weights) < (uint64_t)n_expert * sizeof(float)) {
+            ds4_gpu_tensor_bytes(selected) < (uint64_t)n_tokens * n_expert * sizeof(int) ||
+            ds4_gpu_tensor_bytes(weights) < (uint64_t)n_tokens * n_expert * sizeof(float)) {
             fprintf(stderr, "ds4: Metal routed tensor MoE received undersized activation buffers\n");
             return 0;
         }
         if (n_expert > 1 &&
             (!expertsbuf ||
-             ds4_gpu_tensor_bytes(experts) < (uint64_t)n_expert * out_dim * sizeof(float))) {
+             ds4_gpu_tensor_bytes(experts) < (uint64_t)n_tokens * n_expert * out_dim * sizeof(float))) {
             fprintf(stderr, "ds4: Metal routed tensor MoE received undersized expert output buffer\n");
             return 0;
         }
@@ -40067,7 +40076,6 @@ int ds4_gpu_routed_moe_one_tensor(
         id q4_table_layer_residency = nil;
         int32_t selected_ids[DS4_METAL_MAX_ROUTED_EXPERT_USED] = { 0 };
 
-        const uint32_t n_tokens = 1;
         const uint32_t pair_rows = n_tokens * n_expert;
         const uint64_t down_scratch_bytes = (uint64_t)pair_rows * out_dim * sizeof(float);
         if ((n_expert > 1 && !expertsbuf &&
@@ -40275,8 +40283,10 @@ int ds4_gpu_routed_moe_one_tensor(
         const bool direct_down_sum =
             !g_quality_mode &&
             (n_expert == 6 || (n_expert == 8 && g_tp_split_world == 2)) &&
-            n_tokens == 1 &&
             down_sum6_pipeline != nil;
+        /* the multi-token call has only this route; the generic mul_mv_id down and the
+         * expert sum would need their own token handling checked first */
+        if (n_tokens > 1 && !(fuse_pair_swiglu && direct_down_sum)) return 0;
 
         if (g_parallel_q8_pending) {
             /* A concurrent encoder invalidates every implicit dependency in
@@ -42550,6 +42560,81 @@ int ds4_gpu_routed_moe_one_tensor(
 
     parallel_ffn_scope = NO;
     return 1;
+}
+
+int ds4_gpu_routed_moe_one_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *add_in,
+        uint32_t                layer_index,
+        bool                    force_resident) {
+    return ds4_gpu_routed_moe_tokens_impl(out, gate, up, mid, experts, model_map, model_size,
+                                          gate_offset, up_offset, down_offset, gate_type,
+                                          down_type, gate_expert_bytes, gate_row_bytes,
+                                          down_expert_bytes, down_row_bytes, expert_in_dim,
+                                          expert_mid_dim, out_dim, selected, weights,
+                                          n_total_expert, n_expert, clamp, x, add_in,
+                                          layer_index, force_resident, 1u);
+}
+
+int ds4_gpu_routed_moe_tokens_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t                layer_index,
+        uint32_t                n_tokens) {
+    return ds4_gpu_routed_moe_tokens_impl(out, gate, up, mid, experts, model_map, model_size,
+                                          gate_offset, up_offset, down_offset, gate_type,
+                                          down_type, gate_expert_bytes, gate_row_bytes,
+                                          down_expert_bytes, down_row_bytes, expert_in_dim,
+                                          expert_mid_dim, out_dim, selected, weights,
+                                          n_total_expert, n_expert, clamp, x, NULL,
+                                          layer_index, false, n_tokens);
 }
 
 int ds4_gpu_routed_moe_batch_tensor(

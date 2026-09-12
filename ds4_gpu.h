@@ -3012,6 +3012,42 @@ int ds4_gpu_routed_moe_one_tensor(
         uint32_t                layer_index,
         bool                    force_resident);
 
+/* The same routed experts for `n_tokens` tokens in one pass, at the one-token kernels'
+ * precision: `x` is [n_tokens, in], `selected` / `weights` [n_tokens, n_expert], `out`
+ * [n_tokens, out], and gate/up/mid/experts hold n_tokens * n_expert rows.  Only the
+ * fused id pair+sum6 route carries several tokens, so it declines (returns 0) where
+ * that route is unavailable -- quality mode, tensor parallel, SSD streaming -- and the
+ * caller falls back to one token at a time.  No addend: the shared expert is added
+ * afterwards. */
+int ds4_gpu_routed_moe_tokens_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t                layer_index,
+        uint32_t                n_tokens);
+
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,

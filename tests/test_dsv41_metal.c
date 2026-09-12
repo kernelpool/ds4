@@ -1282,12 +1282,75 @@ static int run_fused_moe(const char *label, uint32_t in_dim, uint32_t mid_dim,
         sc = fmax(sc, fabs(ref[o]));
     }
     const double rel = worst / fmax(sc, 1e-9);
-    const int pass = rel <= 3e-5;
+
+    /* Three tokens in one pass through the same kernels: rows 0 and 2 repeat the token
+     * above; row 1 takes the experts in the opposite slot order, which exercises the
+     * per-token id and weight indexing.  Every row must land on the routed reference. */
+    int rows_ok = -1;
+    if (topk == 6u) {
+        const uint32_t R = 3u;
+        float *x3 = malloc((size_t)R * in_dim * sizeof(float));
+        int32_t *sel3 = malloc((size_t)R * topk * sizeof(int32_t));
+        float *wts3 = malloc((size_t)R * topk * sizeof(float));
+        float *out3 = malloc((size_t)R * out_dim * sizeof(float));
+        for (uint32_t r = 0; r < R; r++) {
+            memcpy(x3 + (size_t)r * in_dim, x, (size_t)in_dim * sizeof(float));
+            for (uint32_t s2 = 0; s2 < topk; s2++) {
+                const uint32_t src = r == 1u ? topk - 1u - s2 : s2;
+                sel3[r * topk + s2] = sel[src];
+                wts3[r * topk + s2] = wts[src];
+            }
+        }
+        ds4_gpu_tensor *t_x3 = ds4_gpu_tensor_alloc((uint64_t)R * in_dim * sizeof(float));
+        ds4_gpu_tensor *t_sel3 = ds4_gpu_tensor_alloc((uint64_t)R * topk * sizeof(int32_t));
+        ds4_gpu_tensor *t_w3 = ds4_gpu_tensor_alloc((uint64_t)R * topk * sizeof(float));
+        ds4_gpu_tensor *t_g3 = ds4_gpu_tensor_alloc((uint64_t)R * topk * mid_dim * sizeof(float));
+        ds4_gpu_tensor *t_u3 = ds4_gpu_tensor_alloc((uint64_t)R * topk * mid_dim * sizeof(float));
+        ds4_gpu_tensor *t_m3 = ds4_gpu_tensor_alloc((uint64_t)R * topk * mid_dim * sizeof(float));
+        ds4_gpu_tensor *t_e3 = ds4_gpu_tensor_alloc((uint64_t)R * topk * out_dim * sizeof(float));
+        ds4_gpu_tensor *t_o3 = ds4_gpu_tensor_alloc((uint64_t)R * out_dim * sizeof(float));
+        int rok = x3 && sel3 && wts3 && out3 && t_x3 && t_sel3 && t_w3 && t_g3 && t_u3 &&
+                  t_m3 && t_e3 && t_o3;
+        rok = rok && ds4_gpu_tensor_write(t_x3, 0, x3, (uint64_t)R * in_dim * sizeof(float));
+        rok = rok && ds4_gpu_tensor_write(t_sel3, 0, sel3, (uint64_t)R * topk * sizeof(int32_t));
+        rok = rok && ds4_gpu_tensor_write(t_w3, 0, wts3, (uint64_t)R * topk * sizeof(float));
+        rok = rok && ds4_gpu_routed_moe_tokens_tensor(t_o3, t_g3, t_u3, t_m3, t_e3, blob, total,
+                                                      o_gate, o_up, o_down, 39u, 39u,
+                                                      g_exp, g_row, d_exp, d_row,
+                                                      in_dim, mid_dim, out_dim, t_sel3, t_w3,
+                                                      n_total, topk, clamp, t_x3, 0, R);
+        rok = rok && ds4_gpu_tensor_read(t_o3, 0, out3, (uint64_t)R * out_dim * sizeof(float));
+        if (rok) {
+            rows_ok = 1;
+            /* the single-token run above folded the shared expert; strip it back off the
+             * rows, which carry the routed sum alone */
+            float *sh = malloc((size_t)out_dim * sizeof(float));
+            rok = ds4_gpu_tensor_read(t_sh, 0, sh, (uint64_t)out_dim * sizeof(float));
+            for (uint32_t r = 0; r < R && rok; r++) {
+                double w3 = 0.0;
+                for (uint32_t o = 0; o < out_dim; o++) {
+                    const double got = out3[(size_t)r * out_dim + o];
+                    w3 = fmax(w3, fabs(got - (ref[o] - sh[o])));
+                }
+                if (w3 / fmax(sc, 1e-9) > 3e-5) rows_ok = 0;
+            }
+            if (!rok) rows_ok = 0;
+            free(sh);
+        } else {
+            rows_ok = 0;
+        }
+        ds4_gpu_tensor_free(t_x3); ds4_gpu_tensor_free(t_sel3); ds4_gpu_tensor_free(t_w3);
+        ds4_gpu_tensor_free(t_g3); ds4_gpu_tensor_free(t_u3); ds4_gpu_tensor_free(t_m3);
+        ds4_gpu_tensor_free(t_e3); ds4_gpu_tensor_free(t_o3);
+        free(x3); free(sel3); free(wts3); free(out3);
+    }
+    const int pass = rel <= 3e-5 && rows_ok != 0;
     printf("  [%s] %-18s %s  rel=%.3e  (mxfp4 %u experts top-%u, %u->%u->%u, q8_0 shared, "
-           "%s, clamped %.0f%%)\n",
+           "%s, clamped %.0f%%%s)\n",
            label, "fused moe", pass ? "ok  " : "FAIL", rel, n_total, topk,
            in_dim, mid_dim, out_dim, fold ? "shared folded" : "shared added",
-           100.0 * (double)clamped / (double)(total_act ? total_act : 1));
+           100.0 * (double)clamped / (double)(total_act ? total_act : 1),
+           rows_ok < 0 ? "" : rows_ok ? ", 3 tokens in one pass ok" : ", 3-TOKEN PASS FAIL");
     if (per_call > 0.0) {
         /* the routed experts are the traffic: topk * (gate + up + down) rows of mxfp4 */
         const double bytes = (double)topk * ((double)mid_dim * (double)g_row * 2.0 +
