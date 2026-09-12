@@ -312,16 +312,23 @@ struct dsv41_index_score_args {
     uint n_index_head;  // <= 32
     uint index_dim;
     uint n_scan;        // positions to score
-    uint use_positions; // 0 = score 0..n_scan-1, 1 = score positions[i]
+    uint use_positions; // 0 = score 0..n_scan-1, 1 = score positions[i], 2 = candidate blocks
     float scale;        // softmax_scale * n_heads^-0.5, applied to the head weights
     uint rows;          // queries, tgpig.y; q and weights are per row
     uint stride;        // row stride of scores
+    uint pos_stride;    // 2: row stride of the block lists
+    uint block;         // 2: positions per block
+    uint n_cap;         // 2: the row's reach, as dsv41_row_reach
+    uint pos0;
+    uint ratio;
 };
 
 // `scale` folds softmax_scale * n_heads^-0.5 in here so the caller never has to touch the
-// weights_proj output.  `positions`, when used, restricts the scan to a candidate set: a layer that reads a
-// source's candidate blocks can never pick anything outside it, so scoring the rest is
-// wasted work.  Output is COMPACTED -- scores[i] belongs to positions[i].
+// weights_proj output.  `positions`, when used, restricts the scan to a candidate set: a
+// layer that reads a source's candidate blocks can never pick anything outside it, so
+// scoring the rest is wasted work.  Output is COMPACTED -- scores[i] belongs to
+// positions[i], or with use_positions 2 to position blocks[row][i / block] * block +
+// i % block, where a -1 block or a position past the row's reach scores -1e30.
 // A simdgroup scores DSV41_INDEX_SCORE_P consecutive candidates at once, four
 // independent chains per lane, so the walk over index_dim waits on memory once per four.
 #define DSV41_INDEX_SCORE_P 4u
@@ -346,14 +353,26 @@ kernel void kernel_dsv41_index_score(
     weights += (ulong)t * args.n_index_head;
     scores += (ulong)t * args.stride;
     device const float *k[DSV41_INDEX_SCORE_P];
+    bool live[DSV41_INDEX_SCORE_P];
+    const uint reach = args.use_positions == 2u
+                     ? min(args.n_cap, (args.pos0 + t + 1u) / args.ratio) : 0u;
     for (uint p = 0; p < DSV41_INDEX_SCORE_P; p++) {
         const uint i = min(i0 + p, args.n_scan - 1u);
-        k[p] = index_k + (ulong)(args.use_positions ? (uint)positions[i] : i) * idim;
+        uint j = i;
+        live[p] = true;
+        if (args.use_positions == 1u) {
+            j = (uint)positions[i];
+        } else if (args.use_positions == 2u) {
+            const int b = positions[(ulong)t * args.pos_stride + i / args.block];
+            j = b < 0 ? 0u : (uint)b * args.block + i % args.block;
+            live[p] = b >= 0 && j < reach;
+        }
+        k[p] = index_k + (ulong)j * idim;
     }
 
     float dot[DSV41_INDEX_SCORE_P] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    const bool live = (uint)lane < args.n_index_head;
-    device const float *qh = q + (ulong)(live ? lane : 0) * idim;
+    const bool head = (uint)lane < args.n_index_head;
+    device const float *qh = q + (ulong)(head ? lane : 0) * idim;
     const uint idim4 = idim / 4u;
     for (uint e = 0; e < idim4; e++) {
         const float4 qv = ((device const float4 *)qh)[e];
@@ -368,11 +387,41 @@ kernel void kernel_dsv41_index_score(
         for (uint p = 0; p < DSV41_INDEX_SCORE_P; p++) dot[p] = fma(qh[e], k[p][e], dot[p]);
     }
     // rectified before the head weight, which may be negative
-    const float w = live ? weights[lane] * args.scale : 0.0f;
+    const float w = head ? weights[lane] * args.scale : 0.0f;
     for (uint p = 0; p < DSV41_INDEX_SCORE_P; p++) {
-        const float total = simd_sum(live && dot[p] > 0.0f ? dot[p] * w : 0.0f);
-        if (lane == 0u && i0 + p < args.n_scan) scores[i0 + p] = total;
+        const float total = simd_sum(head && dot[p] > 0.0f ? dot[p] * w : 0.0f);
+        if (lane == 0u && i0 + p < args.n_scan) scores[i0 + p] = live[p] ? total : -1.0e30f;
     }
+}
+
+// Picks made over a candidate array (use_positions 2) back to positions, in place; the
+// ids carry `offset`, a -1 stays -1 and a dead candidate (no block, or a position past
+// the row's reach) becomes -1.
+struct dsv41_translate_args {
+    uint rows;
+    uint width;
+    uint pos_stride;
+    uint block;
+    uint offset;
+    uint n_cap;
+    uint pos0;
+    uint ratio;
+};
+
+kernel void kernel_dsv41_translate_picks(
+        constant dsv41_translate_args &a,
+        device const int              *blocks,   // [rows, pos_stride]
+        device int                    *picks,    // [rows, width]
+        uint2 gid [[thread_position_in_grid]]) {
+    const uint t = gid.y, i = gid.x;
+    if (t >= a.rows || i >= a.width) return;
+    const int v = picks[(ulong)t * a.width + i];
+    if (v < 0) return;
+    const uint j = (uint)v - a.offset;
+    const int b = blocks[(ulong)t * a.pos_stride + j / a.block];
+    const uint pos = (uint)b * a.block + j % a.block;
+    const uint reach = min(a.n_cap, (a.pos0 + t + 1u) / a.ratio);
+    picks[(ulong)t * a.width + i] = b < 0 || pos >= reach ? -1 : (int)(pos + a.offset);
 }
 
 // Interleaved RoPE.  V4.1 takes ADJACENT ELEMENT PAIRS as one complex number -- not the

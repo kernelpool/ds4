@@ -141,7 +141,16 @@ int main(int argc, char **argv) {
                         if (g[j] >= 0) gv[ng++] = g[j];
                     }
                     compared += nr;
-                    if (nr != ng || memcmp(rv, gv, nr * sizeof(int32_t)) != 0) bad++;
+                    if (nr != ng || memcmp(rv, gv, nr * sizeof(int32_t)) != 0) {
+                        bad++;
+                        if (getenv("DS4_TEST_PICKS_VERBOSE")) {
+                            printf("    layer%u chunk %u row %u: cpu", il, chunks[ci], t);
+                            for (unsigned j = 0; j < nr; j++) printf(" %d", rv[j]);
+                            printf(" | gpu");
+                            for (unsigned j = 0; j < ng; j++) printf(" %d", gv[j]);
+                            printf("\n");
+                        }
+                    }
                 }
                 if (bad) pfail = 1;
                 printf("  picks layer%u chunk %-2u %s  %u/%u positions agree with the CPU reference (%u ids)\n",

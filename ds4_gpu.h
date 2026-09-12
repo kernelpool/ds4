@@ -316,6 +316,18 @@ int ds4_gpu_dsv41_index_score(uint32_t n_index_head,
 
 /* The same scores for `rows` queries at once: `q` is [rows, heads, dim], `weights`
  * [rows, heads], `scores` [rows, stride] with every row scored over 0..n_scan-1. */
+/* A candidate set for the row scorer: per row a list of `stride` kept block ids (-1 past
+ * the kept count) over positions blocks of `block`; candidate i is position
+ * blocks[row][i / block] * block + i % block, dead (-1e30) when the block is -1 or the
+ * position is past the row's reach min(n_cap, (pos0 + row + 1) / ratio). */
+typedef struct {
+    const ds4_gpu_tensor *blocks;
+    uint32_t stride;
+    uint32_t block;
+    uint32_t n_cap;
+    uint32_t pos0;
+    uint32_t ratio;
+} ds4_gpu_dsv41_candidates;
 int ds4_gpu_dsv41_index_score_rows(uint32_t rows,
                                    uint32_t n_index_head,
                                    uint32_t index_dim,
@@ -325,7 +337,11 @@ int ds4_gpu_dsv41_index_score_rows(uint32_t rows,
                                    const ds4_gpu_tensor *index_k,
                                    const ds4_gpu_tensor *weights,
                                    float scale,
-                                   ds4_gpu_tensor *scores);
+                                   ds4_gpu_tensor *scores,
+                                   const ds4_gpu_dsv41_candidates *cand);
+/* Picks made over a candidate array back to positions, in place (ids carry `offset`). */
+int ds4_gpu_dsv41_translate_picks(uint32_t rows, uint32_t width, uint32_t offset,
+                                  const ds4_gpu_dsv41_candidates *cand, ds4_gpu_tensor *picks);
 
 /* DeepSeek V4.1 selection over a prefill chunk, one row per query.  Query t reaches
  * n_t = min(n_cap, (pos0 + t + 1) / ratio) positions -- or ceil(n_t / block) blocks with

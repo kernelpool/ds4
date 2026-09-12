@@ -65997,6 +65997,7 @@ static bool dsv41_gpu_matvec_rows(const ds4_model *m, const ds4_tensor *t, uint6
  * router's choice; V4.1 takes them with F32 tiles.  DS4_DSV41_HALF_MM=1 keeps the half
  * tiles, for comparison. */
 static int g_dsv41_env_half_mm = -1;
+static int g_dsv41_env_full_scan = -1;
 static bool dsv41_gpu_matvec(const ds4_model *m, const ds4_tensor *t, uint64_t offset,
                              uint64_t in_dim, uint64_t out_dim, uint64_t rows,
                              const ds4_gpu_tensor *x, ds4_gpu_tensor *out) {
@@ -66397,6 +66398,7 @@ typedef struct {
     uint32_t nb_stride;         /* max_blocks: row stride of bscore and bkeep */
     dsv41_gpu_buf bscore;       /* [chunk][max_blocks] */
     ds4_gpu_tensor *bkeep;      /* [chunk][max_blocks] int32 */
+    ds4_gpu_tensor *cand;       /* [chunk][candidate_top_blocks] int32: the kept blocks, ascending */
     ds4_gpu_tensor *rstate;     /* radix select: [chunk] x 5 u32 of refinement state */
     ds4_gpu_tensor *rhist;      /* radix select: [chunk] x 256 u32 histograms */
     /* DSpark drafting: the target layers' stream means for the rows of the last trunk
@@ -66434,7 +66436,7 @@ static void dsv41_gpu_consts_free(dsv41_gpu_consts *c, uint32_t n_layer);
 
 static void dsv41_gpu_window_close(dsv41_gpu_window *g) {
     ds4_gpu_tensor_free(g->join.t); ds4_gpu_tensor_free(g->sc.t); ds4_gpu_tensor_free(g->bscore.t);
-    ds4_gpu_tensor_free(g->bkeep);
+    ds4_gpu_tensor_free(g->bkeep); ds4_gpu_tensor_free(g->cand);
     ds4_gpu_tensor_free(g->rstate); ds4_gpu_tensor_free(g->rhist);
     ds4_gpu_tensor_free(g->moe_counts); ds4_gpu_tensor_free(g->moe_cursor);
     ds4_gpu_tensor_free(g->moe_groups); ds4_gpu_tensor_free(g->moe_sorted);
@@ -66494,6 +66496,7 @@ static bool dsv41_gpu_window_open(dsv41_gpu_window *g, uint32_t n_layer, uint32_
     }
     g->nb_stride = max_blocks;
     g->bkeep = ds4_gpu_tensor_alloc((uint64_t)chunk * max_blocks * sizeof(int32_t));
+    g->cand = ds4_gpu_tensor_alloc((uint64_t)chunk * DS4_N_CANDIDATE_TOP_BLOCKS * sizeof(int32_t));
     g->rstate = ds4_gpu_tensor_alloc((uint64_t)chunk * 5u * sizeof(uint32_t));
     g->rhist = ds4_gpu_tensor_alloc((uint64_t)chunk * 256u * sizeof(uint32_t));
     {
@@ -66521,7 +66524,7 @@ static bool dsv41_gpu_window_open(dsv41_gpu_window *g, uint32_t n_layer, uint32_
     if (!dsv41_gpu_buf_alloc(&g->join, ((uint64_t)DS4_N_SWA + max_pos) * DS4_N_HEAD_DIM) ||
         !dsv41_gpu_buf_alloc(&g->sc, max_pos) ||
         !dsv41_gpu_buf_alloc(&g->bscore, (uint64_t)chunk * max_blocks) ||
-        !g->bkeep || !g->rstate || !g->rhist) {
+        !g->bkeep || !g->cand || !g->rstate || !g->rhist) {
         dsv41_gpu_window_close(g);
         return false;
     }
@@ -66945,33 +66948,60 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
                     (uint64_t)t0 * nbs * sizeof(float), (uint64_t)nt * nbs * sizeof(float));
             ds4_gpu_tensor *v_bk = ds4_gpu_tensor_view(win_gpu->bkeep,
                     (uint64_t)t0 * nbs * sizeof(int32_t), (uint64_t)nt * nbs * sizeof(int32_t));
-            ok = v_iq && v_wts && v_pick && v_bs && v_bk;
+            ds4_gpu_tensor *v_cand = ds4_gpu_tensor_view(win_gpu->cand,
+                    (uint64_t)t0 * DS4_N_CANDIDATE_TOP_BLOCKS * sizeof(int32_t),
+                    (uint64_t)nt * DS4_N_CANDIDATE_TOP_BLOCKS * sizeof(int32_t));
+            ok = v_iq && v_wts && v_pick && v_bs && v_bk && v_cand;
+            /* a layer past the candidate source scores and ranks only the candidate array
+             * (the kept blocks' positions, at most top_blocks * block of them) and maps
+             * its picks back; the array is padded to full blocks, dead entries score -1e30 */
+            const bool restricted = g_ds4_candidate_source_layer < il && clen_max &&
+                                    !dsv41_env("DS4_DSV41_FULL_SCAN", &g_dsv41_env_full_scan);
+            uint32_t n_sel = clen_max;
+            if (restricted) {
+                uint32_t nblk = (clen_max + blk - 1u) / blk;
+                if (nblk > DS4_N_CANDIDATE_TOP_BLOCKS) nblk = DS4_N_CANDIDATE_TOP_BLOCKS;
+                n_sel = nblk * blk;
+            }
+            const ds4_gpu_dsv41_candidates cand = {
+                .blocks = v_cand, .stride = DS4_N_CANDIDATE_TOP_BLOCKS, .block = blk,
+                .n_cap = n_cap, .pos0 = pos0 + t0, .ratio = ratio,
+            };
             if (ok && clen_max) {
-                ok = dsv41_gpu_buf_alloc(&b_scores, (uint64_t)nt * clen_max) &&
-                     (t_keep = ds4_gpu_tensor_alloc((uint64_t)nt * clen_max * sizeof(int32_t))) != NULL &&
-                     ds4_gpu_dsv41_index_score_rows(nt, ih, idim, clen_max, clen_max, v_iq,
+                ok = dsv41_gpu_buf_alloc(&b_scores, (uint64_t)nt * n_sel) &&
+                     (t_keep = ds4_gpu_tensor_alloc((uint64_t)nt * n_sel * sizeof(int32_t))) != NULL &&
+                     ds4_gpu_dsv41_index_score_rows(nt, ih, idim, n_sel, n_sel, v_iq,
                                                     win_gpu->ikey[src], v_wts, iscale,
-                                                    b_scores.t) != 0;
+                                                    b_scores.t, restricted ? &cand : NULL) != 0;
                 if (ok && il == g_ds4_candidate_source_layer) {
                     ok = ds4_gpu_dsv41_block_max_rows(nt, clen_max, n_cap, pos0 + t0, ratio,
                                                       blk, nbs, b_scores.t, v_bs) != 0 &&
                          ds4_gpu_dsv41_select_rows(nt, nbs, n_cap, pos0 + t0, ratio,
-                                                   DS4_N_CANDIDATE_TOP_BLOCKS, 0, 0, 1, blk,
-                                                   v_bs, v_bk, NULL, win_gpu->rstate,
+                                                   DS4_N_CANDIDATE_TOP_BLOCKS, 0,
+                                                   DS4_N_CANDIDATE_TOP_BLOCKS, 1, blk,
+                                                   v_bs, v_bk, v_cand, win_gpu->rstate,
                                                    win_gpu->rhist) != 0;
-                } else if (ok && g_ds4_candidate_source_layer < il) {
+                } else if (ok && g_ds4_candidate_source_layer < il && !restricted) {
                     ok = ds4_gpu_dsv41_block_mask_rows(nt, clen_max, n_cap, pos0 + t0, ratio,
                                                        blk, nbs, v_bk, b_scores.t) != 0;
                 }
             }
             /* a query with no reach yet comes out as an empty row */
-            ok = ok && ds4_gpu_dsv41_select_rows(nt, clen_max, n_cap, pos0 + t0, ratio,
-                                                 DS4_N_INDEXER_TOP_K, rslots,
-                                                 DS4_N_INDEXER_TOP_K, 0, 0, b_scores.t, t_keep,
-                                                 v_pick, win_gpu->rstate, win_gpu->rhist) != 0;
+            if (restricted) {
+                ok = ok && ds4_gpu_dsv41_select_rows(nt, n_sel, n_sel, n_sel - 1u, 1u,
+                                                     DS4_N_INDEXER_TOP_K, rslots,
+                                                     DS4_N_INDEXER_TOP_K, 0, 0, b_scores.t, t_keep,
+                                                     v_pick, win_gpu->rstate, win_gpu->rhist) != 0 &&
+                     ds4_gpu_dsv41_translate_picks(nt, DS4_N_INDEXER_TOP_K, rslots, &cand, v_pick) != 0;
+            } else {
+                ok = ok && ds4_gpu_dsv41_select_rows(nt, clen_max, n_cap, pos0 + t0, ratio,
+                                                     DS4_N_INDEXER_TOP_K, rslots,
+                                                     DS4_N_INDEXER_TOP_K, 0, 0, b_scores.t, t_keep,
+                                                     v_pick, win_gpu->rstate, win_gpu->rhist) != 0;
+            }
             ds4_gpu_tensor_free(b_scores.t); ds4_gpu_tensor_free(t_keep);
             ds4_gpu_tensor_free(v_iq); ds4_gpu_tensor_free(v_wts); ds4_gpu_tensor_free(v_pick);
-            ds4_gpu_tensor_free(v_bs); ds4_gpu_tensor_free(v_bk);
+            ds4_gpu_tensor_free(v_bs); ds4_gpu_tensor_free(v_bk); ds4_gpu_tensor_free(v_cand);
         }
     }
 

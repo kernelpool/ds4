@@ -47049,6 +47049,11 @@ typedef struct {
     float    scale;
     uint32_t rows;
     uint32_t stride;
+    uint32_t pos_stride;
+    uint32_t block;
+    uint32_t n_cap;
+    uint32_t pos0;
+    uint32_t ratio;
 } dsv41_gpu_index_score_args;
 
 int ds4_gpu_dsv41_compress_pool(uint32_t groups,
@@ -47153,10 +47158,14 @@ int ds4_gpu_dsv41_index_score_rows(uint32_t rows,
                                    const ds4_gpu_tensor *index_k,
                                    const ds4_gpu_tensor *weights,
                                    float scale,
-                                   ds4_gpu_tensor *scores) {
+                                   ds4_gpu_tensor *scores,
+                                   const ds4_gpu_dsv41_candidates *cand) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (rows == 0 || n_index_head == 0 || n_index_head > 32u || index_dim == 0 ||
         n_scan == 0 || stride < n_scan || !index_k ||
+        (cand && (!cand->blocks || cand->block == 0 || cand->ratio == 0 ||
+                  !glm53_gpu_tensor_has(cand->blocks, (uint64_t)rows * cand->stride, sizeof(int32_t)) ||
+                  n_scan > cand->stride * cand->block)) ||
         !glm53_gpu_tensor_has(q, (uint64_t)rows * n_index_head * index_dim, sizeof(float)) ||
         !glm53_gpu_tensor_has(weights, (uint64_t)rows * n_index_head, sizeof(float)) ||
         !glm53_gpu_tensor_has(scores, (uint64_t)(rows - 1u) * stride + n_scan, sizeof(float))) {
@@ -47173,21 +47182,66 @@ int ds4_gpu_dsv41_index_score_rows(uint32_t rows,
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         dsv41_gpu_index_score_args args = {
             .n_index_head = n_index_head, .index_dim = index_dim,
-            .n_scan = n_scan, .use_positions = 0u, .scale = scale,
+            .n_scan = n_scan, .use_positions = cand ? 2u : 0u, .scale = scale,
             .rows = rows, .stride = stride,
+            .pos_stride = cand ? cand->stride : 0u, .block = cand ? cand->block : 0u,
+            .n_cap = cand ? cand->n_cap : 0u, .pos0 = cand ? cand->pos0 : 0u,
+            .ratio = cand ? cand->ratio : 1u,
         };
         const uint32_t nsg = 8u;
+        const ds4_gpu_tensor *pos = cand ? cand->blocks : scores;
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:ds4_gpu_tensor_buffer(q) offset:ds4_gpu_tensor_offset(q) atIndex:1];
         [enc setBuffer:ds4_gpu_tensor_buffer(index_k) offset:ds4_gpu_tensor_offset(index_k) atIndex:2];
         [enc setBuffer:ds4_gpu_tensor_buffer(weights) offset:ds4_gpu_tensor_offset(weights) atIndex:3];
         [enc setBuffer:ds4_gpu_tensor_buffer(scores) offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-        [enc setBuffer:ds4_gpu_tensor_buffer(scores) offset:0 atIndex:5];
+        [enc setBuffer:ds4_gpu_tensor_buffer(pos) offset:ds4_gpu_tensor_offset(pos) atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake((n_scan + 4u * nsg - 1u) / (4u * nsg), rows, 1)
             threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 chunk indexer");
+    }
+}
+
+typedef struct {
+    uint32_t rows;
+    uint32_t width;
+    uint32_t pos_stride;
+    uint32_t block;
+    uint32_t offset;
+    uint32_t n_cap;
+    uint32_t pos0;
+    uint32_t ratio;
+} dsv41_gpu_translate_args;
+
+int ds4_gpu_dsv41_translate_picks(uint32_t rows, uint32_t width, uint32_t offset,
+                                  const ds4_gpu_dsv41_candidates *cand, ds4_gpu_tensor *picks) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (rows == 0 || width == 0 || !cand || !cand->blocks || cand->block == 0 || cand->ratio == 0 ||
+        !glm53_gpu_tensor_has(cand->blocks, (uint64_t)rows * cand->stride, sizeof(int32_t)) ||
+        !glm53_gpu_tensor_has(picks, (uint64_t)rows * width, sizeof(int32_t))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 pick translation received invalid buffers\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_translate_picks");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        dsv41_gpu_translate_args args = {
+            .rows = rows, .width = width, .pos_stride = cand->stride, .block = cand->block,
+            .offset = offset, .n_cap = cand->n_cap, .pos0 = cand->pos0, .ratio = cand->ratio,
+        };
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(cand->blocks) offset:ds4_gpu_tensor_offset(cand->blocks) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(picks) offset:ds4_gpu_tensor_offset(picks) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(width, rows, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 pick translation");
     }
 }
 
