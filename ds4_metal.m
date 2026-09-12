@@ -11449,6 +11449,10 @@ static void ds4_gpu_queue_keepalive_stop_thread(void) {
     g_queue_keepalive_running = 0;
 }
 
+int ds4_gpu_tp_spin_batch_release_active(void) {
+    return g_tp_spin_release && g_tp_flag_gates && g_tp_batch_max_rows != 0;
+}
+
 int ds4_gpu_tp_failed(void) {
     /* A timed-out release spin opened its gate without the peer payload;
      * the eval must fail rather than return corrupted logits. */

@@ -38890,7 +38890,8 @@ static bool metal_graph_verify_suffix_tops_impl(
          * the host encodes the next layers. Submit short prefixes to overlap
          * that work without changing the verifier's kernels or arithmetic. */
         if (ok && capture_dspark_hidden && !verify_profile &&
-            !selected_profile && g->tp_world != 2 &&
+            !selected_profile &&
+            (g->tp_world != 2 || ds4_gpu_tp_spin_batch_release_active()) &&
             ((il + 1u) % 4u) == 0u) {
             ok = ds4_gpu_flush_commands() != 0;
         }
@@ -71683,6 +71684,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         e->dspark_confidence_threshold = opt->dspark_confidence_threshold;
     } else {
         e->dspark_confidence_threshold =
+            opt->tp.role != DS4_TP_NONE ? 0.8f :
             e->backend == DS4_BACKEND_METAL ? 0.6f : 0.7f;
     }
     e->dspark_confidence_threshold_set =
@@ -80114,7 +80116,8 @@ static int ds4_session_eval_dspark_speculative_argmax(
                                             &e->weights,
                                             drafts[i],
                                             (uint32_t)s->checkpoint.len,
-                                            row_logits);
+                                            i == replay_budget - 1 ?
+                                                row_logits : NULL);
         if (!ok) {
             snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
             s->checkpoint_valid = false;
@@ -80692,7 +80695,8 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                                             &e->weights,
                                             drafts[i],
                                             (uint32_t)s->checkpoint.len,
-                                            logits)) {
+                                            i == replay_n - 1 ?
+                                                logits : NULL)) {
             free(scratch);
             snprintf(err, errlen, "tp: replay decode failed");
             s->checkpoint_valid = false;

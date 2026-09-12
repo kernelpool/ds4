@@ -704,6 +704,9 @@ void ds4_gpu_model_residency_skip(int skip);
 int ds4_gpu_warm_command_queue(void);
 /* Nonzero after any gate exchange failed; the eval must abort. */
 int ds4_gpu_tp_failed(void);
+/* Nonzero when batch gates use the spin release, which lets the verifier
+ * submit its command buffer in pieces. */
+int ds4_gpu_tp_spin_batch_release_active(void);
 
 /* Tensor-parallel sliced projections (Metal decode path only).
  *
