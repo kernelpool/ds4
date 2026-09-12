@@ -19314,10 +19314,19 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         if (nt_off < 0) nt_off = getenv("DS4_METAL_Q8_MV_EXT") != NULL;
         if (n_tok >= 2u && n_tok <= 8u && !nt_off) {
             char fn[40];
-            snprintf(fn, sizeof(fn), "kernel_mul_mv_q8_0_f32_nt%u", (unsigned)n_tok);
             ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
             if (out_dim > 65536u) mv_dispatch.nsg = 8;
+            /* wide matrices stage the activations per threadgroup (see the kernel) */
+            static int64_t nts_min = -1;
+            if (nts_min < 0) nts_min = (int64_t)ds4_gpu_env_u64("DS4_METAL_Q8_NTS_MIN_ROWS", 4096u, 1u, UINT32_MAX);
+            const bool staged = out_dim >= (uint64_t)nts_min;
+            if (staged) {
+                mv_dispatch.nr0 = 4 * mv_dispatch.nsg;
+                mv_dispatch.smem = (NSUInteger)n_tok * (n_tok <= 6u ? 32u : 16u) * 32u * sizeof(float);
+            }
+            snprintf(fn, sizeof(fn), staged ? "kernel_mul_mv_q8_0_f32_nts%u" : "kernel_mul_mv_q8_0_f32_nt%u",
+                     (unsigned)n_tok);
             mv_args.nr0 = mv_dispatch.nr0;
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mv_pipeline(fn, mv_dispatch.nsg);

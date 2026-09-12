@@ -1781,6 +1781,8 @@ int main(void) {
     fail |= run_rows_matmul("q8_0 2", 5120u, 1280u, 2u, 1);
     fail |= run_rows_matmul("q8_0 5", 5120u, 1280u, 5u, 1);
     fail |= run_rows_matmul("q8_0 8", 4096u, 1001u, 8u, 1);
+    fail |= run_rows_matmul("q8_0 5 wide", 1024u, 8192u, 5u, 1);
+    fail |= run_rows_matmul("q8_0 8 wide", 1024u, 4100u, 8u, 1);
     fail |= run_rows_matmul("q8_0 40", 5120u, 2304u, 40u, 1);
     fail |= run_rows_matmul("f16 64", 5120u, 384u, 64u, 0);
     fail |= run_rows_matmul("f16 9", 2304u, 512u, 9u, 0);

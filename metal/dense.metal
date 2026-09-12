@@ -282,6 +282,109 @@ template [[host_name("kernel_mul_mv_q8_0_f32_nt6")]] kernel mul_mv_q8_0_f32_nt_t
 template [[host_name("kernel_mul_mv_q8_0_f32_nt7")]] kernel mul_mv_q8_0_f32_nt_t kernel_mul_mv_q8_0_f32_nt<7>;
 template [[host_name("kernel_mul_mv_q8_0_f32_nt8")]] kernel mul_mv_q8_0_f32_nt_t kernel_mul_mv_q8_0_f32_nt<8>;
 
+// Wide matrices: every simdgroup owns NR0 whole rows and the threadgroup stages each
+// K-chunk of the NT activations once in threadgroup memory, so the activations are read
+// per threadgroup instead of per pair of rows -- at five or more tokens that traffic,
+// not the weights, was the limit.
+template<short NR0, short NT>
+void kernel_mul_mv_q8_0_f32_nts_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;                       // elements per lane per block
+    constexpr short CH = NT <= 6 ? 32 : 16;       // blocks staged per step (32 KB of threadgroup memory at most)
+    constexpr short BPL = CH/NQ;                  // blocks per lane per step
+
+    const int nb = args.ne00/QK8_0;
+    const int r0 = (tgpig.x*NSG + sgitg)*NR0;
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const int r = min(r0 + row, args.ne01 - 1);
+        ax[row] = (device const block_q8_0 *) (src0 + (uint64_t)r*args.nb01);
+    }
+    threadgroup float4 * ys = (threadgroup float4 *) shmem;   // [NT][CH*QK8_0/4]
+    constexpr short YS_TOK = CH*QK8_0/4;
+
+    const short il = tiisg%(NW/NQ);               // 8-element quarter of a block
+    const short ix = tiisg/(NW/NQ);               // block within a group of NQ
+    const short tid = sgitg*NW + tiisg;
+    const short nthr = NSG*NW;
+
+    float sumf[NT][NR0];
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[t][row] = 0.f;
+    }
+
+    for (int ib0 = 0; ib0 < nb; ib0 += CH) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short i = tid; i < NT*YS_TOK; i += nthr) {
+            const short t = i / YS_TOK, c = i % YS_TOK;
+            const int e = ib0*QK8_0 + c*4;
+            ys[i] = e < args.ne00 ? ((device const float4 *) (src1 + (uint64_t)t*args.nb11))[e/4] : float4(0.f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        FOR_UNROLL (short k = 0; k < BPL; ++k) {
+            const int ib = ib0 + k*NQ + ix;
+            if (ib >= nb) break;
+            const short c = (k*NQ + ix)*(QK8_0/4) + il*(NQ/4);
+            // the rows' weights first, then each token's activations once for all rows
+            float4 q0[NR0], q1[NR0];
+            float d[NR0];
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                device const int8_t * qs = ax[row][ib].qs + il*NQ;
+                q0[row] = float4(qs[0], qs[1], qs[2], qs[3]);
+                q1[row] = float4(qs[4], qs[5], qs[6], qs[7]);
+                d[row] = ax[row][ib].d;
+            }
+            FOR_UNROLL (short t = 0; t < NT; ++t) {
+                const float4 y0 = ys[t*YS_TOK + c], y1 = ys[t*YS_TOK + c + 1];
+                FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                    sumf[t][row] += (dot(q0[row], y0) + dot(q1[row], y1))*d[row];
+                }
+            }
+        }
+    }
+
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            const float tot = simd_sum(sumf[t][row]);
+            if (tiisg == 0 && r0 + row < args.ne01) {
+                ((device float *) dst)[(uint64_t)t*args.ne0 + r0 + row] = tot;
+            }
+        }
+    }
+}
+
+template<short NT>
+kernel void kernel_mul_mv_q8_0_f32_nts(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_nts_impl<4, NT>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+typedef decltype(kernel_mul_mv_q8_0_f32_nts<2>) mul_mv_q8_0_f32_nts_t;
+template [[host_name("kernel_mul_mv_q8_0_f32_nts2")]] kernel mul_mv_q8_0_f32_nts_t kernel_mul_mv_q8_0_f32_nts<2>;
+template [[host_name("kernel_mul_mv_q8_0_f32_nts3")]] kernel mul_mv_q8_0_f32_nts_t kernel_mul_mv_q8_0_f32_nts<3>;
+template [[host_name("kernel_mul_mv_q8_0_f32_nts4")]] kernel mul_mv_q8_0_f32_nts_t kernel_mul_mv_q8_0_f32_nts<4>;
+template [[host_name("kernel_mul_mv_q8_0_f32_nts5")]] kernel mul_mv_q8_0_f32_nts_t kernel_mul_mv_q8_0_f32_nts<5>;
+template [[host_name("kernel_mul_mv_q8_0_f32_nts6")]] kernel mul_mv_q8_0_f32_nts_t kernel_mul_mv_q8_0_f32_nts<6>;
+template [[host_name("kernel_mul_mv_q8_0_f32_nts7")]] kernel mul_mv_q8_0_f32_nts_t kernel_mul_mv_q8_0_f32_nts<7>;
+template [[host_name("kernel_mul_mv_q8_0_f32_nts8")]] kernel mul_mv_q8_0_f32_nts_t kernel_mul_mv_q8_0_f32_nts<8>;
+
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
 // K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked
 // poll-gate flag published by the last-arriving threadgroup (see
