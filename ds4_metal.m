@@ -47517,8 +47517,13 @@ int ds4_gpu_dsv41_sparse_attn(uint32_t s_len,
         [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:6];
         [enc setBuffer:ds4_gpu_tensor_buffer(idx_cmp ? idx_cmp : idxs)
                 offset:ds4_gpu_tensor_offset(idx_cmp ? idx_cmp : idxs) atIndex:7];
-        /* [nsg][head_dim] accumulators plus per-simdgroup max, denominator and count */
-        const uint32_t nsg = 8u;
+        /* [nsg][head_dim] accumulators plus per-simdgroup max, denominator and count.  A
+         * single query has only n_head threadgroups, so it takes as many simdgroups as the
+         * 32 KB of threadgroup memory allows to split its candidates over. */
+        uint32_t nsg = 8u;
+        if (s_len == 1u) {
+            while (nsg < 16u && ((nsg + 1u) * head_dim + 3u * (nsg + 1u)) * sizeof(float) <= 32768u) nsg++;
+        }
         [enc setThreadgroupMemoryLength:(nsg * head_dim + 3u * nsg) * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_head, s_len, 1)
             threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
