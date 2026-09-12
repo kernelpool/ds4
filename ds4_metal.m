@@ -2539,6 +2539,15 @@ void ds4_gpu_release_zero_prefix_prefill_mask_cache(void) {
     ds4_gpu_clear_zero_prefix_prefill_mask_cache();
 }
 
+/* F32-staged matrix kernels: the same tiles held in float (12 KB of threadgroup memory
+ * instead of 6 or 8), for a model that keeps prefill at the decode kernels' precision */
+static int g_mm_exact_staging;
+void ds4_gpu_set_exact_mm(int on) { g_mm_exact_staging = on; }
+static NSUInteger ds4_gpu_mul_mm_shmem(bool bc_out) {
+    if (g_mm_exact_staging) return 12288u;
+    return bc_out ? 8192u : 6144u;
+}
+
 static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_pipeline(
         const char *function_name,
         bool        bc_inp,
@@ -19405,7 +19414,8 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         const bool bc_out =
             (out_dim % 64u) != 0 || (generic_rows % 32u) != 0;
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_q8_0_f32", bc_inp, bc_out);
+            ds4_gpu_get_mul_mm_pipeline(g_mm_exact_staging ? "kernel_mul_mm_q8_0_f32_exact"
+                                                           : "kernel_mul_mm_q8_0_f32", bc_inp, bc_out);
         if (!pipeline) return 0;
 
         ds4_gpu_mul_mm_args args =
@@ -19423,7 +19433,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                 offset:ds4_gpu_tensor_offset(out) +
                        (NSUInteger)(generic_row0 * out_dim * sizeof(float))
                atIndex:3];
-        [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+        [enc setThreadgroupMemoryLength:ds4_gpu_mul_mm_shmem(bc_out) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)generic_rows + 31u) / 32u,
                                               ((NSUInteger)out_dim + 63u) / 64u,
                                               1)
@@ -20955,7 +20965,8 @@ int ds4_gpu_matmul_f16_tensor(
         const bool bc_inp = (in_dim % 32u) != 0;
         const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_f16_f32", bc_inp, bc_out);
+            ds4_gpu_get_mul_mm_pipeline(g_mm_exact_staging ? "kernel_mul_mm_f16_f32_exact"
+                                                           : "kernel_mul_mm_f16_f32", bc_inp, bc_out);
         if (!pipeline) return 0;
 
         ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
@@ -20966,7 +20977,7 @@ int ds4_gpu_matmul_f16_tensor(
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+        [enc setThreadgroupMemoryLength:ds4_gpu_mul_mm_shmem(bc_out) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
                                               ((NSUInteger)out_dim + 63u) / 64u,
                                               1)

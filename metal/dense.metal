@@ -2506,7 +2506,7 @@ kernel void kernel_mul_mm(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 2048 * sizeof(S0));   // 64 x 32 of S0
 
     constexpr int NR0 = 64;
     constexpr int NR1 = 32;
@@ -2911,5 +2911,10 @@ typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, 
 // Host-visible prefill matmul variants for F16 and Q8_0 weights.
 template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, half4x4, 1, dequantize_f16,  half,  half4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
+// F32 staging: the same kernel with the tiles and the activations kept in float, for
+// paths that hold prefill to the decode kernels' precision (the half tiles move a
+// DeepSeek V4.1 prefill's logits by ~1e-1); needs 12 KB of threadgroup memory
+template [[host_name("kernel_mul_mm_f16_f32_exact")]]  kernel mul_mm_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, half4x4, 1, dequantize_f16,  half,  half4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_q8_0_f32_exact")]] kernel mul_mm_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;

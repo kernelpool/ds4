@@ -1093,6 +1093,8 @@ static int run_offset_matmul(const char *label, uint32_t in_dim, uint32_t out_di
     return !pass;
 }
 
+
+
 /* MXFP4 routed experts + a Q8_0 shared expert through DS4's fused routed-MoE kernels,
  * which is how the released checkpoint stores them.  The blob is synthesised straight in
  * the quantized layouts and the reference dequantises the same bytes, so the comparison
@@ -1155,6 +1157,69 @@ static void fill_q8_0(uint8_t *p, size_t blocks) {
             p[b * 34u + 2u + j] = (uint8_t)(int8_t)(int)(rnd() * 127.0f);
         }
     }
+}
+
+/* A prefill chunk's dense projections go through the matrix kernels; V4.1 takes them with
+ * F32 tiles.  Q8_0 and F16 weights, more rows than the matvec path handles, against a
+ * double reference; the half-tiled result is reported next to it. */
+static int run_rows_matmul(const char *label, uint32_t in_dim, uint32_t out_dim, uint32_t rows, int q8) {
+    const size_t wbytes = q8 ? (size_t)out_dim * (in_dim / 32u) * 34u : (size_t)out_dim * in_dim * 2u;
+    void *blob = NULL;
+    if (posix_memalign(&blob, (size_t)getpagesize(), wbytes) != 0) return 1;
+    uint8_t *w = blob;
+    if (q8) {
+        fill_q8_0(w, (size_t)out_dim * (in_dim / 32u));
+    } else {
+        for (size_t i = 0; i < (size_t)out_dim * in_dim; i++) {
+            const __fp16 h = (__fp16)(rnd() * 0.05f);
+            memcpy(w + 2u * i, &h, 2u);
+        }
+    }
+    float *x = malloc((size_t)rows * in_dim * sizeof(float));
+    for (size_t i = 0; i < (size_t)rows * in_dim; i++) x[i] = rnd();
+    double *xd = malloc((size_t)in_dim * sizeof(double));
+    float *ref = malloc((size_t)rows * out_dim * sizeof(float));
+    for (uint32_t r = 0; r < rows; r++) {
+        for (uint32_t i = 0; i < in_dim; i++) xd[i] = x[(size_t)r * in_dim + i];
+        for (uint32_t o = 0; o < out_dim; o++) {
+            double acc = 0.0;
+            if (q8) {
+                acc = q8_0_row_dot(w + (size_t)o * (in_dim / 32u) * 34u, in_dim, xd);
+            } else {
+                for (uint32_t i = 0; i < in_dim; i++) {
+                    __fp16 h; memcpy(&h, w + 2u * ((size_t)o * in_dim + i), 2u);
+                    acc += (double)(float)h * xd[i];
+                }
+            }
+            ref[(size_t)r * out_dim + o] = (float)acc;
+        }
+    }
+    ds4_gpu_tensor *t_x = ds4_gpu_tensor_alloc((uint64_t)rows * in_dim * sizeof(float));
+    ds4_gpu_tensor *t_o = ds4_gpu_tensor_alloc((uint64_t)rows * out_dim * sizeof(float));
+    float *gpu = malloc((size_t)rows * out_dim * sizeof(float));
+    int ok = t_x && t_o && ds4_gpu_set_model_map(blob, wbytes) &&
+             ds4_gpu_tensor_write(t_x, 0, x, (uint64_t)rows * in_dim * sizeof(float));
+    double rel[2] = {0.0, 0.0};
+    for (int exact = 1; exact >= 0 && ok; exact--) {
+        ds4_gpu_set_exact_mm(exact);
+        ok = q8 ? ds4_gpu_matmul_quant_tensor(t_o, blob, wbytes, 0, 8u, in_dim, out_dim, t_x, rows)
+                : ds4_gpu_matmul_f16_tensor(t_o, blob, wbytes, 0, in_dim, out_dim, t_x, rows);
+        ds4_gpu_set_exact_mm(0);
+        ok = ok && ds4_gpu_tensor_read(t_o, 0, gpu, (uint64_t)rows * out_dim * sizeof(float));
+        double worst = 0.0, sc = 0.0;
+        for (size_t i = 0; ok && i < (size_t)rows * out_dim; i++) {
+            worst = fmax(worst, fabs((double)gpu[i] - ref[i]));
+            sc = fmax(sc, fabs((double)ref[i]));
+        }
+        rel[exact] = worst / fmax(sc, 1e-9);
+    }
+    if (!ok) { printf("  [%s] rows matmul dispatch failed\n", label); return 1; }
+    const int pass = rel[1] <= 3e-6;
+    printf("  [%s] %-18s %s  rel=%.3e f32 tiles, %.3e half tiles  (%s %ux%u, %u rows)\n", label,
+           "rows matmul", pass ? "ok  " : "FAIL", rel[1], rel[0], q8 ? "q8_0" : "f16", out_dim, in_dim, rows);
+    ds4_gpu_tensor_free(t_x); ds4_gpu_tensor_free(t_o);
+    free(blob); free(x); free(xd); free(ref); free(gpu);
+    return !pass;
 }
 
 static int run_fused_moe(const char *label, uint32_t in_dim, uint32_t mid_dim,
@@ -1712,6 +1777,10 @@ int main(void) {
     fail |= run_route("released", 384u, 6u, 1.5f, 1u);
     fail |= run_route("batch", 384u, 6u, 1.5f, 64u);
     fail |= run_offset_matmul("mini", 256u, 128u, 8u, 0u);
+    fail |= run_rows_matmul("q8_0 64", 5120u, 1280u, 64u, 1);
+    fail |= run_rows_matmul("q8_0 40", 5120u, 2304u, 40u, 1);
+    fail |= run_rows_matmul("f16 64", 5120u, 384u, 64u, 0);
+    fail |= run_rows_matmul("f16 9", 2304u, 512u, 9u, 0);
     fail |= run_offset_matmul("mini", 256u, 128u, 8u, 5u);
     /* every precision the released checkpoint stores an attention projection at:
      * q_a/q_b/kv/output_b are Q8_0, compressor and indexer F16, the mini model F32 */

@@ -65977,9 +65977,9 @@ static int g_dsv41_env_moe_per_token = -1, g_dsv41_env_moe_token_major = -1;
 
 /* A model-resident mat-vec at whatever precision the checkpoint stores: the mini model is
  * F32 throughout, the released one mixes F16 and Q8_0. */
-static bool dsv41_gpu_matvec(const ds4_model *m, const ds4_tensor *t, uint64_t offset,
-                             uint64_t in_dim, uint64_t out_dim, uint64_t rows,
-                             const ds4_gpu_tensor *x, ds4_gpu_tensor *out) {
+static bool dsv41_gpu_matvec_rows(const ds4_model *m, const ds4_tensor *t, uint64_t offset,
+                                  uint64_t in_dim, uint64_t out_dim, uint64_t rows,
+                                  const ds4_gpu_tensor *x, ds4_gpu_tensor *out) {
     if (t->type == DS4_TENSOR_F32) {
         return ds4_gpu_matmul_f32_tensor(out, m->map, m->size, offset,
                                          in_dim, out_dim, x, rows) != 0;
@@ -65990,6 +65990,20 @@ static bool dsv41_gpu_matvec(const ds4_model *m, const ds4_tensor *t, uint64_t o
     }
     return ds4_gpu_matmul_quant_tensor(out, m->map, m->size, offset, t->type,
                                        in_dim, out_dim, x, rows) != 0;
+}
+
+/* Above eight rows (one, for F16) the generic entries move to the matrix kernels, whose
+ * half tiles put a prefill chunk's logits ~1e-1 from the decode path's and can flip the
+ * router's choice; V4.1 takes them with F32 tiles.  DS4_DSV41_HALF_MM=1 keeps the half
+ * tiles, for comparison. */
+static int g_dsv41_env_half_mm = -1;
+static bool dsv41_gpu_matvec(const ds4_model *m, const ds4_tensor *t, uint64_t offset,
+                             uint64_t in_dim, uint64_t out_dim, uint64_t rows,
+                             const ds4_gpu_tensor *x, ds4_gpu_tensor *out) {
+    ds4_gpu_set_exact_mm(!dsv41_env("DS4_DSV41_HALF_MM", &g_dsv41_env_half_mm));
+    const bool ok = dsv41_gpu_matvec_rows(m, t, offset, in_dim, out_dim, rows, x, out);
+    ds4_gpu_set_exact_mm(0);
+    return ok;
 }
 
 /* Two projections reading the same input, in one dispatch.  The pair kernel takes a
