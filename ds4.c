@@ -71967,7 +71967,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
         /* Private read-only mapping, no prefetch: the tables are 203 GB and must stay
          * out of both the resident set and the GPU map ranges.  Rows are faulted in
          * one at a time by engram_lookup. */
-        model_open(&e->engram_model, opt->engram_path, false, false);
+        /* the tables are gathered on the CPU inside the layer loop, so a cold page
+         * is a stall there; ask for the read-ahead up front */
+        model_open(&e->engram_model, opt->engram_path, false, true);
         engram_weights_bind(&e->engram_weights, &g_ds4_engram, &e->engram_model);
         e->engram_ready = true;
     }
@@ -73764,6 +73766,9 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     if (ds4_model_is_dsv41()) {
         e->tp.vocab_split = false;
         g_dsv41_tp.tp = &e->tp;
+        /* engram rows are gathered on the CPU inside the layer loop; a cold
+         * page-in can hold a gate well past the dead-peer timeout */
+        ds4_tp_raise_gate_timeout_ms(tp, 5000);
     }
     e->tp.ctx = tp;
     e->tp.rank = ds4_tp_rank(tp);

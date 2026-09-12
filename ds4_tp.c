@@ -209,6 +209,7 @@ struct ds4_tp {
     uint64_t batch_in_off;      /* [layer][row] verify-block peer partials */
     uint64_t timeout_sec;
     uint64_t gate_timeout_ms;
+    bool gate_timeout_set;      /* DS4_TP_GATE_TIMEOUT_MS given */
     atomic_bool failed;
 #ifdef DS4_TP_HAVE_VERBS
     ds4_tp_rdma rdma;
@@ -1829,7 +1830,10 @@ int ds4_tp_create(
     const char *gate_tmo = getenv("DS4_TP_GATE_TIMEOUT_MS");
     if (gate_tmo) {
         const long value = strtol(gate_tmo, NULL, 10);
-        if (value > 0 && value <= 60000) tp->gate_timeout_ms = (uint64_t)value;
+        if (value > 0 && value <= 60000) {
+            tp->gate_timeout_ms = (uint64_t)value;
+            tp->gate_timeout_set = true;
+        }
     }
 
     int rdma_ok = 0;
@@ -2024,6 +2028,12 @@ int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers) {
 
 /* End of the verify block: every gate must have been exchanged (all
  * posted receives consumed) and our signaled sends reaped. */
+void ds4_tp_raise_gate_timeout_ms(ds4_tp *tp, uint64_t ms) {
+    if (!tp || tp->gate_timeout_set || tp->gate_timeout_ms >= ms) return;
+    tp->gate_timeout_ms = ms;
+    fprintf(stderr, "ds4-tp: gate timeout raised to %llums\n", (unsigned long long)ms);
+}
+
 int ds4_tp_batch_block_end(ds4_tp *tp) {
 #ifdef DS4_TP_HAVE_VERBS
     ds4_tp_rdma *r = &tp->rdma;
