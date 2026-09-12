@@ -299,6 +299,8 @@ struct dsv41_index_score_args {
     uint n_scan;        // positions to score
     uint use_positions; // 0 = score 0..n_scan-1, 1 = score positions[i]
     float scale;        // softmax_scale * n_heads^-0.5, applied to the head weights
+    uint rows;          // queries, tgpig.y; q and weights are per row
+    uint stride;        // row stride of scores
 };
 
 // `scale` folds softmax_scale * n_heads^-0.5 in here so the caller never has to touch the
@@ -317,10 +319,14 @@ kernel void kernel_dsv41_index_score(
         ushort sg    [[simdgroup_index_in_threadgroup]],
         ushort nsg   [[simdgroups_per_threadgroup]]) {
     const uint i = tgpig.x * (uint)nsg + (uint)sg;
-    if (i >= args.n_scan) return;
+    const uint t = tgpig.y;
+    if (i >= args.n_scan || t >= args.rows) return;
     const uint j = args.use_positions ? (uint)positions[i] : i;
 
     const uint idim = args.index_dim;
+    q += (ulong)t * args.n_index_head * idim;
+    weights += (ulong)t * args.n_index_head;
+    scores += (ulong)t * args.stride;
     device const float *k = index_k + (ulong)j * idim;
 
     float contrib = 0.0f;
@@ -627,6 +633,234 @@ kernel void kernel_dsv41_block_mask(
         uint gid [[thread_position_in_grid]]) {
     if (gid >= args.n) return;
     if (!block_keep[gid / args.block]) scores[gid] = -1.0e30f;
+}
+
+// ---- Selection over a prefill chunk, one row per query ----------------------------
+//
+// Query t of a chunk starting at pos0 reaches n_t = min(n_cap, (pos0 + t + 1) / ratio)
+// compressed positions -- or ceil(n_t / block) candidate blocks -- and wants
+// k_t = min(k_max, n_t) of them.  The kernels below take that rule instead of one fixed
+// n and k, so a single dispatch covers every query of the chunk with each keeping its
+// own reach.  It is also what gives each query its own candidate blocks: with one block
+// decision per layer, every query of a chunk was masked with the last query's.
+
+struct dsv41_rows_args {
+    uint rows;
+    uint stride;      // row stride of scores / keep, in elements
+    uint n_cap;       // positions published so far
+    uint pos0;
+    uint ratio;
+    uint k_max;
+    uint blocks;      // 1: extents count blocks of `block`, not positions
+    uint block;
+    uint offset;      // compact: added to every id
+    uint width;       // compact: output row width
+    uint nb_stride;   // block_max / block_mask: row stride of the block arrays
+    uint mode;        // radix: 0 settles the score, 1 the index among ties
+};
+
+static inline uint dsv41_row_reach(constant dsv41_rows_args &a, uint t) {
+    return min(a.n_cap, (a.pos0 + t + 1u) / a.ratio);
+}
+
+static inline uint dsv41_row_n(constant dsv41_rows_args &a, uint t) {
+    const uint n = dsv41_row_reach(a, t);
+    return a.blocks ? (n + a.block - 1u) / a.block : n;
+}
+
+kernel void kernel_dsv41_rank_select_rows(
+        constant dsv41_rows_args &a,
+        device const float       *scores,   // [rows, stride]
+        device int               *keep,     // [rows, stride]
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]],
+        ushort nsg   [[simdgroups_per_threadgroup]]) {
+    const uint t = tgpig.y;
+    if (t >= a.rows) return;
+    const uint n = dsv41_row_n(a, t);
+    const uint k = min(a.k_max, n);
+    const uint j = tgpig.x * (uint)nsg + (uint)sg;
+    if (j >= n) return;
+    scores += (ulong)t * a.stride;
+    keep += (ulong)t * a.stride;
+
+    const float mine = scores[j];
+    uint beats = 0u;
+    for (uint i = lane; i < n; i += 32u) {
+        const float other = scores[i];
+        beats += (other > mine || (other == mine && i > j)) ? 1u : 0u;
+    }
+    beats = simd_sum(beats);
+    if (lane == 0u) keep[j] = beats < k ? 1 : 0;
+}
+
+// One threadgroup per row; a row that reaches nothing comes out all -1.
+kernel void kernel_dsv41_compact_rows(
+        constant dsv41_rows_args &a,
+        device const int         *keep,     // [rows, stride]
+        device int               *out,      // [rows, width]
+        threadgroup uint         *counts [[threadgroup(0)]],
+        uint tgpig [[threadgroup_position_in_grid]],
+        uint tpitg [[thread_position_in_threadgroup]],
+        uint ntg   [[threads_per_threadgroup]]) {
+    const uint t = tgpig;
+    if (t >= a.rows) return;
+    const uint n = dsv41_row_n(a, t);
+    const uint k = min(a.k_max, n);
+    keep += (ulong)t * a.stride;
+    out += (ulong)t * a.width;
+
+    const uint chunk = (n + ntg - 1u) / ntg;
+    const uint lo = tpitg * chunk;
+    const uint hi = min(lo + chunk, n);
+    uint mine = 0u;
+    for (uint j = lo; j < hi; j++) mine += keep[j] ? 1u : 0u;
+    counts[tpitg] = mine;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tpitg == 0u) {
+        uint running = 0u;
+        for (uint i = 0; i < ntg; i++) {
+            const uint c = counts[i];
+            counts[i] = running;
+            running += c;
+        }
+        counts[ntg] = running;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint w = counts[tpitg];
+    for (uint j = lo; j < hi && w < k; j++) {
+        if (!keep[j]) continue;
+        out[w++] = (int)(j + a.offset);
+    }
+    const uint filled = min(counts[ntg], k);
+    for (uint i = filled + tpitg; i < a.width; i += ntg) out[i] = -1;
+}
+
+kernel void kernel_dsv41_block_max_rows(
+        constant dsv41_rows_args &a,
+        device const float       *scores,       // [rows, stride]
+        device float             *block_score,  // [rows, nb_stride]
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]],
+        ushort nsg   [[simdgroups_per_threadgroup]]) {
+    const uint t = tgpig.y;
+    if (t >= a.rows) return;
+    const uint n = dsv41_row_reach(a, t);
+    const uint nb = (n + a.block - 1u) / a.block;
+    const uint b = tgpig.x * (uint)nsg + (uint)sg;
+    if (b >= nb) return;
+    scores += (ulong)t * a.stride;
+    block_score += (ulong)t * a.nb_stride;
+
+    const uint lo = b * a.block;
+    const uint hi = min(lo + a.block, n);
+    float mx = -1.0e30f;
+    for (uint j = lo + lane; j < hi; j += 32u) mx = max(mx, scores[j]);
+    mx = simd_max(mx);
+    if (lane != 0u) return;
+    // the block holding the query's newest position is pinned in
+    block_score[b] = b == (n - 1u) / a.block ? 1.0e30f : mx;
+}
+
+kernel void kernel_dsv41_block_mask_rows(
+        constant dsv41_rows_args &a,
+        device const int         *block_keep,   // [rows, nb_stride]
+        device float             *scores,       // [rows, stride]
+        uint2 gid [[thread_position_in_grid]]) {
+    const uint t = gid.y;
+    if (t >= a.rows) return;
+    const uint j = gid.x;
+    if (j >= dsv41_row_reach(a, t)) return;
+    if (!block_keep[(ulong)t * a.nb_stride + j / a.block]) {
+        scores[(ulong)t * a.stride + j] = -1.0e30f;
+    }
+}
+
+// The radix select per row: its refinement state and histogram are per row too.
+kernel void kernel_dsv41_radix_init_rows(
+        constant dsv41_rows_args &a,
+        device dsv41_radix_state *state,    // [rows]
+        device uint              *hist,     // [rows, 256]
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        uint2 tpitg [[thread_position_in_threadgroup]],
+        uint2 ntg   [[threads_per_threadgroup]]) {
+    const uint t = tgpig.y;
+    if (t >= a.rows) return;
+    if (tpitg.x == 0u) {
+        const uint n = dsv41_row_n(a, t);
+        state[t].prefix = 0u;
+        state[t].shift = 24u;
+        state[t].k_rem = min(a.k_max, n);
+        state[t].thresh = 0u;
+        state[t].pass = 0u;
+    }
+    for (uint b = tpitg.x; b < 256u; b += ntg.x) hist[(ulong)t * 256u + b] = 0u;
+}
+
+kernel void kernel_dsv41_radix_hist_rows(
+        constant dsv41_rows_args &a,
+        device const float       *scores,
+        device dsv41_radix_state *state,
+        device atomic_uint       *hist,
+        uint2 gid [[thread_position_in_grid]]) {
+    const uint t = gid.y;
+    if (t >= a.rows) return;
+    const uint j = gid.x;
+    if (j >= dsv41_row_n(a, t)) return;
+    device dsv41_radix_state *st = state + t;
+    const uint u = dsv41_sortable(scores[(ulong)t * a.stride + j]);
+    if (a.mode != 0u && u != st->thresh) return;
+    const uint key = a.mode == 0u ? u : j;
+    const uint shift = st->shift;
+    if (st->pass != 0u && (key >> (shift + 8u)) != st->prefix) return;
+    atomic_fetch_add_explicit(&hist[(ulong)t * 256u + ((key >> shift) & 255u)], 1u,
+                              memory_order_relaxed);
+}
+
+kernel void kernel_dsv41_radix_scan_rows(
+        constant dsv41_rows_args &a,
+        device dsv41_radix_state *state,
+        device uint              *hist,
+        uint gid [[thread_position_in_grid]]) {
+    const uint t = gid;
+    if (t >= a.rows) return;
+    device dsv41_radix_state *st = state + t;
+    hist += (ulong)t * 256u;
+    uint cum = 0u;
+    uint chosen = 0u;
+    for (int b = 255; b >= 0; b--) {
+        const uint c = hist[b];
+        if (cum + c >= st->k_rem) { chosen = (uint)b; break; }
+        cum += c;
+    }
+    st->prefix = st->pass == 0u ? chosen : ((st->prefix << 8u) | chosen);
+    st->k_rem -= cum;
+    st->pass += 1u;
+    if (st->shift == 0u) {
+        if (a.mode == 0u) st->thresh = st->prefix;
+        st->shift = 24u;
+        st->pass = 0u;
+    } else {
+        st->shift -= 8u;
+    }
+    for (uint b = 0; b < 256u; b++) hist[b] = 0u;
+}
+
+kernel void kernel_dsv41_radix_keep_rows(
+        constant dsv41_rows_args       &a,
+        device const float             *scores,
+        device const dsv41_radix_state *state,
+        device int                     *keep,
+        uint2 gid [[thread_position_in_grid]]) {
+    const uint t = gid.y;
+    if (t >= a.rows) return;
+    const uint j = gid.x;
+    if (j >= dsv41_row_n(a, t)) return;
+    const uint u = dsv41_sortable(scores[(ulong)t * a.stride + j]);
+    keep[(ulong)t * a.stride + j] =
+        (u > state[t].thresh || (u == state[t].thresh && j >= state[t].prefix)) ? 1 : 0;
 }
 
 // Compacts a keep mask into ascending positions, shifted by `offset`, with anything the

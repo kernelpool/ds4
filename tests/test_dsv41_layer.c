@@ -23,6 +23,9 @@
 
 int ds4_test_dsv41_attn_gpu(const char *, const int *, unsigned, const unsigned *, unsigned,
                             float *, float *, double *, const char *);
+int ds4_test_dsv41_prefill(const char *, const int *, unsigned, float *, float *, float *,
+                           float *, int32_t *, float *, const char *);
+int ds4_test_dsv41_gpu_picks(const char *, const int *, unsigned, unsigned, unsigned, int32_t *);
 
 #define MAX_CASES 10u
 
@@ -102,5 +105,45 @@ int main(int argc, char **argv) {
     }
     printf("v4.1 layer composition: %s\n", fail ? "FAILED" : "all layer kinds match");
     free(cpu_all); free(gpu_all);
+
+    /* The indexer's picks over a CHUNKED prefill against the CPU reference's per-position
+     * selection, for every index-source layer of the mini.  The layer harness above runs
+     * one position at a time, so it cannot see a query being masked with another query's
+     * candidate blocks; this can.  Ids are compared as compressed positions, and the two
+     * sides pad differently past a query's reach, so only the reachable prefix is held. */
+    if (!real) {
+        enum { NL = 6, K = 8 };
+        static const unsigned index_layers[] = { 2, 4, 5 };
+        static const unsigned chunks[] = { 24, 7, 1 };
+        int32_t *ref = calloc((size_t)NL * n * K, sizeof(int32_t));
+        int32_t *got = calloc((size_t)n * K, sizeof(int32_t));
+        const int nl = ds4_test_dsv41_prefill(gguf, tokens, n, NULL, NULL, NULL, NULL,
+                                              ref, NULL, NULL);
+        int pfail = nl != NL;
+        for (unsigned ci = 0; ci < sizeof(chunks) / sizeof(chunks[0]) && !pfail; ci++) {
+            for (unsigned li = 0; li < sizeof(index_layers) / sizeof(index_layers[0]); li++) {
+                const unsigned il = index_layers[li];
+                unsigned bad = 0, compared = 0;
+                if (!ds4_test_dsv41_gpu_picks(gguf, tokens, n, chunks[ci], il, got)) { pfail = 1; break; }
+                for (unsigned t = 0; t < n; t++) {
+                    const int32_t *r = ref + ((size_t)il * n + t) * K, *g = got + (size_t)t * K;
+                    unsigned nr = 0, ng = 0;
+                    int32_t rv[K], gv[K];
+                    for (unsigned j = 0; j < K; j++) {
+                        if (r[j] >= 0) rv[nr++] = r[j] - (int32_t)n;   /* joined-KV offset */
+                        if (g[j] >= 0) gv[ng++] = g[j];
+                    }
+                    compared += nr;
+                    if (nr != ng || memcmp(rv, gv, nr * sizeof(int32_t)) != 0) bad++;
+                }
+                if (bad) pfail = 1;
+                printf("  picks layer%u chunk %-2u %s  %u/%u positions agree with the CPU reference (%u ids)\n",
+                       il, chunks[ci], bad ? "FAIL" : "ok  ", n - bad, n, compared);
+            }
+        }
+        free(ref); free(got);
+        printf("v4.1 chunked selection: %s\n", pfail ? "FAILED" : "every query selects with its own reach");
+        if (pfail) fail = 1;
+    }
     return fail;
 }

@@ -311,6 +311,65 @@ int ds4_gpu_dsv41_index_score(uint32_t n_index_head,
                               float scale,
                               ds4_gpu_tensor *scores);
 
+/* The same scores for `rows` queries at once: `q` is [rows, heads, dim], `weights`
+ * [rows, heads], `scores` [rows, stride] with every row scored over 0..n_scan-1. */
+int ds4_gpu_dsv41_index_score_rows(uint32_t rows,
+                                   uint32_t n_index_head,
+                                   uint32_t index_dim,
+                                   uint32_t n_scan,
+                                   uint32_t stride,
+                                   const ds4_gpu_tensor *q,
+                                   const ds4_gpu_tensor *index_k,
+                                   const ds4_gpu_tensor *weights,
+                                   float scale,
+                                   ds4_gpu_tensor *scores);
+
+/* DeepSeek V4.1 selection over a prefill chunk, one row per query.  Query t reaches
+ * n_t = min(n_cap, (pos0 + t + 1) / ratio) positions -- or ceil(n_t / block) blocks with
+ * `blocks` set -- and keeps min(k_max, n_t) of them by the same (score, index) order as
+ * ds4_gpu_dsv41_topk_select.  `keep` is [rows, stride] scratch; `out`, when given, receives
+ * each query's picks ascending, shifted by `offset`, padded to `width` with -1.  Past the
+ * rank pass's reach the radix select runs per row, which needs `state` (rows x 5 u32) and
+ * `hist` (rows x 256 u32). */
+int ds4_gpu_dsv41_select_rows(uint32_t rows,
+                              uint32_t stride,
+                              uint32_t n_cap,
+                              uint32_t pos0,
+                              uint32_t ratio,
+                              uint32_t k_max,
+                              uint32_t offset,
+                              uint32_t width,
+                              int blocks,
+                              uint32_t block,
+                              const ds4_gpu_tensor *scores,
+                              ds4_gpu_tensor *keep,
+                              ds4_gpu_tensor *out,
+                              ds4_gpu_tensor *state,
+                              ds4_gpu_tensor *hist);
+
+/* The candidate source's level one for every query of a chunk: `block_score` is
+ * [rows, nb_stride], each row scored over its own reach with the newest block pinned. */
+int ds4_gpu_dsv41_block_max_rows(uint32_t rows,
+                                 uint32_t stride,
+                                 uint32_t n_cap,
+                                 uint32_t pos0,
+                                 uint32_t ratio,
+                                 uint32_t block,
+                                 uint32_t nb_stride,
+                                 const ds4_gpu_tensor *scores,
+                                 ds4_gpu_tensor *block_score);
+
+/* A consumer's scores masked by its own query's block decision, [rows, nb_stride]. */
+int ds4_gpu_dsv41_block_mask_rows(uint32_t rows,
+                                  uint32_t stride,
+                                  uint32_t n_cap,
+                                  uint32_t pos0,
+                                  uint32_t ratio,
+                                  uint32_t block,
+                                  uint32_t nb_stride,
+                                  const ds4_gpu_tensor *block_keep,
+                                  ds4_gpu_tensor *scores);
+
 /* DeepSeek V4.1 RoPE: adjacent element pairs as one complex number, applied to the last
  * `rope_dim` elements of every head.  `inverse` conjugates.  cos/sin are [max_pos, rope_dim/2],
  * so YaRN and the per-layer theta stay on the host. */
