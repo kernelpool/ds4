@@ -47204,6 +47204,8 @@ typedef struct {
     uint32_t width;
     uint32_t nb_stride;
     uint32_t mode;
+    uint32_t slice_len;
+    uint32_t n_slices;
 } dsv41_gpu_rows_args;
 
 static uint32_t dsv41_gpu_row_n(const dsv41_gpu_rows_args *a, uint32_t t) {
@@ -47241,7 +47243,7 @@ int ds4_gpu_dsv41_select_rows(uint32_t rows,
     dsv41_gpu_rows_args a = {
         .rows = rows, .stride = stride, .n_cap = n_cap, .pos0 = pos0, .ratio = ratio,
         .k_max = k_max, .blocks = blocks ? 1u : 0u, .block = block, .offset = offset,
-        .width = width, .nb_stride = 0u, .mode = 0u,
+        .width = width, .nb_stride = 0u, .mode = 0u, .slice_len = 0u, .n_slices = 0u,
     };
     if (rows == 0 || ratio == 0 || k_max == 0 || (blocks && block == 0)) return 0;
     const uint32_t n_max = dsv41_gpu_row_n(&a, rows - 1u);
@@ -47304,7 +47306,37 @@ int ds4_gpu_dsv41_select_rows(uint32_t rows,
            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
         }
-        if (out) {
+        /* long rows compact over many threadgroups, their slice counts in the histogram
+         * scratch (free once the radix passes are done, zeroed again by the next init) */
+        static int sliced = -1;
+        if (sliced < 0) sliced = getenv("DS4_DSV41_COMPACT_SINGLE") == NULL;
+        if (out && sliced && hist && n_max > 8192u) {
+            id<MTLComputePipelineState> p_count = ds4_gpu_get_pipeline("kernel_dsv41_compact_count_rows");
+            id<MTLComputePipelineState> p_scan2 = ds4_gpu_get_pipeline("kernel_dsv41_compact_scan_rows");
+            id<MTLComputePipelineState> p_write = ds4_gpu_get_pipeline("kernel_dsv41_compact_write_rows");
+            if (!p_count || !p_scan2 || !p_write) return 0;
+            a.n_slices = (n_max + 2047u) / 2048u;
+            if (a.n_slices > 255u) a.n_slices = 255u;
+            a.slice_len = (n_max + a.n_slices - 1u) / a.n_slices;
+            enc = ds4_gpu_compute_encoder(cb);
+            dsv41_gpu_rows_bind(enc, &a, p_count, keep, hist, NULL);
+            [enc setThreadgroupMemoryLength:32u * sizeof(uint32_t) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(a.n_slices, rows, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            enc = ds4_gpu_compute_encoder(cb);
+            dsv41_gpu_rows_bind(enc, &a, p_scan2, hist, out, NULL);
+            [enc setThreadgroupMemoryLength:32u * sizeof(uint32_t) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            enc = ds4_gpu_compute_encoder(cb);
+            dsv41_gpu_rows_bind(enc, &a, p_write, keep, hist, out);
+            [enc setThreadgroupMemoryLength:32u * sizeof(uint32_t) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(a.n_slices, rows, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        } else if (out) {
             const uint32_t ct = 256u;
             enc = ds4_gpu_compute_encoder(cb);
             /* keep is never read past a row's reach, so a rows-with-no-reach dispatch may

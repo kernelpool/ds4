@@ -709,6 +709,8 @@ struct dsv41_rows_args {
     uint width;       // compact: output row width
     uint nb_stride;   // block_max / block_mask: row stride of the block arrays
     uint mode;        // radix: 0 settles the score, 1 the index among ties
+    uint slice_len;   // sliced compact: positions per slice
+    uint n_slices;
 };
 
 static inline uint dsv41_row_reach(constant dsv41_rows_args &a, uint t) {
@@ -787,6 +789,105 @@ kernel void kernel_dsv41_compact_rows(
     }
     const uint filled = min(counts[ntg], k);
     for (uint i = filled + tpitg; i < a.width; i += ntg) out[i] = -1;
+}
+
+// The compaction over many threadgroups for long rows: slice s of a row covers
+// [s * slice_len, ...) and a thread a contiguous piece of it.  The slices' counts go into
+// the row's 256-entry histogram scratch (so at most 255 slices), one threadgroup per row
+// prefixes them, and each slice then writes its kept positions from its offset.
+kernel void kernel_dsv41_compact_count_rows(
+        constant dsv41_rows_args &a,
+        device const int         *keep,     // [rows, stride]
+        device uint              *slices,   // [rows, 256]
+        threadgroup uint         *sh [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        uint2  tpitg [[thread_position_in_threadgroup]],
+        uint2  ntg   [[threads_per_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]],
+        ushort nsg   [[simdgroups_per_threadgroup]]) {
+    const uint t = tgpig.y, s = tgpig.x;
+    if (t >= a.rows || s >= a.n_slices) return;
+    const uint n = dsv41_row_n(a, t);
+    const uint lo = s * a.slice_len, hi = min(lo + a.slice_len, n);
+    const uint c = (a.slice_len + ntg.x - 1u) / ntg.x;
+    const uint my_lo = min(lo + tpitg.x * c, hi), my_hi = min(my_lo + c, hi);
+    keep += (ulong)t * a.stride;
+    uint cnt = 0u;
+    for (uint j = my_lo; j < my_hi; j++) cnt += keep[j] ? 1u : 0u;
+    cnt = simd_sum(cnt);
+    if (lane == 0u) sh[sg] = cnt;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tpitg.x != 0u) return;
+    uint total = 0u;
+    for (ushort i = 0; i < nsg; i++) total += sh[i];
+    slices[(ulong)t * 256u + s] = total;
+}
+
+// counts in, offsets out; the output's tail past the kept count is set to -1 here
+kernel void kernel_dsv41_compact_scan_rows(
+        constant dsv41_rows_args &a,
+        device uint              *slices,   // [rows, 256]
+        device int               *out,      // [rows, width]
+        threadgroup uint         *sh [[threadgroup(0)]],
+        uint   tgpig [[threadgroup_position_in_grid]],
+        uint   tpitg [[thread_position_in_threadgroup]],
+        uint   ntg   [[threads_per_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]],
+        ushort nsg   [[simdgroups_per_threadgroup]]) {
+    const uint t = tgpig;
+    if (t >= a.rows) return;
+    slices += (ulong)t * 256u;
+    const uint v = tpitg < a.n_slices ? slices[tpitg] : 0u;
+    const uint ex = simd_prefix_exclusive_sum(v);
+    const uint in_sg = simd_sum(v);
+    if (lane == 0u) sh[sg] = in_sg;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint before = 0u, total = 0u;
+    for (ushort i = 0; i < nsg; i++) {
+        const uint c = sh[i];
+        before += i < sg ? c : 0u;
+        total += c;
+    }
+    if (tpitg < a.n_slices) slices[tpitg] = before + ex;
+    const uint k = min(a.k_max, dsv41_row_n(a, t));
+    out += (ulong)t * a.width;
+    for (uint i = min(total, k) + tpitg; i < a.width; i += ntg) out[i] = -1;
+}
+
+kernel void kernel_dsv41_compact_write_rows(
+        constant dsv41_rows_args &a,
+        device const int         *keep,     // [rows, stride]
+        device const uint        *slices,   // [rows, 256], offsets
+        device int               *out,      // [rows, width]
+        threadgroup uint         *sh [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        uint2  tpitg [[thread_position_in_threadgroup]],
+        uint2  ntg   [[threads_per_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]],
+        ushort nsg   [[simdgroups_per_threadgroup]]) {
+    const uint t = tgpig.y, s = tgpig.x;
+    if (t >= a.rows || s >= a.n_slices) return;
+    const uint n = dsv41_row_n(a, t);
+    const uint k = min(a.k_max, n);
+    const uint lo = s * a.slice_len, hi = min(lo + a.slice_len, n);
+    const uint c = (a.slice_len + ntg.x - 1u) / ntg.x;
+    const uint my_lo = min(lo + tpitg.x * c, hi), my_hi = min(my_lo + c, hi);
+    keep += (ulong)t * a.stride;
+    out += (ulong)t * a.width;
+    uint cnt = 0u;
+    for (uint j = my_lo; j < my_hi; j++) cnt += keep[j] ? 1u : 0u;
+    const uint ex = simd_prefix_exclusive_sum(cnt);
+    const uint in_sg = simd_sum(cnt);
+    if (lane == 0u) sh[sg] = in_sg;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint w = slices[(ulong)t * 256u + s] + ex;
+    for (ushort i = 0; i < sg; i++) w += sh[i];
+    for (uint j = my_lo; j < my_hi && w < k; j++) {
+        if (keep[j]) out[w++] = (int)(j + a.offset);
+    }
 }
 
 kernel void kernel_dsv41_block_max_rows(

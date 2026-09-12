@@ -1815,7 +1815,9 @@ static int run_radix_rows(const char *label, uint32_t n, uint32_t k, float tie_f
     unsetenv("DS4_DSV41_FORCE_RADIX");
     const double ms = now_ms() - t0;
     ok = ok && ds4_gpu_tensor_read(t_keep, 0, keep_g, (uint64_t)rows * n * sizeof(int32_t));
-    uint32_t bad = 0;
+    int32_t *out_g = malloc((size_t)rows * k * sizeof(int32_t));
+    ok = ok && out_g && ds4_gpu_tensor_read(t_out, 0, out_g, (uint64_t)rows * k * sizeof(int32_t));
+    uint32_t bad = 0, bad_out = 0;
     for (uint32_t r = 0; ok && r < rows; r++) {
         const uint32_t nr = pos0 + r + 1u;
         for (uint32_t i = 0; i < n; i++) keep_r[i] = 0;
@@ -1829,10 +1831,19 @@ static int run_radix_rows(const char *label, uint32_t n, uint32_t k, float tie_f
             if (best >= 0) keep_r[best] = 1;
         }
         for (uint32_t i = 0; i < nr; i++) if (keep_g[(size_t)r * n + i] != keep_r[i]) bad++;
+        /* the compacted list: the kept positions ascending, -1 past the count */
+        uint32_t w = 0;
+        for (uint32_t i = 0; i < nr; i++) {
+            if (!keep_r[i]) continue;
+            if (w < k && out_g[(size_t)r * k + w] != (int32_t)i) bad_out++;
+            w++;
+        }
+        for (uint32_t i = w; i < k; i++) if (out_g[(size_t)r * k + i] != -1) bad_out++;
     }
-    const int pass = ok && !bad;
-    printf("  [%s] %-18s %s  %u mismatches over %u rows, %.2f ms (n=%u k=%u ties~%.0f%%)\n",
-           label, "radix select rows", pass ? "ok  " : "FAIL", bad, rows, ms, n, k, 100.0 * tie_frac);
+    const int pass = ok && !bad && !bad_out;
+    printf("  [%s] %-18s %s  %u keep, %u list mismatches over %u rows, %.2f ms (n=%u k=%u ties~%.0f%%)\n",
+           label, "radix select rows", pass ? "ok  " : "FAIL", bad, bad_out, rows, ms, n, k, 100.0 * tie_frac);
+    free(out_g);
     ds4_gpu_tensor_free(t_sc); ds4_gpu_tensor_free(t_keep); ds4_gpu_tensor_free(t_out);
     ds4_gpu_tensor_free(t_state); ds4_gpu_tensor_free(t_hist);
     free(sc); free(keep_r); free(keep_g);
