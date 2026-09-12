@@ -917,6 +917,313 @@ kernel void kernel_dsv41_compact(
     for (uint i = filled + tpitg; i < args.width; i += ntg) out[i] = -1;
 }
 
+// ---- Routed experts for a prefill chunk, expert-major, in F32 -------------------------
+//
+// A chunk's (token, slot) pairs are counting-sorted by expert on the device, then each
+// expert's tokens go through its weights in groups of up to DSV41_XM_R: a weight block is
+// decoded once and applied to every token of the group, so tokens sharing an expert read
+// it once.  Every pair's arithmetic is its own -- nothing is shared but the weight loads
+// -- so the result does not depend on how the pairs were grouped, and there is no MMA and
+// no half staging anywhere: the sums are the one-token kernels' F32 sums in another order.
+// The down projection lands per pair in the experts scratch and a last pass folds each
+// token's slots and its shared expert.
+
+#define DSV41_XM_R 8u
+
+struct dsv41_moe_xm_args {
+    uint n_expert;      // routed pool
+    uint topk;
+    uint rows;          // tokens
+    uint in_dim;
+    uint mid_dim;
+    uint out_dim;
+    uint n_pairs;       // rows * topk
+    ulong gate_expert_bytes;
+    ulong gate_row_bytes;
+    ulong down_expert_bytes;
+    ulong down_row_bytes;
+    float clamp;
+};
+
+static constant float dsv41_mxfp4_lut[16] = {
+     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+};
+
+static inline float dsv41_e8m0(uchar e) {
+    return as_type<float>(e == 0 ? 0x00400000u : (uint)e << 23);
+}
+
+// four nibble bytes of one block: elements i (low nibbles) and i+16 (high) for the lane's
+// four i; unscaled, the block scale goes on the sum
+static inline void dsv41_mxfp4_quarter(packed_uchar4 nib, threadgroup const float *lut,
+                                       thread float4 &lo, thread float4 &hi) {
+    lo = float4(lut[nib.x & 15u], lut[nib.y & 15u], lut[nib.z & 15u], lut[nib.w & 15u]);
+    hi = float4(lut[nib.x >> 4], lut[nib.y >> 4], lut[nib.z >> 4], lut[nib.w >> 4]);
+}
+
+// the nibble table in threadgroup memory, as in the one-token kernel
+#define DSV41_XM_LUT(lut, tid)                                                                 \
+    threadgroup float lut[16];                                                                \
+    if ((tid) < 16u) lut[tid] = dsv41_mxfp4_lut[tid];                                         \
+    threadgroup_barrier(mem_flags::mem_threadgroup)
+
+// pair p = (token, slot) counts toward its expert
+kernel void kernel_dsv41_moe_hist(
+        constant dsv41_moe_xm_args &a,
+        device const int           *sel,     // [rows, topk]
+        device atomic_uint         *counts,  // [n_expert], zero on entry
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= a.n_pairs) return;
+    const int e = sel[gid];
+    if (e < 0 || (uint)e >= a.n_expert) return;
+    atomic_fetch_add_explicit(&counts[e], 1u, memory_order_relaxed);
+}
+
+// Offsets, the group list, and the group count; one threadgroup, thread 0 walks the pool.
+// Clears the counts behind itself so the next layer's histogram starts at zero.  The
+// expert kernels are launched for the most groups there could be and exit past the count.
+kernel void kernel_dsv41_moe_scan(
+        constant dsv41_moe_xm_args &a,
+        device uint                *counts,  // [n_expert]
+        device uint                *cursor,  // [n_expert + 1]: scatter cursors, then n_groups
+        device uint                *groups,  // [n_pairs * 3]: expert, first sorted pair, count
+        uint tpitg [[thread_position_in_threadgroup]]) {
+    if (tpitg != 0u) return;
+    uint off = 0u, g = 0u;
+    for (uint e = 0; e < a.n_expert; e++) {
+        const uint c = counts[e];
+        cursor[e] = off;
+        for (uint k = 0; k < c; k += DSV41_XM_R) {
+            groups[3u * g] = e;
+            groups[3u * g + 1u] = off + k;
+            groups[3u * g + 2u] = min(DSV41_XM_R, c - k);
+            g++;
+        }
+        off += c;
+        counts[e] = 0u;
+    }
+    cursor[a.n_expert] = g;
+}
+
+kernel void kernel_dsv41_moe_scatter(
+        constant dsv41_moe_xm_args &a,
+        device const int           *sel,
+        device atomic_uint         *cursor,
+        device uint                *sorted,  // [n_pairs]: token << 8 | slot
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= a.n_pairs) return;
+    const int e = sel[gid];
+    if (e < 0 || (uint)e >= a.n_expert) return;
+    const uint pos = atomic_fetch_add_explicit(&cursor[e], 1u, memory_order_relaxed);
+    sorted[pos] = ((gid / a.topk) << 8) | (gid % a.topk);
+}
+
+// Gate and up for one expert group, register-blocked.  A lane owns half of every block
+// (16 k) for DSV41_XM_T of the group's tokens and holds that x in registers while it walks
+// DSV41_XM_ROWS rows of gate and of up, so a loaded x value meets 2*ROWS weights and a
+// decoded weight meets T tokens.  A threadgroup is DSV41_XM_SPLITS token slices by two row
+// sets, one simdgroup each, so 2*ROWS rows share a threadgroup and the slices share its
+// weight loads through L1.  A slice past the group's tokens exits; a slice's dead token
+// recomputes a live one's x, which keeps the loop branch-free, and only live results are
+// stored.  Lanes hold partials over different k of the same outputs and a simd_sum closes
+// each one.  The nibble table sits in threadgroup memory as in the one-token kernel, and
+// the block scale is applied to the block's sum, as there.
+//
+// Measured on the released dims against the one-token kernels run token-major, per
+// (token, expert) pair: 1.3x slower at one token per expert, 1.6x faster at two, 1.8x at
+// four and eight -- so the host takes this path from two tokens per expert up.
+#define DSV41_XM_T 2u        // tokens per simdgroup
+#define DSV41_XM_SPLITS 4u   // token slices per threadgroup; T * SPLITS = DSV41_XM_R
+#define DSV41_XM_ROWS 4u
+#define DSV41_XM_DOWN_ROWS 8u
+#define DSV41_XM_NV 2u       // float4 of x per lane per nibble half
+#define DSV41_XM_BPP 16u     // blocks per pass
+
+// the lane's part of a block against T x slices: loads the nibbles once, applies them to
+// every token, and folds the block scale into each running sum
+#define DSV41_XM_BLOCK(wp, dv, acc, xv) do {                                                  \
+    float4 lo_[DSV41_XM_NV], hi_[DSV41_XM_NV];                                               \
+    _Pragma("unroll") for (uint i_ = 0; i_ < DSV41_XM_NV; i_++) {                             \
+        dsv41_mxfp4_quarter(*(device const packed_uchar4 *)((wp) + boff + 4u * i_), lut,     \
+                            lo_[i_], hi_[i_]);                                                \
+    }                                                                                         \
+    _Pragma("unroll") for (uint t_ = 0; t_ < DSV41_XM_T; t_++) {                              \
+        float4 p_ = lo_[0] * (xv)[t_][0];                                                     \
+        _Pragma("unroll") for (uint i_ = 1; i_ < DSV41_XM_NV; i_++) {                         \
+            p_ = fma(lo_[i_], (xv)[t_][i_], p_);                                              \
+        }                                                                                     \
+        _Pragma("unroll") for (uint i_ = 0; i_ < DSV41_XM_NV; i_++) {                         \
+            p_ = fma(hi_[i_], (xv)[t_][DSV41_XM_NV + i_], p_);                                \
+        }                                                                                     \
+        (acc)[t_] = fma((dv), (p_.x + p_.y) + (p_.z + p_.w), (acc)[t_]);                      \
+    }                                                                                         \
+} while (0)
+
+// x for the lane's part of block `blk`, T tokens
+#define DSV41_XM_LOAD_X(xv, xr, blk) do {                                                     \
+    _Pragma("unroll") for (uint t_ = 0; t_ < DSV41_XM_T; t_++) {                              \
+        _Pragma("unroll") for (uint i_ = 0; i_ < DSV41_XM_NV; i_++) {                         \
+            (xv)[t_][i_] = *(device const float4 *)((xr)[t_] + (blk) * 32u + 4u * i_);        \
+            (xv)[t_][DSV41_XM_NV + i_] =                                                      \
+                *(device const float4 *)((xr)[t_] + (blk) * 32u + 16u + 4u * i_);             \
+        }                                                                                     \
+    }                                                                                         \
+} while (0)
+
+kernel void kernel_dsv41_moe_pair_xm_mxfp4(
+        constant dsv41_moe_xm_args &a,
+        device const uchar         *gate_w,  // all experts
+        device const uchar         *up_w,
+        device const float         *x,       // [rows, in_dim]
+        device const float         *wts,     // [rows, topk]
+        device const uint          *groups,
+        device const uint          *cursor,
+        device const uint          *sorted,
+        device float               *mid,     // [rows * topk, mid_dim]
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    DSV41_XM_LUT(lut, tid);
+
+    const uint g = tgpig.y;
+    if (g >= cursor[a.n_expert]) return;
+    const uint e = groups[3u * g], start = groups[3u * g + 1u], n = groups[3u * g + 2u];
+    const uint t0 = (sg % DSV41_XM_SPLITS) * DSV41_XM_T;
+    if (t0 >= n) return;
+    const uint nt = min(DSV41_XM_T, n - t0);
+    const uint row0 = (tgpig.x * 2u + sg / DSV41_XM_SPLITS) * DSV41_XM_ROWS;
+    const uint b = lane / (32u / DSV41_XM_BPP), part = lane % (32u / DSV41_XM_BPP);
+    const uint koff = part * 4u * DSV41_XM_NV, boff = 1u + koff;
+
+    device const float *xr[DSV41_XM_T];
+#pragma unroll
+    for (uint t = 0; t < DSV41_XM_T; t++) {
+        xr[t] = x + (ulong)(sorted[start + t0 + min(t, nt - 1u)] >> 8) * a.in_dim + koff;
+    }
+    device const uchar *gw = gate_w + (ulong)e * a.gate_expert_bytes + (ulong)row0 * a.gate_row_bytes;
+    device const uchar *uw = up_w + (ulong)e * a.gate_expert_bytes + (ulong)row0 * a.gate_row_bytes;
+
+    float ag[DSV41_XM_ROWS][DSV41_XM_T], au[DSV41_XM_ROWS][DSV41_XM_T];
+#pragma unroll
+    for (uint r = 0; r < DSV41_XM_ROWS; r++) {
+#pragma unroll
+        for (uint t = 0; t < DSV41_XM_T; t++) { ag[r][t] = 0.0f; au[r][t] = 0.0f; }
+    }
+    const uint nb = a.in_dim / 32u;
+    for (uint blk = b; blk < nb; blk += DSV41_XM_BPP) {
+        float4 xv[DSV41_XM_T][2u * DSV41_XM_NV];
+        DSV41_XM_LOAD_X(xv, xr, blk);
+        const ulong bo = (ulong)blk * 17u;
+#pragma unroll
+        for (uint r = 0; r < DSV41_XM_ROWS; r++) {
+            device const uchar *gp = gw + (ulong)r * a.gate_row_bytes + bo;
+            device const uchar *up = uw + (ulong)r * a.gate_row_bytes + bo;
+            DSV41_XM_BLOCK(gp, dsv41_e8m0(gp[0]), ag[r], xv);
+            DSV41_XM_BLOCK(up, dsv41_e8m0(up[0]), au[r], xv);
+        }
+    }
+#pragma unroll
+    for (uint r = 0; r < DSV41_XM_ROWS; r++) {
+#pragma unroll
+        for (uint t = 0; t < DSV41_XM_T; t++) {
+            float gv = simd_sum(ag[r][t]), uv = simd_sum(au[r][t]);
+            if (lane != 0u || t >= nt) continue;
+            const uint v = sorted[start + t0 + t];
+            const uint pair = (v >> 8) * a.topk + (v & 255u);
+            if (a.clamp > 1.0e-6f) {
+                gv = min(gv, a.clamp);
+                uv = clamp(uv, -a.clamp, a.clamp);
+            }
+            mid[(ulong)pair * a.mid_dim + row0 + r] = (gv / (1.0f + exp(-gv))) * uv * wts[pair];
+        }
+    }
+}
+
+// the down projection of one expert group, per pair into the experts scratch: the same
+// blocking with DSV41_XM_DOWN_ROWS rows of one matrix
+kernel void kernel_dsv41_moe_down_xm_mxfp4(
+        constant dsv41_moe_xm_args &a,
+        device const uchar         *down_w,
+        device const float         *mid,     // [rows * topk, mid_dim]
+        device const uint          *groups,
+        device const uint          *cursor,
+        device const uint          *sorted,
+        device float               *experts, // [rows * topk, out_dim]
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    DSV41_XM_LUT(lut, tid);
+
+    const uint g = tgpig.y;
+    if (g >= cursor[a.n_expert]) return;
+    const uint e = groups[3u * g], start = groups[3u * g + 1u], n = groups[3u * g + 2u];
+    const uint t0 = (sg % DSV41_XM_SPLITS) * DSV41_XM_T;
+    if (t0 >= n) return;
+    const uint nt = min(DSV41_XM_T, n - t0);
+    const uint row0 = (tgpig.x * 2u + sg / DSV41_XM_SPLITS) * DSV41_XM_DOWN_ROWS;
+    const uint b = lane / (32u / DSV41_XM_BPP), part = lane % (32u / DSV41_XM_BPP);
+    const uint koff = part * 4u * DSV41_XM_NV, boff = 1u + koff;
+
+    uint pair[DSV41_XM_T];
+    device const float *mr[DSV41_XM_T];
+#pragma unroll
+    for (uint t = 0; t < DSV41_XM_T; t++) {
+        const uint v = sorted[start + t0 + min(t, nt - 1u)];
+        pair[t] = (v >> 8) * a.topk + (v & 255u);
+        mr[t] = mid + (ulong)pair[t] * a.mid_dim + koff;
+    }
+    device const uchar *dw = down_w + (ulong)e * a.down_expert_bytes + (ulong)row0 * a.down_row_bytes;
+
+    float acc[DSV41_XM_DOWN_ROWS][DSV41_XM_T];
+#pragma unroll
+    for (uint r = 0; r < DSV41_XM_DOWN_ROWS; r++) {
+#pragma unroll
+        for (uint t = 0; t < DSV41_XM_T; t++) acc[r][t] = 0.0f;
+    }
+    const uint nb = a.mid_dim / 32u;
+    for (uint blk = b; blk < nb; blk += DSV41_XM_BPP) {
+        float4 xv[DSV41_XM_T][2u * DSV41_XM_NV];
+        DSV41_XM_LOAD_X(xv, mr, blk);
+        const ulong bo = (ulong)blk * 17u;
+#pragma unroll
+        for (uint r = 0; r < DSV41_XM_DOWN_ROWS; r++) {
+            device const uchar *dp = dw + (ulong)r * a.down_row_bytes + bo;
+            DSV41_XM_BLOCK(dp, dsv41_e8m0(dp[0]), acc[r], xv);
+        }
+    }
+#pragma unroll
+    for (uint r = 0; r < DSV41_XM_DOWN_ROWS; r++) {
+#pragma unroll
+        for (uint t = 0; t < DSV41_XM_T; t++) {
+            const float v = simd_sum(acc[r][t]);
+            if (lane == 0u && t < nt) experts[(ulong)pair[t] * a.out_dim + row0 + r] = v;
+        }
+    }
+}
+
+// out[t] = shared[t] + sum over slots of the pair outputs, slots in order; a slot the
+// sort skipped (no valid expert) has no output and is skipped here too
+kernel void kernel_dsv41_moe_sum(
+        constant dsv41_moe_xm_args &a,
+        device const float         *experts, // [rows * topk, out_dim]
+        device const float         *shared,  // [rows, out_dim]
+        device float               *out,     // [rows, out_dim]
+        device const int           *sel,     // [rows, topk]
+        uint2 gid [[thread_position_in_grid]]) {
+    const uint j = gid.x, t = gid.y;
+    if (j >= a.out_dim || t >= a.rows) return;
+    float acc = shared[(ulong)t * a.out_dim + j];
+    for (uint s = 0; s < a.topk; s++) {
+        const int e = sel[t * a.topk + s];
+        if (e < 0 || (uint)e >= a.n_expert) continue;
+        acc += experts[((ulong)t * a.topk + s) * a.out_dim + j];
+    }
+    out[(ulong)t * a.out_dim + j] = acc;
+}
+
 // Single-Pass mHC: one projection of the flattened, normalised residual stream, split
 // into the pre / post / comb coefficients, with `comb` made doubly stochastic by Sinkhorn.
 //

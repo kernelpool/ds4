@@ -47094,6 +47094,167 @@ int ds4_gpu_dsv41_block_mask_rows(uint32_t rows,
     }
 }
 
+/* the expert kernels' grouping and blocking, kept equal to the defines in metal/dsv41.metal */
+#define DSV41_XM_R         8u
+#define DSV41_XM_SPLITS    4u
+#define DSV41_XM_ROWS      4u
+#define DSV41_XM_DOWN_ROWS 8u
+
+typedef struct {
+    uint32_t n_expert;
+    uint32_t topk;
+    uint32_t rows;
+    uint32_t in_dim;
+    uint32_t mid_dim;
+    uint32_t out_dim;
+    uint32_t n_pairs;
+    uint64_t gate_expert_bytes;
+    uint64_t gate_row_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t down_row_bytes;
+    float    clamp;
+} dsv41_gpu_moe_xm_args;
+
+int ds4_gpu_dsv41_moe_expert_major(const void *model_map,
+                                   uint64_t model_size,
+                                   uint64_t gate_offset,
+                                   uint64_t up_offset,
+                                   uint64_t down_offset,
+                                   uint64_t gate_expert_bytes,
+                                   uint64_t gate_row_bytes,
+                                   uint64_t down_expert_bytes,
+                                   uint64_t down_row_bytes,
+                                   uint32_t n_expert,
+                                   uint32_t topk,
+                                   uint32_t rows,
+                                   uint32_t in_dim,
+                                   uint32_t mid_dim,
+                                   uint32_t out_dim,
+                                   float clamp,
+                                   const ds4_gpu_tensor *x,
+                                   const ds4_gpu_tensor *sel,
+                                   const ds4_gpu_tensor *wts,
+                                   const ds4_gpu_tensor *shared,
+                                   ds4_gpu_tensor *counts,
+                                   ds4_gpu_tensor *cursor,
+                                   ds4_gpu_tensor *groups,
+                                   ds4_gpu_tensor *sorted,
+                                   ds4_gpu_tensor *mid,
+                                   ds4_gpu_tensor *experts,
+                                   ds4_gpu_tensor *out) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint32_t n_pairs = rows * topk;
+    if (rows == 0 || topk == 0 || topk > 255u || rows >= (1u << 24) || n_expert == 0 ||
+        in_dim == 0 || mid_dim == 0 || out_dim == 0 ||
+        (in_dim % 32u) != 0u || (mid_dim % 32u) != 0u ||
+        (mid_dim % (2u * DSV41_XM_ROWS)) != 0u || (out_dim % (2u * DSV41_XM_DOWN_ROWS)) != 0u ||
+        gate_row_bytes != (uint64_t)(in_dim / 32u) * 17u ||
+        down_row_bytes != (uint64_t)(mid_dim / 32u) * 17u ||
+        gate_expert_bytes < (uint64_t)mid_dim * gate_row_bytes ||
+        down_expert_bytes < (uint64_t)out_dim * down_row_bytes ||
+        !glm53_gpu_tensor_has(x, (uint64_t)rows * in_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(sel, n_pairs, sizeof(int32_t)) ||
+        !glm53_gpu_tensor_has(wts, n_pairs, sizeof(float)) ||
+        !glm53_gpu_tensor_has(shared, (uint64_t)rows * out_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(counts, n_expert, sizeof(uint32_t)) ||
+        !glm53_gpu_tensor_has(cursor, (uint64_t)n_expert + 1u, sizeof(uint32_t)) ||
+        !glm53_gpu_tensor_has(groups, (uint64_t)n_pairs * 3u, sizeof(uint32_t)) ||
+        !glm53_gpu_tensor_has(sorted, n_pairs, sizeof(uint32_t)) ||
+        !glm53_gpu_tensor_has(mid, (uint64_t)n_pairs * mid_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(experts, (uint64_t)n_pairs * out_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out, (uint64_t)rows * out_dim, sizeof(float))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 expert-major MoE received invalid buffers\n");
+        return 0;
+    }
+    @autoreleasepool {
+        uint64_t g_inner = 0, u_inner = 0, d_inner = 0;
+        id<MTLBuffer> gbuf = glm53_gpu_weight_buffer(model_map, model_size, gate_offset,
+                                                     (uint64_t)n_expert * gate_expert_bytes,
+                                                     &g_inner, "routed gate");
+        id<MTLBuffer> ubuf = glm53_gpu_weight_buffer(model_map, model_size, up_offset,
+                                                     (uint64_t)n_expert * gate_expert_bytes,
+                                                     &u_inner, "routed up");
+        id<MTLBuffer> dbuf = glm53_gpu_weight_buffer(model_map, model_size, down_offset,
+                                                     (uint64_t)n_expert * down_expert_bytes,
+                                                     &d_inner, "routed down");
+        if (!gbuf || !ubuf || !dbuf) return 0;
+        id<MTLComputePipelineState> p_hist = ds4_gpu_get_pipeline("kernel_dsv41_moe_hist");
+        id<MTLComputePipelineState> p_scan = ds4_gpu_get_pipeline("kernel_dsv41_moe_scan");
+        id<MTLComputePipelineState> p_scat = ds4_gpu_get_pipeline("kernel_dsv41_moe_scatter");
+        id<MTLComputePipelineState> p_pair = ds4_gpu_get_pipeline("kernel_dsv41_moe_pair_xm_mxfp4");
+        id<MTLComputePipelineState> p_down = ds4_gpu_get_pipeline("kernel_dsv41_moe_down_xm_mxfp4");
+        id<MTLComputePipelineState> p_sum = ds4_gpu_get_pipeline("kernel_dsv41_moe_sum");
+        if (!p_hist || !p_scan || !p_scat || !p_pair || !p_down || !p_sum) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        /* A threadgroup is DSV41_XM_SPLITS token slices by two row sets.  The group count
+         * is only known on the device, so the expert kernels are launched for the most
+         * groups the sort can produce -- a partial group per expert plus full ones -- and
+         * exit past the count the scan wrote. */
+        const uint32_t nsg = 2u * DSV41_XM_SPLITS;
+        const uint32_t pair_tiles = mid_dim / (2u * DSV41_XM_ROWS);
+        const uint32_t down_tiles = out_dim / (2u * DSV41_XM_DOWN_ROWS);
+        const uint32_t max_groups = n_pairs / DSV41_XM_R + (n_expert < n_pairs ? n_expert : n_pairs);
+        dsv41_gpu_moe_xm_args a = {
+            .n_expert = n_expert, .topk = topk, .rows = rows, .in_dim = in_dim,
+            .mid_dim = mid_dim, .out_dim = out_dim, .n_pairs = n_pairs,
+            .gate_expert_bytes = gate_expert_bytes, .gate_row_bytes = gate_row_bytes,
+            .down_expert_bytes = down_expert_bytes, .down_row_bytes = down_row_bytes,
+            .clamp = clamp,
+        };
+#define XM_T(i, t) [enc setBuffer:ds4_gpu_tensor_buffer(t) offset:ds4_gpu_tensor_offset(t) atIndex:(i)]
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:p_hist];
+        [enc setBytes:&a length:sizeof(a) atIndex:0];
+        XM_T(1, sel); XM_T(2, counts);
+        [enc dispatchThreads:MTLSizeMake(n_pairs, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:p_scan];
+        [enc setBytes:&a length:sizeof(a) atIndex:0];
+        XM_T(1, counts); XM_T(2, cursor); XM_T(3, groups);
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:p_scat];
+        [enc setBytes:&a length:sizeof(a) atIndex:0];
+        XM_T(1, sel); XM_T(2, cursor); XM_T(3, sorted);
+        [enc dispatchThreads:MTLSizeMake(n_pairs, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:p_pair];
+        [enc setBytes:&a length:sizeof(a) atIndex:0];
+        [enc setBuffer:gbuf offset:(NSUInteger)g_inner atIndex:1];
+        [enc setBuffer:ubuf offset:(NSUInteger)u_inner atIndex:2];
+        XM_T(3, x); XM_T(4, wts); XM_T(5, groups); XM_T(6, cursor); XM_T(7, sorted); XM_T(8, mid);
+        [enc dispatchThreadgroups:MTLSizeMake(pair_tiles, max_groups, 1)
+            threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:p_down];
+        [enc setBytes:&a length:sizeof(a) atIndex:0];
+        [enc setBuffer:dbuf offset:(NSUInteger)d_inner atIndex:1];
+        XM_T(2, mid); XM_T(3, groups); XM_T(4, cursor); XM_T(5, sorted); XM_T(6, experts);
+        [enc dispatchThreadgroups:MTLSizeMake(down_tiles, max_groups, 1)
+            threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:p_sum];
+        [enc setBytes:&a length:sizeof(a) atIndex:0];
+        XM_T(1, experts); XM_T(2, shared); XM_T(3, out); XM_T(4, sel);
+        [enc dispatchThreads:MTLSizeMake(out_dim, rows, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+#undef XM_T
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 expert-major MoE");
+    }
+}
+
 typedef struct {
     uint32_t n_window;
     uint32_t n_head;

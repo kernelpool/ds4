@@ -1344,7 +1344,133 @@ static int run_fused_moe(const char *label, uint32_t in_dim, uint32_t mid_dim,
         ds4_gpu_tensor_free(t_e3); ds4_gpu_tensor_free(t_o3);
         free(x3); free(sel3); free(wts3); free(out3);
     }
-    const int pass = rel <= 3e-5 && rows_ok != 0;
+    /* Expert-major: eight tokens, each its own input and selection, chosen so experts are
+     * shared by several tokens (groups of 1..4).  Every token is held to its own
+     * double-precision reference, which is the routed sum plus the shared expert. */
+    int xm_ok = -1;
+    {
+        const uint32_t R = 8u;
+        float *xr = malloc((size_t)R * in_dim * sizeof(float));
+        double *xd_r = malloc((size_t)in_dim * sizeof(double));
+        int32_t *selr = malloc((size_t)R * topk * sizeof(int32_t));
+        float *wr = malloc((size_t)R * topk * sizeof(float));
+        double *refr = calloc((size_t)R * out_dim, sizeof(double));
+        float *shr = malloc((size_t)R * out_dim * sizeof(float));
+        float *outr = malloc((size_t)R * out_dim * sizeof(float));
+        for (uint32_t r = 0; r < R; r++) {
+            for (uint32_t i = 0; i < in_dim; i++) xr[(size_t)r * in_dim + i] = rnd();
+            for (uint32_t s2 = 0; s2 < topk; s2++) {
+                /* token r takes experts (r + 2 s) mod n_total: heavy overlap between rows */
+                selr[r * topk + s2] = (int32_t)((r + 2u * s2) % n_total);
+                wr[r * topk + s2] = 0.1f + 0.2f * (rnd() + 1.0f);
+            }
+        }
+        for (uint32_t r = 0; r < R; r++) {
+            for (uint32_t i = 0; i < in_dim; i++) xd_r[i] = xr[(size_t)r * in_dim + i];
+            for (uint32_t s2 = 0; s2 <= topk; s2++) {
+                const int shared = (s2 == topk);
+                const uint64_t e = shared ? 0u : (uint64_t)selr[r * topk + s2];
+                const double weight = shared ? 1.0 : (double)wr[r * topk + s2];
+                for (uint32_t j = 0; j < mid_dim; j++) {
+                    double g, u;
+                    if (shared) {
+                        g = q8_0_row_dot(base + o_sg + (uint64_t)j * (in_dim / 32u) * 34u, in_dim, xd_r);
+                        u = q8_0_row_dot(base + o_su + (uint64_t)j * (in_dim / 32u) * 34u, in_dim, xd_r);
+                    } else {
+                        g = mxfp4_row_dot(base + o_gate + e * g_exp + (uint64_t)j * g_row, in_dim, xd_r);
+                        u = mxfp4_row_dot(base + o_up + e * g_exp + (uint64_t)j * g_row, in_dim, xd_r);
+                    }
+                    if (clamp > 1.0e-6f) {
+                        if (g > clamp) g = clamp;
+                        if (u > clamp) u = clamp;
+                        if (u < -clamp) u = -clamp;
+                    }
+                    act[j] = (g / (1.0 + exp(-g))) * u * weight;
+                }
+                for (uint32_t o = 0; o < out_dim; o++) {
+                    const double v = shared
+                        ? q8_0_row_dot(base + o_sd + (uint64_t)o * (mid_dim / 32u) * 34u, mid_dim, act)
+                        : mxfp4_row_dot(base + o_down + e * d_exp + (uint64_t)o * d_row, mid_dim, act);
+                    refr[(size_t)r * out_dim + o] += v;
+                    if (shared) shr[(size_t)r * out_dim + o] = (float)v;
+                }
+            }
+        }
+        ds4_gpu_tensor *t_xr = ds4_gpu_tensor_alloc((uint64_t)R * in_dim * sizeof(float));
+        ds4_gpu_tensor *t_selr = ds4_gpu_tensor_alloc((uint64_t)R * topk * sizeof(int32_t));
+        ds4_gpu_tensor *t_wr = ds4_gpu_tensor_alloc((uint64_t)R * topk * sizeof(float));
+        ds4_gpu_tensor *t_shr = ds4_gpu_tensor_alloc((uint64_t)R * out_dim * sizeof(float));
+        ds4_gpu_tensor *t_cnt = ds4_gpu_tensor_alloc((uint64_t)n_total * sizeof(uint32_t));
+        ds4_gpu_tensor *t_cur = ds4_gpu_tensor_alloc(((uint64_t)n_total + 1u) * sizeof(uint32_t));
+        ds4_gpu_tensor *t_grp = ds4_gpu_tensor_alloc((uint64_t)R * topk * 3u * sizeof(uint32_t));
+        ds4_gpu_tensor *t_srt = ds4_gpu_tensor_alloc((uint64_t)R * topk * sizeof(uint32_t));
+        ds4_gpu_tensor *t_midr = ds4_gpu_tensor_alloc((uint64_t)R * topk * mid_dim * sizeof(float));
+        ds4_gpu_tensor *t_exr = ds4_gpu_tensor_alloc((uint64_t)R * topk * out_dim * sizeof(float));
+        ds4_gpu_tensor *t_outr = ds4_gpu_tensor_alloc((uint64_t)R * out_dim * sizeof(float));
+        int xok = xr && xd_r && selr && wr && refr && shr && outr && t_xr && t_selr && t_wr &&
+                  t_shr && t_cnt && t_cur && t_grp && t_srt && t_midr && t_exr && t_outr;
+        xok = xok && ds4_gpu_tensor_fill_f32(t_cnt, 0.0f, n_total);
+        xok = xok && ds4_gpu_tensor_write(t_xr, 0, xr, (uint64_t)R * in_dim * sizeof(float));
+        xok = xok && ds4_gpu_tensor_write(t_selr, 0, selr, (uint64_t)R * topk * sizeof(int32_t));
+        xok = xok && ds4_gpu_tensor_write(t_wr, 0, wr, (uint64_t)R * topk * sizeof(float));
+        xok = xok && ds4_gpu_tensor_write(t_shr, 0, shr, (uint64_t)R * out_dim * sizeof(float));
+        /* Two calls queued in one batch, as the engine queues one per layer: a decoy
+         * selection with fewer expert groups first, then the one under test.  The second
+         * must see its own sort -- counts back at zero, its own group count -- not the
+         * decoy's. */
+        int32_t *sel_decoy = malloc((size_t)R * topk * sizeof(int32_t));
+        ds4_gpu_tensor *t_decoy = ds4_gpu_tensor_alloc((uint64_t)R * topk * sizeof(int32_t));
+        for (uint32_t i = 0; i < R * topk; i++) sel_decoy[i] = (int32_t)(i % topk);
+        xok = xok && sel_decoy && t_decoy &&
+              ds4_gpu_tensor_write(t_decoy, 0, sel_decoy, (uint64_t)R * topk * sizeof(int32_t));
+        if (xok) {
+            const int batched = ds4_gpu_begin_commands() != 0;
+            xok = ds4_gpu_dsv41_moe_expert_major(blob, total, o_gate, o_up, o_down,
+                                                 g_exp, g_row, d_exp, d_row, n_total, topk, R,
+                                                 in_dim, mid_dim, out_dim, clamp,
+                                                 t_xr, t_decoy, t_wr, t_shr, t_cnt, t_cur, t_grp,
+                                                 t_srt, t_midr, t_exr, t_outr) &&
+                  ds4_gpu_dsv41_moe_expert_major(blob, total, o_gate, o_up, o_down,
+                                                 g_exp, g_row, d_exp, d_row, n_total, topk, R,
+                                                 in_dim, mid_dim, out_dim, clamp,
+                                                 t_xr, t_selr, t_wr, t_shr, t_cnt, t_cur, t_grp,
+                                                 t_srt, t_midr, t_exr, t_outr);
+            if (batched) ds4_gpu_end_commands();
+        }
+        free(sel_decoy); ds4_gpu_tensor_free(t_decoy);
+        xok = xok && ds4_gpu_tensor_read(t_outr, 0, outr, (uint64_t)R * out_dim * sizeof(float));
+        double xm_worst = 0.0, xm_scale = 0.0;
+        if (xok) {
+            for (size_t i = 0; i < (size_t)R * out_dim; i++) {
+                xm_worst = fmax(xm_worst, fabs((double)outr[i] - refr[i]));
+                xm_scale = fmax(xm_scale, fabs(refr[i]));
+            }
+            xm_ok = xm_worst / fmax(xm_scale, 1e-9) <= 3e-5;
+        } else {
+            xm_ok = 0;
+        }
+        if (getenv("DS4_DSV41_TIME_MOE") && xok) {
+            const int reps = 20;
+            const double t0 = now_ms();
+            for (int r = 0; r < reps; r++) {
+                ds4_gpu_dsv41_moe_expert_major(blob, total, o_gate, o_up, o_down,
+                                               g_exp, g_row, d_exp, d_row, n_total, topk, R,
+                                               in_dim, mid_dim, out_dim, clamp,
+                                               t_xr, t_selr, t_wr, t_shr, t_cnt, t_cur, t_grp,
+                                               t_srt, t_midr, t_exr, t_outr);
+            }
+            printf("  [%s] %-18s      %.3f ms/call for %u tokens expert-major\n", label,
+                   "xm moe timing", (now_ms() - t0) / reps, R);
+        }
+        printf("  [%s] %-18s %s  rel=%.3e  (%u tokens, experts shared across rows)\n", label,
+               "expert-major moe", xm_ok ? "ok  " : "FAIL", xm_worst / fmax(xm_scale, 1e-9), R);
+        ds4_gpu_tensor_free(t_xr); ds4_gpu_tensor_free(t_selr); ds4_gpu_tensor_free(t_wr);
+        ds4_gpu_tensor_free(t_shr); ds4_gpu_tensor_free(t_cnt); ds4_gpu_tensor_free(t_cur);
+        ds4_gpu_tensor_free(t_grp); ds4_gpu_tensor_free(t_srt); ds4_gpu_tensor_free(t_midr);
+        ds4_gpu_tensor_free(t_exr); ds4_gpu_tensor_free(t_outr);
+        free(xr); free(xd_r); free(selr); free(wr); free(refr); free(shr); free(outr);
+    }
+    const int pass = rel <= 3e-5 && rows_ok != 0 && xm_ok != 0;
     printf("  [%s] %-18s %s  rel=%.3e  (mxfp4 %u experts top-%u, %u->%u->%u, q8_0 shared, "
            "%s, clamped %.0f%%%s)\n",
            label, "fused moe", pass ? "ok  " : "FAIL", rel, n_total, topk,

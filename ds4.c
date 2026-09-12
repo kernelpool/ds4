@@ -65778,7 +65778,7 @@ static bool dsv41_env(const char *name, int *cache) {
 }
 static int g_dsv41_env_host_select = -1, g_dsv41_env_attn_only = -1;
 static int g_dsv41_env_moe_only = -1, g_dsv41_env_moe_grouped = -1;
-static int g_dsv41_env_moe_per_token = -1;
+static int g_dsv41_env_moe_per_token = -1, g_dsv41_env_moe_token_major = -1;
 
 /* A model-resident mat-vec at whatever precision the checkpoint stores: the mini model is
  * F32 throughout, the released one mixes F16 and Q8_0. */
@@ -65824,7 +65824,7 @@ static bool dsv41_gpu_moe_fused(const ds4_model *m, const ds4_layer_weights *l, 
                                 uint32_t n_exp, uint32_t topk, uint32_t rows,
                                 const ds4_gpu_tensor *x,
                                 const ds4_gpu_tensor *sel, const ds4_gpu_tensor *wts,
-                                ds4_gpu_tensor *out) {
+                                ds4_gpu_tensor *out, ds4_gpu_tensor *const *sort) {
     const uint32_t dim = DS4_N_EMBD, ff = DS4_N_FF_EXP;
     const uint64_t g_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t d_row = routed_expert_row_bytes(l->ffn_down_exps);
@@ -65877,6 +65877,24 @@ static bool dsv41_gpu_moe_fused(const ds4_model *m, const ds4_layer_weights *l, 
         /* the batched kernel has no addend, so the shared expert lands after it */
         ok = ds4_gpu_add_tensor(out, out, b_sh.t,
                                 (uint32_t)((uint64_t)rows * dim)) != 0;
+        goto done;
+    }
+
+    /* Expert-major, in F32: tokens that share an expert read its weights once, and the
+     * kernels pay for it per pair below two tokens per expert, so this path takes a chunk
+     * from that fill up (rows >= 128 at 384 experts top-6).  Needs the window's sort
+     * scratch and MXFP4 experts, else the paths below. */
+    if (ok && (uint64_t)rows * topk >= 2u * (uint64_t)n_exp && sort && sort[0] &&
+        l->ffn_gate_exps->type == DS4_TENSOR_MXFP4 && l->ffn_down_exps->type == DS4_TENSOR_MXFP4 &&
+        !dsv41_env("DS4_DSV41_MOE_PER_TOKEN", &g_dsv41_env_moe_per_token) &&
+        !dsv41_env("DS4_DSV41_MOE_TOKEN_MAJOR", &g_dsv41_env_moe_token_major) &&
+        ds4_gpu_dsv41_moe_expert_major(m->map, m->size,
+                                       l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                                       l->ffn_down_exps->abs_offset,
+                                       g_exp, g_row, d_exp, d_row, n_exp, topk, rows,
+                                       dim, ff, dim, DS4_SWIGLU_CLAMP_EXP, x, sel, wts, b_sh.t,
+                                       sort[0], sort[1], sort[2], sort[3],
+                                       b_mid.t, b_dn.t, out) != 0) {
         goto done;
     }
 
@@ -65943,7 +65961,7 @@ done:
  */
 static bool dsv41_gpu_moe_step(const ds4_model *m, const ds4_weights *w, uint32_t il,
                                uint32_t rows, const ds4_gpu_tensor *x,
-                               ds4_gpu_tensor *out) {
+                               ds4_gpu_tensor *out, ds4_gpu_tensor *const *sort) {
     const ds4_layer_weights *l = &w->layer[il];
     const uint32_t dim = DS4_N_EMBD, ff = DS4_N_FF_EXP;
     const uint32_t n_exp = ds4_layer_expert_count(il), topk = DS4_N_EXPERT_USED;
@@ -65984,7 +66002,7 @@ static bool dsv41_gpu_moe_step(const ds4_model *m, const ds4_weights *w, uint32_
                                    b_log.t, b_bias.t, t_idx, b_w.t);
     if (!ok) goto done;
     if (fused) {
-        ok = dsv41_gpu_moe_fused(m, l, il, n_exp, topk, rows, x, t_idx, b_w.t, out);
+        ok = dsv41_gpu_moe_fused(m, l, il, n_exp, topk, rows, x, t_idx, b_w.t, out, sort);
         goto done;
     }
     /* the selection has to come back to the host: an F32 expert is addressed by a weight
@@ -66160,6 +66178,11 @@ typedef struct {
     ds4_gpu_tensor *bkeep;      /* [chunk][max_blocks] int32 */
     ds4_gpu_tensor *rstate;     /* radix select: [chunk] x 5 u32 of refinement state */
     ds4_gpu_tensor *rhist;      /* radix select: [chunk] x 256 u32 histograms */
+    /* the expert-major MoE's counting sort of a chunk's (token, slot) pairs */
+    ds4_gpu_tensor *moe_counts; /* [n_expert] u32, zero between calls */
+    ds4_gpu_tensor *moe_cursor; /* [n_expert + 1] u32 */
+    ds4_gpu_tensor *moe_groups; /* [chunk * topk * 3] u32 */
+    ds4_gpu_tensor *moe_sorted; /* [chunk * topk] u32 */
     /* the published compressed caches, on the device.  Only a layer that is its own kv
      * source has them, which is 4 layers of 40; uploading them per block per token cost
      * clen*hd floats a layer, which at long context is the whole budget. */
@@ -66178,6 +66201,8 @@ static void dsv41_gpu_window_close(dsv41_gpu_window *g) {
     ds4_gpu_tensor_free(g->join.t); ds4_gpu_tensor_free(g->sc.t); ds4_gpu_tensor_free(g->bscore.t);
     ds4_gpu_tensor_free(g->bkeep);
     ds4_gpu_tensor_free(g->rstate); ds4_gpu_tensor_free(g->rhist);
+    ds4_gpu_tensor_free(g->moe_counts); ds4_gpu_tensor_free(g->moe_cursor);
+    ds4_gpu_tensor_free(g->moe_groups); ds4_gpu_tensor_free(g->moe_sorted);
     if (g->ring) {
         for (uint32_t i = 0; i < g->n_layer; i++) ds4_gpu_tensor_free(g->ring[i]);
         free(g->ring);
@@ -66233,6 +66258,18 @@ static bool dsv41_gpu_window_open(dsv41_gpu_window *g, uint32_t n_layer, uint32_
     g->bkeep = ds4_gpu_tensor_alloc((uint64_t)chunk * max_blocks * sizeof(int32_t));
     g->rstate = ds4_gpu_tensor_alloc((uint64_t)chunk * 5u * sizeof(uint32_t));
     g->rhist = ds4_gpu_tensor_alloc((uint64_t)chunk * 256u * sizeof(uint32_t));
+    {
+        const uint64_t pairs = (uint64_t)chunk * DS4_N_EXPERT_USED;
+        g->moe_counts = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(uint32_t));
+        g->moe_cursor = ds4_gpu_tensor_alloc(((uint64_t)DS4_N_EXPERT + 1u) * sizeof(uint32_t));
+        g->moe_groups = ds4_gpu_tensor_alloc(pairs * 3u * sizeof(uint32_t));
+        g->moe_sorted = ds4_gpu_tensor_alloc(pairs * sizeof(uint32_t));
+        if (!g->moe_counts || !g->moe_cursor || !g->moe_groups || !g->moe_sorted ||
+            !ds4_gpu_tensor_fill_f32(g->moe_counts, 0.0f, DS4_N_EXPERT)) {
+            dsv41_gpu_window_close(g);
+            return false;
+        }
+    }
     g->ckv = xcalloc(n_layer, sizeof(*g->ckv));
     g->ikey = xcalloc(n_layer, sizeof(*g->ikey));
     g->pkv = xcalloc(n_layer, sizeof(*g->pkv));
@@ -66789,7 +66826,12 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
     ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(b_x_all.t, b_coll.t, m->map, m->size,
                                                    l->ffn_norm->abs_offset, dim,
                                                    n_tok, DS4_RMS_EPS);
-    ok = ok && dsv41_gpu_moe_step(m, w, il, n_tok, b_x_all.t, b_moe.t);
+    /* the expert-major MoE's sort scratch: counts, cursor, groups, sorted */
+    ds4_gpu_tensor *moe_sort[4] = {
+        win_gpu ? win_gpu->moe_counts : NULL, win_gpu ? win_gpu->moe_cursor : NULL,
+        win_gpu ? win_gpu->moe_groups : NULL, win_gpu ? win_gpu->moe_sorted : NULL,
+    };
+    ok = ok && dsv41_gpu_moe_step(m, w, il, n_tok, b_x_all.t, b_moe.t, moe_sort);
     if (ok && out && dsv41_env("DS4_DSV41_MOE_ONLY", &g_dsv41_env_moe_only)) {
         ok = dsv41_gpu_buf_get(&b_moe, out, dim);
         goto done;

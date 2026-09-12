@@ -3048,6 +3048,41 @@ int ds4_gpu_routed_moe_tokens_tensor(
         uint32_t                layer_index,
         uint32_t                n_tokens);
 
+/* DeepSeek V4.1 routed experts for a prefill chunk, expert-major, in F32: the chunk's
+ * (token, slot) pairs are counting-sorted by expert on the device and each expert's
+ * tokens share its weight loads, with no half staging anywhere.  MXFP4 gate/up/down.
+ * `x` [rows, in], `sel`/`wts` [rows, topk], `shared` and `out` [rows, out]; scratch:
+ * `counts` [n_expert] u32 (zero before the first call; left zero afterwards), `cursor`
+ * [n_expert + 1] u32, `groups` [rows * topk * 3] u32, `sorted` [rows * topk] u32, `mid`
+ * [rows * topk, mid], `experts` [rows * topk, out]. */
+int ds4_gpu_dsv41_moe_expert_major(const void *model_map,
+                                   uint64_t model_size,
+                                   uint64_t gate_offset,
+                                   uint64_t up_offset,
+                                   uint64_t down_offset,
+                                   uint64_t gate_expert_bytes,
+                                   uint64_t gate_row_bytes,
+                                   uint64_t down_expert_bytes,
+                                   uint64_t down_row_bytes,
+                                   uint32_t n_expert,
+                                   uint32_t topk,
+                                   uint32_t rows,
+                                   uint32_t in_dim,
+                                   uint32_t mid_dim,
+                                   uint32_t out_dim,
+                                   float clamp,
+                                   const ds4_gpu_tensor *x,
+                                   const ds4_gpu_tensor *sel,
+                                   const ds4_gpu_tensor *wts,
+                                   const ds4_gpu_tensor *shared,
+                                   ds4_gpu_tensor *counts,
+                                   ds4_gpu_tensor *cursor,
+                                   ds4_gpu_tensor *groups,
+                                   ds4_gpu_tensor *sorted,
+                                   ds4_gpu_tensor *mid,
+                                   ds4_gpu_tensor *experts,
+                                   ds4_gpu_tensor *out);
+
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
