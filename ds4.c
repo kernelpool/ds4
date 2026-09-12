@@ -67787,20 +67787,29 @@ static bool dsv41_session_prefill(dsv41_session_state *ss, ds4_session *s,
     return *status == DSV41_PREFILL_OK;
 }
 
-/* One DSpark cycle, greedy.  `first_token` is the token the target chose at the last
- * position; the block drafts what follows it, the trunk runs first_token and the confident
- * drafts in one pass, and the longest prefix the target agrees with is kept -- the target's
- * own next token after that prefix is left in s->logits, exactly as a one-token step would.
+static bool speculative_point_accept(float target_p, float draft_p, uint64_t *rng);
+static int speculative_point_replacement(ds4_session *s, int draft_token, uint64_t *rng);
+
+/* One DSpark cycle.  `first_token` is the token the target chose at the last position; the
+ * block drafts what follows it, the trunk runs first_token and the confident drafts in one
+ * pass, and the longest prefix the target agrees with is kept -- the target's own next
+ * token after that prefix is left in s->logits, exactly as a one-token step would.  With an
+ * rng a draft is instead accepted with probability p(draft) under the target's sampling
+ * distribution and the first rejected one is replaced by a sample of the residual, which
+ * keeps the output distributed as the target's; the replacement then takes its own step.
  * Rejected positions are rolled back: the compressed caches to the accepted frontier, the
  * draft rings by committing only the accepted rows. */
-static int dsv41_session_spec_argmax(ds4_session *s, int first_token, int max_tokens,
-                                     int eos_token, bool ignore_eos, ds4_think_mode think_mode,
-                                     int *accepted, int accepted_cap, char *err, size_t errlen) {
+static int dsv41_session_spec(ds4_session *s, int first_token, int max_tokens,
+                              int eos_token, bool ignore_eos, ds4_think_mode think_mode,
+                              float temperature, int top_k, float top_p, float min_p,
+                              uint64_t *rng, int *accepted, int accepted_cap,
+                              char *err, size_t errlen) {
     ds4_engine *e = s->engine;
     dsv41_session_state *ss = s->dsv41;
     dsv41_gpu_window *g = &ss->win;
     const uint32_t B = g->draft.block, vocab = DS4_N_VOCAB;
     const uint32_t P1 = (uint32_t)s->checkpoint.len;    /* first_token's position */
+    const bool exact = rng && temperature > 0.0f;
     const bool stats = ds4_dspark_stats_enabled();
     const double t0 = stats ? now_sec() : 0.0;
     int drafts[DS4_DSPARK_MAX_BLOCK_SIZE];
@@ -67822,7 +67831,7 @@ static int dsv41_session_spec_argmax(ds4_session *s, int first_token, int max_to
         k = dspark_confident_prefix_len(conf, B, e->dspark_confidence_threshold);
         if (k > (uint32_t)max_tokens - 1u) k = (uint32_t)max_tokens - 1u;
         if (k > (uint32_t)accepted_cap - 1u) k = (uint32_t)accepted_cap - 1u;
-        if (k > ss->cap - P1 - 1u) k = ss->cap - P1 - 1u;
+        if (k > ss->cap - P1 - 1u - exact) k = ss->cap - P1 - 1u - exact;
         for (uint32_t i = 0; i < k; i++) {
             if (drafts[i] < 0 || drafts[i] >= (int)vocab) { k = i; break; }
             if (!ignore_eos && drafts[i] == eos_token) { k = i + 1u; break; }
@@ -67870,7 +67879,19 @@ static int dsv41_session_spec_argmax(ds4_session *s, int first_token, int max_to
         return -1;
     }
     uint32_t j = 0;
-    while (j < k && sample_argmax(rows + (size_t)j * vocab, vocab) == drafts[j]) j++;
+    int replacement = -1;
+    if (exact) {
+        while (j < k && sample_build_probabilities(rows + (size_t)j * vocab, vocab, temperature,
+                                                   top_k, top_p, min_p, s->sample_probs)) {
+            if (!speculative_point_accept(s->sample_probs[drafts[j]], 1.0f, rng)) {
+                replacement = speculative_point_replacement(s, drafts[j], rng);
+                break;
+            }
+            j++;
+        }
+    } else {
+        while (j < k && sample_argmax(rows + (size_t)j * vocab, vocab) == drafts[j]) j++;
+    }
     memcpy(s->logits, rows + (size_t)j * vocab, (size_t)vocab * sizeof(float));
     free(rows);
     for (uint32_t i = 0; i <= j; i++) {
@@ -67887,17 +67908,23 @@ static int dsv41_session_spec_argmax(ds4_session *s, int first_token, int max_to
         if (errlen) snprintf(err, errlen, "DeepSeek V4.1 draft rollback failed");
         return -1;
     }
+    if (replacement >= 0) {
+        if (ds4_session_eval(s, replacement, err, errlen) != 0) return -1;
+        accepted[j + 1u] = replacement;
+    }
     if (stats) {
         s->dspark_stats.accepted_draft_tokens += j;
         s->dspark_stats.first_tokens++;
         if (j == k) s->dspark_stats.full_accepts++;
+        else if (replacement >= 0) s->dspark_stats.partial_accepts++;
         ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, j);
         s->dspark_stats.total_ms += (now_sec() - t0) * 1000.0;
     }
     if (getenv("DS4_DSPARK_SPEC_LOG")) {
-        fprintf(stderr, "ds4: DSpark V4.1 cycle pos=%u drafted=%u accepted=%u\n", P1, k, j);
+        fprintf(stderr, "ds4: DSpark V4.1 cycle pos=%u drafted=%u accepted=%u replacement=%d\n", P1, k, j,
+                replacement);
     }
-    return (int)(1u + j);
+    return (int)(1u + j + (replacement >= 0));
 }
 
 #endif /* !DS4_NO_GPU */
@@ -83174,8 +83201,8 @@ static int ds4_session_eval_speculative_argmax_impl(
         if (!accepted || accepted_cap <= 0) return 0;
 #ifndef DS4_NO_GPU
         if (s->dsv41 && s->dsv41->win.draft.n_stage) {
-            return dsv41_session_spec_argmax(s, first_token, max_tokens, eos_token, ignore_eos,
-                                             think_mode, accepted, accepted_cap, err, errlen);
+            return dsv41_session_spec(s, first_token, max_tokens, eos_token, ignore_eos, think_mode,
+                                      0.0f, 0, 0.0f, 0.0f, NULL, accepted, accepted_cap, err, errlen);
         }
 #endif
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
@@ -84103,9 +84130,19 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
 #endif
         return rc;
     }
+    if (ds4_session_is_dsv41(s)) {
+        const bool exact = e && e->dspark_exact_sampling;
+        if (s->dsv41 && s->dsv41->win.draft.n_stage) {
+            return dsv41_session_spec(s, first_token, max_tokens, eos_token, false, DS4_THINK_HIGH,
+                                      exact ? temperature : 0.0f, top_k, top_p, min_p,
+                                      exact ? rng : NULL, accepted, accepted_cap, err, errlen);
+        }
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
     const bool opportunistic_dspark =
         e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
-        !ds4_session_is_dsv41(s) &&
         !e->quality && !e->dspark_strict && !e->dspark_exact_sampling;
     if (opportunistic_dspark) {
         /* first_token was sampled with the requested temperature. Commit the
@@ -84117,7 +84154,6 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
     }
     const bool stochastic_dspark =
         e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
-        !ds4_session_is_dsv41(s) &&
         !e->quality && !e->dspark_strict && e->dspark_exact_sampling;
     bool can_prepare = stochastic_dspark && !s->dspark_sched_bypass &&
         first_token != eos_token &&
