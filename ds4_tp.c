@@ -23,6 +23,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
@@ -41,7 +44,7 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 10u
+#define DS4_TP_PROTOCOL_VERSION 11u
 
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
 /* Once both ranks enter a Metal gate, a live exchange normally completes in
@@ -83,6 +86,7 @@ typedef struct {
     uint16_t lid;
     uint8_t gid[16];
     uint8_t link_layer;
+    uint32_t max_msg;   /* largest single message this side will post */
 } ds4_tp_rdma_info;
 
 /* TCP gate frames carry a small header so a desynchronized pair fails loudly
@@ -133,6 +137,8 @@ typedef struct {
  * lands in the slab in-slot (s-1) % slots and its completion is the arrival
  * signal. */
 #define DS4_TP_RDMA_MAX_MSG 16384
+#define DS4_TP_RDMA_MAX_MSG_LARGE 524288
+#define DS4_TP_RDMA_BULK_ROUND_BYTES (2u * 1024u * 1024u)
 #define DS4_TP_RDMA_RECV_WINDOW 16
 #define DS4_TP_RDMA_BULK_SLOTS 64
 #define DS4_TP_RDMA_BULK_WR_TAG (UINT64_C(1) << 63)
@@ -150,6 +156,7 @@ typedef struct {
     int gid_index;
     uint32_t max_inline;
     ds4_tp_rdma_info peer;
+    uint32_t max_msg;           /* negotiated single-message ceiling */
     uint32_t send_outstanding;  /* signaled sends not yet reaped */
     uint64_t recv_done;         /* highest gate seq whose recv completed */
     uint64_t last_gate_seq;     /* last real decode receive consumed */
@@ -827,6 +834,40 @@ static int tp_rdma_posted_barrier(ds4_tp *tp, uint32_t tag) {
     return 1;
 }
 
+/* Largest single message this build posts: 16KB below macOS 26.3, 512KiB from
+ * 26.3 on (peers exchange theirs and use the minimum, so the framing stays
+ * identical on both ends).  DS4_TP_RDMA_MAX_MSG env overrides. */
+static uint32_t tp_rdma_local_max_msg(void) {
+    const char *env = getenv("DS4_TP_RDMA_MAX_MSG");
+    if (env) {
+        long v = atol(env);
+        if (v < DS4_TP_RDMA_MAX_MSG) v = DS4_TP_RDMA_MAX_MSG;
+        if (v > 1048576) v = 1048576;
+        return (uint32_t)v;
+    }
+#ifdef __APPLE__
+    char ver[32] = "";
+    size_t len = sizeof(ver);
+    if (sysctlbyname("kern.osproductversion", ver, &len, NULL, 0) == 0) {
+        int major = 0, minor = 0;
+        if (sscanf(ver, "%d.%d", &major, &minor) >= 1 &&
+            (major > 26 || (major == 26 && minor >= 3)))
+            return DS4_TP_RDMA_MAX_MSG_LARGE;
+    }
+#endif
+    return DS4_TP_RDMA_MAX_MSG;
+}
+
+/* A bulk round posts at most DS4_TP_RDMA_BULK_ROUND_BYTES of receives (the
+ * driver bounds total outstanding recv bytes per QP). */
+static uint32_t tp_rdma_bulk_round_chunks(const ds4_tp *tp) {
+    const uint32_t max_msg = tp->rdma.max_msg ? tp->rdma.max_msg : DS4_TP_RDMA_MAX_MSG;
+    uint32_t chunks = DS4_TP_RDMA_BULK_ROUND_BYTES / max_msg;
+    if (chunks == 0) chunks = 1;
+    if (chunks > DS4_TP_RDMA_BULK_SLOTS) chunks = DS4_TP_RDMA_BULK_SLOTS;
+    return chunks;
+}
+
 static int tp_rdma_warm_up(ds4_tp *tp, char *err, size_t errlen) {
     ds4_tp_rdma *r = &tp->rdma;
     uint8_t *wsend = tp->slab + tp->batch_out_off;
@@ -980,6 +1021,7 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     mine.mtu = (uint32_t)r->port.active_mtu;
     mine.lid = r->port.lid;
     memcpy(mine.gid, r->gid.raw, 16);
+    mine.max_msg = tp_rdma_local_max_msg();
     mine.link_layer = r->port.link_layer;
     if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RDMA_INFO, &mine, sizeof(mine))) {
         tp_set_err(err, errlen, "tp rdma: info send failed");
@@ -1030,18 +1072,20 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
         tp_set_err(err, errlen, "tp rdma: modify RTS: %s", strerror(errno));
         return 0;
     }
-    if (tp->vec_bytes > 2ull * DS4_TP_RDMA_MAX_MSG) {
+    r->max_msg = mine.max_msg < r->peer.max_msg ? mine.max_msg : r->peer.max_msg;
+    if (r->max_msg < DS4_TP_RDMA_MAX_MSG) r->max_msg = DS4_TP_RDMA_MAX_MSG;
+    if (tp->vec_bytes > 2ull * r->max_msg) {
         tp_set_err(err, errlen,
                    "tp rdma: gate vector %llu bytes exceeds twice the driver's "
                    "%u message limit",
-                   (unsigned long long)tp->vec_bytes, DS4_TP_RDMA_MAX_MSG);
+                   (unsigned long long)tp->vec_bytes, r->max_msg);
         return 0;
     }
-    if (tp->vec_bytes > DS4_TP_RDMA_MAX_MSG) {
+    if (tp->vec_bytes > r->max_msg) {
         fprintf(stderr,
                 "ds4-tp: rdma gate vectors ride as 2 chunked messages "
                 "(%llu bytes > %u limit)\n",
-                (unsigned long long)tp->vec_bytes, DS4_TP_RDMA_MAX_MSG);
+                (unsigned long long)tp->vec_bytes, r->max_msg);
     }
     /* Leave the receive queue empty for an initial bulk prefill.  The first
      * decode gate arms the normal lookahead window after prefill finishes. */
@@ -1132,8 +1176,7 @@ static int tp_rdma_drain_cq(ds4_tp *tp) {
 static int tp_rdma_block_post_layer(ds4_tp *tp, uint32_t layer) {
     ds4_tp_rdma *r = &tp->rdma;
     const uint32_t rows = r->block_rows;
-    const uint32_t chunks = (uint32_t)((tp->vec_bytes + DS4_TP_RDMA_MAX_MSG - 1u) /
-                                       DS4_TP_RDMA_MAX_MSG);
+    const uint32_t chunks = (uint32_t)((tp->vec_bytes + r->max_msg - 1u) / r->max_msg);
     const uint32_t n = rows * chunks;
     if (n == 0 || n > r->recv_depth) return 0;
     struct ibv_sge *sge = r->win_sge;
@@ -1144,8 +1187,8 @@ static int tp_rdma_block_post_layer(ds4_tp *tp, uint32_t layer) {
     uint32_t wi = 0;
     for (uint32_t row = 0; row < rows; row++) {
         for (uint64_t off = 0; off < tp->vec_bytes; ) {
-            const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
-                DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
+            const uint64_t len = tp->vec_bytes - off > r->max_msg ?
+                r->max_msg : tp->vec_bytes - off;
             const int last = off + len == tp->vec_bytes;
             sge[wi].addr = base + (uintptr_t)row * tp->vec_bytes + off;
             sge[wi].length = (uint32_t)len;
@@ -1183,8 +1226,7 @@ static int tp_rdma_block_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows
      * can only send layer+1 after it has received this send, so its send
      * never reaches an unposted queue. */
     if (layer + 1u < r->block_layers) ok = tp_rdma_block_post_layer(tp, layer + 1u);
-    const uint32_t chunks = (uint32_t)((tp->vec_bytes + DS4_TP_RDMA_MAX_MSG - 1u) /
-                                       DS4_TP_RDMA_MAX_MSG);
+    const uint32_t chunks = (uint32_t)((tp->vec_bytes + r->max_msg - 1u) / r->max_msg);
     const uint32_t n = rows * chunks;
     if (ok) {
         struct ibv_sge *sge = r->win_sge + r->recv_depth / 2u;   /* separate half of the arrays */
@@ -1197,8 +1239,8 @@ static int tp_rdma_block_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows
             uint32_t wi = 0;
             for (uint32_t row = 0; row < rows; row++) {
                 for (uint64_t off = 0; off < tp->vec_bytes; ) {
-                    const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
-                        DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
+                    const uint64_t len = tp->vec_bytes - off > r->max_msg ?
+                        r->max_msg : tp->vec_bytes - off;
                     sge[wi].addr = base + (uintptr_t)row * tp->vec_bytes + off;
                     sge[wi].length = (uint32_t)len;
                     sge[wi].lkey = r->mr->lkey;
@@ -1260,8 +1302,8 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq) {
     memset(wr, 0, sizeof(wr));
     uint32_t count = 0;
     for (uint64_t off = 0; off < tp->vec_bytes; count++) {
-        const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
-            DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
+        const uint64_t len = tp->vec_bytes - off > r->max_msg ?
+            r->max_msg : tp->vec_bytes - off;
         const int last = off + len == tp->vec_bytes;
         sge[count].addr = base + off;
         sge[count].length = (uint32_t)len;
@@ -1319,8 +1361,8 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
     memset(send_wr, 0, sizeof(send_wr));
     uint32_t send_count = 0;
     for (uint64_t off = 0; ok && off < tp->vec_bytes; send_count++) {
-        const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
-            DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
+        const uint64_t len = tp->vec_bytes - off > r->max_msg ?
+            r->max_msg : tp->vec_bytes - off;
         send_sge[send_count].addr = send_base + off;
         send_sge[send_count].length = (uint32_t)len;
         send_sge[send_count].lkey = r->mr->lkey;
@@ -1379,7 +1421,7 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
 
 static int tp_rdma_big_gate_capable(const ds4_tp *tp) {
     const uint64_t stage_bytes =
-        (uint64_t)DS4_TP_RDMA_BULK_SLOTS * DS4_TP_RDMA_MAX_MSG;
+        (uint64_t)tp_rdma_bulk_round_chunks(tp) * (tp->rdma.max_msg ? tp->rdma.max_msg : DS4_TP_RDMA_MAX_MSG);
     const uint64_t batch_region_bytes =
         (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
     return tp->rdma.qp && tp->rdma.mr && batch_region_bytes >= stage_bytes;
@@ -1394,8 +1436,7 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
     if (!r->recv_window_active) return 1;
 
     const uint32_t chunks_per_gate =
-        (uint32_t)((tp->vec_bytes + DS4_TP_RDMA_MAX_MSG - 1u) /
-                   DS4_TP_RDMA_MAX_MSG);
+        (uint32_t)((tp->vec_bytes + r->max_msg - 1u) / r->max_msg);
     const uint32_t nwr = DS4_TP_RDMA_RECV_WINDOW * chunks_per_gate;
     struct ibv_sge sge[DS4_TP_RDMA_RECV_WINDOW * 2u];
     struct ibv_send_wr wr[DS4_TP_RDMA_RECV_WINDOW * 2u];
@@ -1404,8 +1445,8 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
     uint32_t wi = 0;
     for (uint32_t gate = 0; gate < DS4_TP_RDMA_RECV_WINDOW; gate++) {
         for (uint64_t off = 0; off < tp->vec_bytes; ) {
-            const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
-                DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
+            const uint64_t len = tp->vec_bytes - off > r->max_msg ?
+                r->max_msg : tp->vec_bytes - off;
             sge[wi] = (struct ibv_sge) {
                 .addr = (uintptr_t)(scratch + off),
                 .length = (uint32_t)len,
@@ -1518,8 +1559,9 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
     const uint64_t stage_bytes = (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
     uint32_t depth = r->recv_depth ? r->recv_depth : 64u;
     if (depth > 256u) depth = 256u;
+    if (depth > tp_rdma_bulk_round_chunks(tp)) depth = tp_rdma_bulk_round_chunks(tp);
     if (!direct) {
-        const uint32_t stage_slots = (uint32_t)(stage_bytes / DS4_TP_RDMA_MAX_MSG);
+        const uint32_t stage_slots = (uint32_t)(stage_bytes / r->max_msg);
         if (depth > stage_slots) depth = stage_slots;
         if (depth == 0u) return 0;
         out_mr = in_mr = r->mr;
@@ -1536,12 +1578,12 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
     uint8_t tag = 1;
     while (off < bytes) {
         const uint64_t remaining = bytes - off;
-        uint32_t chunks = (uint32_t)((remaining + DS4_TP_RDMA_MAX_MSG - 1u) / DS4_TP_RDMA_MAX_MSG);
+        uint32_t chunks = (uint32_t)((remaining + r->max_msg - 1u) / r->max_msg);
         if (chunks > depth) chunks = depth;
         uint64_t win_bytes = 0;
         for (uint32_t i = 0; i < chunks; i++) {
             const uint64_t left = remaining - win_bytes;
-            const uint32_t len = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ? DS4_TP_RDMA_MAX_MSG : left);
+            const uint32_t len = (uint32_t)(left > r->max_msg ? r->max_msg : left);
             const uint64_t coff = win_bytes;
             if (!direct) {
                 memcpy(stage_send + coff, (const uint8_t *)out + off + coff, len);
@@ -1629,8 +1671,8 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                 }
                 if (wc[i].opcode & IBV_WC_RECV) {
                     const uint64_t idx = (wc[i].wr_id & ~DS4_TP_RDMA_BULK_WR_TAG) - 1u;
-                    const uint32_t want = idx + 1u < chunks || win_bytes % DS4_TP_RDMA_MAX_MSG == 0u
-                        ? (uint32_t)DS4_TP_RDMA_MAX_MSG : (uint32_t)(win_bytes % DS4_TP_RDMA_MAX_MSG);
+                    const uint32_t want = idx + 1u < chunks || win_bytes % r->max_msg == 0u
+                        ? r->max_msg : (uint32_t)(win_bytes % r->max_msg);
                     if (idx >= chunks || wc[i].byte_len != want) {
                         fprintf(stderr, "ds4-tp: big gate chunk %llu received %u bytes, expected %u\n",
                                 (unsigned long long)idx, wc[i].byte_len, want);
@@ -1793,7 +1835,7 @@ int ds4_tp_create(
     int rdma_ok = 0;
 #ifdef DS4_TP_HAVE_VERBS
     if (opt->transport != DS4_TP_TRANSPORT_TCP &&
-        (uint64_t)id->n_embd * sizeof(float) <= 2ull * DS4_TP_RDMA_MAX_MSG)
+        (uint64_t)id->n_embd * sizeof(float) <= 2ull * tp_rdma_local_max_msg())
         rdma_ok = tp_rdma_probe(&tp->rdma.api);
 #endif
 

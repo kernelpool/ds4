@@ -40201,7 +40201,7 @@ static int ds4_gpu_routed_moe_tokens_impl(
      * token (nei1 / nb12 / nb1), the specialised pipelines all gate on one token, and the
      * sum6 addend has no per-token stride.  Anything else stays one token at a time. */
     if (n_tokens == 0) return 0;
-    if (n_tokens > 1 && (add_in || g_tp_split_world > 1 || g_ssd_streaming_mode ||
+    if (n_tokens > 1 && (add_in || g_ssd_streaming_mode ||
                          g_parallel_q8_pending || g_quality_mode)) {
         return 0;
     }
@@ -47651,6 +47651,9 @@ typedef struct {
     uint64_t down_expert_bytes;
     uint64_t down_row_bytes;
     float    clamp;
+    uint32_t expert_lo;
+    uint32_t expert_hi;
+    uint32_t add_shared;
 } dsv41_gpu_moe_xm_args;
 
 int ds4_gpu_dsv41_moe_expert_major(const void *model_map,
@@ -47693,7 +47696,7 @@ int ds4_gpu_dsv41_moe_expert_major(const void *model_map,
         !glm53_gpu_tensor_has(x, (uint64_t)rows * in_dim, sizeof(float)) ||
         !glm53_gpu_tensor_has(sel, n_pairs, sizeof(int32_t)) ||
         !glm53_gpu_tensor_has(wts, n_pairs, sizeof(float)) ||
-        !glm53_gpu_tensor_has(shared, (uint64_t)rows * out_dim, sizeof(float)) ||
+        (shared && !glm53_gpu_tensor_has(shared, (uint64_t)rows * out_dim, sizeof(float))) ||
         !glm53_gpu_tensor_has(counts, n_expert, sizeof(uint32_t)) ||
         !glm53_gpu_tensor_has(cursor, (uint64_t)n_expert + 1u, sizeof(uint32_t)) ||
         !glm53_gpu_tensor_has(groups, (uint64_t)n_pairs * 3u, sizeof(uint32_t)) ||
@@ -47734,12 +47737,15 @@ int ds4_gpu_dsv41_moe_expert_major(const void *model_map,
         const uint32_t pair_tiles = mid_dim / (2u * DSV41_XM_ROWS);
         const uint32_t down_tiles = out_dim / (2u * DSV41_XM_DOWN_ROWS);
         const uint32_t max_groups = n_pairs / DSV41_XM_R + (n_expert < n_pairs ? n_expert : n_pairs);
+        uint32_t first_expert = 0, n_own = n_expert;
+        ds4_gpu_tp_expert_range(n_expert, &first_expert, &n_own);
         dsv41_gpu_moe_xm_args a = {
             .n_expert = n_expert, .topk = topk, .rows = rows, .in_dim = in_dim,
             .mid_dim = mid_dim, .out_dim = out_dim, .n_pairs = n_pairs,
             .gate_expert_bytes = gate_expert_bytes, .gate_row_bytes = gate_row_bytes,
             .down_expert_bytes = down_expert_bytes, .down_row_bytes = down_row_bytes,
-            .clamp = clamp,
+            .clamp = clamp, .expert_lo = first_expert, .expert_hi = first_expert + n_own,
+            .add_shared = shared != NULL,
         };
 #define XM_T(i, t) [enc setBuffer:ds4_gpu_tensor_buffer(t) offset:ds4_gpu_tensor_offset(t) atIndex:(i)]
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
@@ -47785,7 +47791,7 @@ int ds4_gpu_dsv41_moe_expert_major(const void *model_map,
         enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:p_sum];
         [enc setBytes:&a length:sizeof(a) atIndex:0];
-        XM_T(1, experts); XM_T(2, shared); XM_T(3, out); XM_T(4, sel);
+        XM_T(1, experts); XM_T(2, shared ? shared : out); XM_T(3, out); XM_T(4, sel);
         [enc dispatchThreads:MTLSizeMake(out_dim, rows, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 #undef XM_T

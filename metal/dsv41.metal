@@ -1218,6 +1218,9 @@ struct dsv41_moe_xm_args {
     ulong down_expert_bytes;
     ulong down_row_bytes;
     float clamp;
+    uint expert_lo;     // this rank's experts under tensor parallelism
+    uint expert_hi;
+    uint add_shared;    // fold `shared` into the sum
 };
 
 static constant float dsv41_mxfp4_lut[16] = {
@@ -1365,6 +1368,7 @@ kernel void kernel_dsv41_moe_pair_xm_mxfp4(
     const uint g = tgpig.y;
     if (g >= cursor[a.n_expert]) return;
     const uint e = groups[3u * g], start = groups[3u * g + 1u], n = groups[3u * g + 2u];
+    if (e < a.expert_lo || e >= a.expert_hi) return;
     const uint t0 = (sg % DSV41_XM_SPLITS) * DSV41_XM_T;
     if (t0 >= n) return;
     const uint nt = min(DSV41_XM_T, n - t0);
@@ -1435,6 +1439,7 @@ kernel void kernel_dsv41_moe_down_xm_mxfp4(
     const uint g = tgpig.y;
     if (g >= cursor[a.n_expert]) return;
     const uint e = groups[3u * g], start = groups[3u * g + 1u], n = groups[3u * g + 2u];
+    if (e < a.expert_lo || e >= a.expert_hi) return;
     const uint t0 = (sg % DSV41_XM_SPLITS) * DSV41_XM_T;
     if (t0 >= n) return;
     const uint nt = min(DSV41_XM_T, n - t0);
@@ -1490,10 +1495,10 @@ kernel void kernel_dsv41_moe_sum(
         uint2 gid [[thread_position_in_grid]]) {
     const uint j = gid.x, t = gid.y;
     if (j >= a.out_dim || t >= a.rows) return;
-    float acc = shared[(ulong)t * a.out_dim + j];
+    float acc = a.add_shared ? shared[(ulong)t * a.out_dim + j] : 0.0f;
     for (uint s = 0; s < a.topk; s++) {
         const int e = sel[t * a.topk + s];
-        if (e < 0 || (uint)e >= a.n_expert) continue;
+        if (e < 0 || (uint)e >= a.n_expert || (uint)e < a.expert_lo || (uint)e >= a.expert_hi) continue;
         acc += experts[((ulong)t * a.topk + s) * a.out_dim + j];
     }
     out[(ulong)t * a.out_dim + j] = acc;

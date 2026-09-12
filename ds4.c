@@ -1073,6 +1073,11 @@ static bool ds4_model_is_dsv41(void) {
     return DS4_MODEL_VARIANT == DS4_VARIANT_FLASH_V41 ||
            DS4_MODEL_VARIANT == DS4_VARIANT_FLASH_V41_MINI;
 }
+/* DeepSeek V4.1 keeps its draft stages' experts on both tensor-parallel ranks: top-3 of
+ * 128 has no ownership-split kernel, and the stages only run in the leader's propose. */
+static bool dsv41_tp_layer_replicated(uint32_t il) {
+    return ds4_model_is_dsv41() && il >= DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+}
 
 static bool ds4_model_is_glm53(void) {
     return DS4_MODEL_VARIANT == DS4_VARIANT_GLM53;
@@ -8855,6 +8860,10 @@ static DS4_MAYBE_UNUSED bool weights_model_map_sharded_spans(
         for (int t = 0; t < 3; t++) {
             const ds4_tensor *x = exps[t];
             if (!x || x->ndim != 3 || x->dim[2] < 2) continue;
+            if (dsv41_tp_layer_replicated(il)) {
+                model_map_span_vec_include_one(spans, x);
+                continue;
+            }
             uint64_t in_dim = 0, out_dim = 0, row_bytes = 0;
             (void)tensor_expert_bytes(m, x, 0, &in_dim, &out_dim, &row_bytes);
             const uint64_t expert_bytes = out_dim * row_bytes;
@@ -66041,6 +66050,54 @@ static bool dsv41_gpu_matvec_pair(const ds4_model *m,
            dsv41_gpu_matvec(m, t1, t1->abs_offset, in_dim, out1_dim, rows, x, o1);
 }
 
+/* Tensor parallelism: the trunk's routed experts are split between the ranks and each
+ * layer's MoE partial crosses the wire through DS4's gate machinery -- the row slot for a
+ * token, the batch slot for a verify block, a bounce buffer for a prefill chunk.  Attention
+ * and the draft stages stay replicated; the shared expert is lane-split for small blocks
+ * and rank 0's for prefill chunks. */
+static struct {
+    const ds4_engine_tp_state *tp;
+    ds4_gpu_tensor *bounce;
+    uint64_t bounce_bytes;
+} g_dsv41_tp;
+
+static bool dsv41_tp_trunk(uint32_t il) {
+    return g_dsv41_tp.tp && g_dsv41_tp.tp->active && !dsv41_tp_layer_replicated(il);
+}
+
+static ds4_gpu_tensor *dsv41_tp_moe_out(uint32_t il, uint32_t rows, ds4_gpu_tensor *own) {
+    const ds4_engine_tp_state *tp = g_dsv41_tp.tp;
+    if (rows == 1u) return tp->out_views[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN];
+    if (rows <= (uint32_t)DS4_TP_BATCH_MAX_ROWS) return tp->batch_out_views[il];
+    return own;
+}
+
+/* Exchange the partial dsv41_tp_moe_out() placed and leave the rank-ordered sum in dst. */
+static bool dsv41_tp_moe_exchange(uint32_t il, uint32_t rows, ds4_gpu_tensor *dst) {
+    const ds4_engine_tp_state *tp = g_dsv41_tp.tp;
+    const uint32_t n = rows * DS4_N_EMBD;
+    ds4_gpu_tensor *own, *peer;
+    if (rows == 1u) {
+        const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
+        if (!ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN)) return false;
+        own = tp->out_views[slot]; peer = tp->in_views[slot];
+    } else if (rows <= (uint32_t)DS4_TP_BATCH_MAX_ROWS) {
+        if (!ds4_gpu_tp_batch_gate_encode(il, rows)) return false;
+        own = tp->batch_out_views[il]; peer = tp->batch_in_views[il];
+    } else {
+        const uint64_t bytes = (uint64_t)n * sizeof(float);
+        if (g_dsv41_tp.bounce_bytes < bytes) {
+            ds4_gpu_tensor_free(g_dsv41_tp.bounce);
+            g_dsv41_tp.bounce = ds4_gpu_tensor_alloc(bytes);
+            g_dsv41_tp.bounce_bytes = g_dsv41_tp.bounce ? bytes : 0;
+            if (!g_dsv41_tp.bounce) return false;
+        }
+        if (!ds4_gpu_tp_big_gate_encode(il, rows, dst, g_dsv41_tp.bounce, bytes)) return false;
+        own = dst; peer = g_dsv41_tp.bounce;
+    }
+    return ds4_gpu_add_tensor(dst, tp->rank == 0 ? own : peer, tp->rank == 0 ? peer : own, n) != 0;
+}
+
 /* The released checkpoint's experts, through DS4's fused routed-MoE kernels.
  *
  * V4.1's expert is DS4's existing one: the fused MXFP4 pair+SwiGLU kernel already applies
@@ -66057,6 +66114,16 @@ static bool dsv41_gpu_moe_fused(const ds4_model *m, const ds4_layer_weights *l, 
     const uint64_t d_row = routed_expert_row_bytes(l->ffn_down_exps);
     const uint64_t g_exp = l->ffn_gate_exps->dim[1] * g_row;
     const uint64_t d_exp = l->ffn_down_exps->dim[1] * d_row;
+    const bool tp = dsv41_tp_trunk(il);
+    /* a decode row or a verify block splits the shared expert's lanes between the ranks
+     * (row slice of gate/up, k-slice of down), so its half rides in each rank's partial;
+     * a prefill chunk leaves the whole shared expert to rank 0 */
+    uint64_t sh_row = 0;
+    const bool split_shared = tp && rows <= (uint32_t)DS4_TP_BATCH_MAX_ROWS && (ff / 2u) % 32u == 0u &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
+        metal_graph_dense_quant_row_bytes(l->ffn_gate_shexp, dim, &sh_row);
+    const bool shared_here = !tp || split_shared || g_dsv41_tp.tp->rank == 0;
 
     bool ok = true;
     dsv41_gpu_buf b_g = {0}, b_u = {0}, b_mid = {0}, b_dn = {0}, b_sh = {0}, b_sa = {0};
@@ -66069,18 +66136,45 @@ static bool dsv41_gpu_moe_fused(const ds4_model *m, const ds4_layer_weights *l, 
 
     /* the shared expert is a dense FFN, so the whole chunk goes through it at once; it
      * borrows the routed gate/up scratch, which the fused calls below overwrite anyway */
-    ok = ok && dsv41_gpu_matvec_pair(m, l->ffn_gate_shexp, l->ffn_up_shexp,
-                                     dim, ff, ff, rows, x, b_g.t, b_u.t);
-    ok = ok && ds4_gpu_swiglu_tensor(b_sa.t, b_g.t, b_u.t, rows * ff,
-                                     DS4_SWIGLU_CLAMP_EXP, 1.0f);
-    ok = ok && dsv41_gpu_matvec(m, l->ffn_down_shexp, l->ffn_down_shexp->abs_offset,
-                                ff, dim, rows, b_sa.t, b_sh.t);
+    if (split_shared) {
+        const uint32_t half = ff / 2u;
+        const uint64_t lane = (uint64_t)g_dsv41_tp.tp->rank * half * sh_row;
+        if (rows == 1u) {
+            ok = ok && ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(b_g.t, b_u.t, b_sa.t, m->map, m->size,
+                                                                 l->ffn_gate_shexp->abs_offset + lane,
+                                                                 l->ffn_up_shexp->abs_offset + lane,
+                                                                 dim, half, x, DS4_SWIGLU_CLAMP_EXP) != 0;
+        } else {
+            ok = ok && dsv41_gpu_matvec(m, l->ffn_gate_shexp, l->ffn_gate_shexp->abs_offset + lane,
+                                        dim, half, rows, x, b_g.t);
+            ok = ok && dsv41_gpu_matvec(m, l->ffn_up_shexp, l->ffn_up_shexp->abs_offset + lane,
+                                        dim, half, rows, x, b_u.t);
+            ok = ok && ds4_gpu_swiglu_tensor(b_sa.t, b_g.t, b_u.t, rows * half,
+                                             DS4_SWIGLU_CLAMP_EXP, 1.0f);
+        }
+        for (uint32_t t = 0; t < rows && ok; t++) {
+            ds4_gpu_tensor *v_sh = ds4_gpu_tensor_view(b_sh.t, (uint64_t)t * dim * sizeof(float),
+                                                       (uint64_t)dim * sizeof(float));
+            ok = v_sh && ds4_gpu_matmul_q8_0_kslice_tensor(v_sh, m->map, m->size,
+                                                           l->ffn_down_shexp->abs_offset, ff,
+                                                           (uint64_t)g_dsv41_tp.tp->rank * half, half,
+                                                           dim, b_sa.t, (uint64_t)t * half) != 0;
+            ds4_gpu_tensor_free(v_sh);
+        }
+    } else if (shared_here) {
+        ok = ok && dsv41_gpu_matvec_pair(m, l->ffn_gate_shexp, l->ffn_up_shexp,
+                                         dim, ff, ff, rows, x, b_g.t, b_u.t);
+        ok = ok && ds4_gpu_swiglu_tensor(b_sa.t, b_g.t, b_u.t, rows * ff,
+                                         DS4_SWIGLU_CLAMP_EXP, 1.0f);
+        ok = ok && dsv41_gpu_matvec(m, l->ffn_down_shexp, l->ffn_down_shexp->abs_offset,
+                                    ff, dim, rows, b_sa.t, b_sh.t);
+    }
 
     /* The addend only reaches the fused pair+sum6 decode path, which is a top-6 kernel.
      * Folding also disqualifies the specialized MXFP4 decode family, whose gate wants
      * add_in == NULL -- but that family measures no faster here than the generic one, so
      * the fold stays and saves a dispatch. */
-    const bool fold_shared = (topk == 6u);
+    const bool fold_shared = (topk == 6u) && shared_here;
 
     /* The grouped matmul launches a tile per (token, expert) pair where the decode kernels
      * launch one thin row per token.  Opt-in for now: it stages the activations and the
@@ -66089,7 +66183,7 @@ static bool dsv41_gpu_moe_fused(const ds4_model *m, const ds4_layer_weights *l, 
      * 512 and nothing at the default 64.  Above 1024 rows its scratch stops being
      * allocatable. */
     bool mid_f16 = false;
-    if (ok && rows > 1u && rows <= 1024u &&
+    if (ok && rows > 1u && rows <= 1024u && !tp &&
         dsv41_env("DS4_DSV41_MOE_GROUPED", &g_dsv41_env_moe_grouped) &&
         ds4_gpu_routed_moe_batch_tensor(out, b_g.t, b_u.t, b_mid.t, b_dn.t,
                                         m->map, m->size,
@@ -66102,8 +66196,8 @@ static bool dsv41_gpu_moe_fused(const ds4_model *m, const ds4_layer_weights *l, 
                                         DS4_SWIGLU_CLAMP_EXP, x, il, rows,
                                         &mid_f16, false) != 0) {
         /* the batched kernel has no addend, so the shared expert lands after it */
-        ok = ds4_gpu_add_tensor(out, out, b_sh.t,
-                                (uint32_t)((uint64_t)rows * dim)) != 0;
+        ok = !shared_here || ds4_gpu_add_tensor(out, out, b_sh.t,
+                                                (uint32_t)((uint64_t)rows * dim)) != 0;
         goto done;
     }
 
@@ -66113,7 +66207,7 @@ static bool dsv41_gpu_moe_fused(const ds4_model *m, const ds4_layer_weights *l, 
      * is not top-6, which the one-pass id kernels below cannot take (the draft stages).
      * Needs the window's sort scratch and MXFP4 experts, else the paths below. */
     if (ok && rows > 1u && ((uint64_t)rows * topk >= 2u * (uint64_t)n_exp || topk != 6u) &&
-        sort && sort[0] &&
+        sort && sort[0] && !tp &&
         l->ffn_gate_exps->type == DS4_TENSOR_MXFP4 && l->ffn_down_exps->type == DS4_TENSOR_MXFP4 &&
         !dsv41_env("DS4_DSV41_MOE_PER_TOKEN", &g_dsv41_env_moe_per_token) &&
         !dsv41_env("DS4_DSV41_MOE_TOKEN_MAJOR", &g_dsv41_env_moe_token_major) &&
@@ -66141,8 +66235,8 @@ static bool dsv41_gpu_moe_fused(const ds4_model *m, const ds4_layer_weights *l, 
                                          g_exp, g_row, d_exp, d_row,
                                          dim, ff, dim, sel, wts, n_exp, topk,
                                          DS4_SWIGLU_CLAMP_EXP, x, il, rows) != 0) {
-        ok = ds4_gpu_add_tensor(out, out, b_sh.t,
-                                (uint32_t)((uint64_t)rows * dim)) != 0;
+        ok = !shared_here || ds4_gpu_add_tensor(out, out, b_sh.t,
+                                                (uint32_t)((uint64_t)rows * dim)) != 0;
         goto done;
     }
 
@@ -66169,7 +66263,7 @@ static bool dsv41_gpu_moe_fused(const ds4_model *m, const ds4_layer_weights *l, 
                                            dim, ff, dim, v_s, v_w, n_exp, topk,
                                            DS4_SWIGLU_CLAMP_EXP, v_x,
                                            fold_shared ? v_sh : NULL, il, false) != 0;
-        ok = ok && (fold_shared || ds4_gpu_add_tensor(v_o, v_o, v_sh, dim) != 0);
+        ok = ok && (fold_shared || !shared_here || ds4_gpu_add_tensor(v_o, v_o, v_sh, dim) != 0);
         ds4_gpu_tensor_free(v_x); ds4_gpu_tensor_free(v_o); ds4_gpu_tensor_free(v_sh);
         ds4_gpu_tensor_free(v_s); ds4_gpu_tensor_free(v_w);
     }
@@ -66195,6 +66289,8 @@ static bool dsv41_gpu_moe_step(const ds4_model *m, const ds4_weights *w, uint32_
     const uint32_t dim = DS4_N_EMBD, ff = DS4_N_FF_EXP;
     const uint32_t n_exp = ds4_layer_expert_count(il), topk = ds4_layer_expert_used(il);
     const bool fused = l->ffn_gate_exps->type != DS4_TENSOR_F32;
+    const bool replicated = g_dsv41_tp.tp && g_dsv41_tp.tp->active && !dsv41_tp_trunk(il);
+    if (replicated) ds4_gpu_tp_suspend_expert_sharding(1);
 
     bool ok = true;
     dsv41_gpu_buf b_log = {0}, b_bias = {0}, b_w = {0}, b_g = {0}, b_u = {0};
@@ -66284,6 +66380,7 @@ done:
     ds4_gpu_tensor_free(b_e.t);
     if (t_idx) ds4_gpu_tensor_free(t_idx);
     free(idx_all); free(wt_all);
+    if (replicated) ds4_gpu_tp_suspend_expert_sharding(0);
     return ok;
 }
 
@@ -67178,7 +67275,10 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
         win_gpu ? win_gpu->moe_counts : NULL, win_gpu ? win_gpu->moe_cursor : NULL,
         win_gpu ? win_gpu->moe_groups : NULL, win_gpu ? win_gpu->moe_sorted : NULL,
     };
-    ok = ok && dsv41_gpu_moe_step(m, w, il, n_tok, b_x_all.t, b_moe.t, moe_sort);
+    const bool tp = dsv41_tp_trunk(il);
+    ok = ok && dsv41_gpu_moe_step(m, w, il, n_tok, b_x_all.t,
+                                  tp ? dsv41_tp_moe_out(il, n_tok, b_moe.t) : b_moe.t, moe_sort);
+    if (ok && tp) ok = dsv41_tp_moe_exchange(il, n_tok, b_moe.t);
     if (ok && out && dsv41_env("DS4_DSV41_MOE_ONLY", &g_dsv41_env_moe_only)) {
         ok = dsv41_gpu_buf_get(&b_moe, out, dim);
         goto done;
@@ -68003,10 +68103,17 @@ static bool dsv41_session_step_rows(dsv41_session_state *ss, const ds4_model *m,
                                     uint32_t pos0, float *logits_rows) {
     if (pos0 + n > ss->cap) return false;
     dsv41_session_note(ss, tokens, n, pos0);
-    return dsv41_gpu_forward_rows(m, w, &ss->st, tokens, n, pos0,
-                                  ss->has_engram ? &ss->ctx : NULL, &ss->ge,
-                                  &ss->rope0, &ss->ropec, &ss->win, logits_rows, n, false, NULL,
-                                  DSV41_PHASE_ALL);
+    /* under TP the block's gates ride the pre-posted RDMA verify window */
+    const bool window = g_dsv41_tp.tp && g_dsv41_tp.tp->active &&
+                        n <= (uint32_t)DS4_TP_BATCH_MAX_ROWS &&
+                        ds4_tp_batch_block_begin(g_dsv41_tp.tp->ctx, n,
+                                                 DS4_N_LAYER - DS4_N_NEXTN_PREDICT) != 0;
+    bool ok = dsv41_gpu_forward_rows(m, w, &ss->st, tokens, n, pos0,
+                                     ss->has_engram ? &ss->ctx : NULL, &ss->ge,
+                                     &ss->rope0, &ss->ropec, &ss->win, logits_rows, n, false, NULL,
+                                     DSV41_PHASE_ALL);
+    if (window) ok = ds4_tp_batch_block_end(g_dsv41_tp.tp->ctx) != 0 && ok;
+    return ok;
 }
 
 /* A whole prompt, chunked and split by dsv41_gpu_prefill; the tick keeps the session's
@@ -68135,12 +68242,21 @@ static int dsv41_session_spec(ds4_session *s, int first_token, int max_tokens,
     int toks[DS4_DSPARK_MAX_BLOCK_SIZE + 1];
     toks[0] = first_token;
     memcpy(toks + 1, drafts, k * sizeof(int));
+    /* the worker runs the same block in lockstep (dsv41_session_tp_verify) and keeps the
+     * prefix the commit frame names; a replacement reaches it as an ordinary eval */
+    const bool tp_leader = ds4_session_tp_leader(s);
+    if (tp_leader && !ds4_tp_send_verify(e->tp.ctx, s->tp_session_id, toks, k + 1u)) {
+        s->checkpoint_valid = false;
+        if (errlen) snprintf(err, errlen, "tp: verify block send failed");
+        return -1;
+    }
     float *rows = xmalloc((size_t)(k + 1u) * vocab * sizeof(float));
     const double tv = stats ? now_sec() : 0.0;
     bool ok = dsv41_session_step_rows(ss, &e->model, &e->weights, toks, k + 1u, P1, rows);
     if (stats) s->dspark_stats.verify_ms += (now_sec() - tv) * 1000.0;
     if (!ok) {
         free(rows);
+        if (tp_leader) (void)ds4_tp_send_verify_commit(e->tp.ctx, DS4_TP_VERIFY_COMMIT_PREFIX, 0);
         s->checkpoint_valid = false;
         if (errlen) snprintf(err, errlen, "DeepSeek V4.1 verify failed");
         return -1;
@@ -68161,6 +68277,12 @@ static int dsv41_session_spec(ds4_session *s, int first_token, int max_tokens,
     }
     memcpy(s->logits, rows + (size_t)j * vocab, (size_t)vocab * sizeof(float));
     free(rows);
+    if (tp_leader && !ds4_tp_send_verify_commit(e->tp.ctx, DS4_TP_VERIFY_COMMIT_PREFIX,
+                                                (int32_t)(j + 1u))) {
+        s->checkpoint_valid = false;
+        if (errlen) snprintf(err, errlen, "tp: verify commit send failed");
+        return -1;
+    }
     for (uint32_t i = 0; i <= j; i++) {
         token_vec_push(&s->checkpoint, toks[i]);
         accepted[i] = toks[i];
@@ -68192,6 +68314,43 @@ static int dsv41_session_spec(ds4_session *s, int first_token, int max_tokens,
                 replacement);
     }
     return (int)(1u + j + (replacement >= 0));
+}
+
+/* The worker's side of dsv41_session_spec: the leader's block goes through the trunk in
+ * lockstep (its batch gates pair with the leader's), then the commit frame says how many
+ * of its rows to keep.  Nothing kept means the leader failed; the session is left invalid
+ * for the resync that follows. */
+static int dsv41_session_tp_verify(ds4_session *s, const int *toks, int n,
+                                   char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    dsv41_session_state *ss = s->dsv41;
+    const uint32_t P1 = (uint32_t)s->checkpoint.len;
+    if (!ss || n < 1 || n > DS4_DSPARK_MAX_BLOCK_SIZE + 1 || P1 + (uint32_t)n > ss->cap) {
+        snprintf(err, errlen, "tp: bad V4.1 verify block");
+        return 1;
+    }
+    bool ok = dsv41_session_step_rows(ss, &e->model, &e->weights, toks, (uint32_t)n, P1, NULL);
+    int32_t mode = 0, kept = 0;
+    if (!ds4_tp_recv_verify_commit(e->tp.ctx, &mode, &kept)) {
+        s->checkpoint_valid = false;
+        snprintf(err, errlen, "tp: verify commit frame missing");
+        return 1;
+    }
+    if (!ok || kept < 1 || kept > n) {
+        s->checkpoint_valid = false;
+        if (!ok) snprintf(err, errlen, "DeepSeek V4.1 verify failed");
+        return ok ? 0 : 1;
+    }
+    const uint32_t j = (uint32_t)kept - 1u;
+    const bool batched = ds4_gpu_begin_commands() != 0;
+    ok = (j + 1u == (uint32_t)n || dsv41_gpu_window_rollback(&ss->win, &ss->st, P1 + j)) &&
+         dsv41_gpu_draft_commit(&ss->win, P1, j + 1u);
+    if (batched) (void)ds4_gpu_end_commands();
+    for (uint32_t i = 0; i <= j; i++) token_vec_push(&s->checkpoint, toks[i]);
+    s->mtp_draft_valid = false;
+    s->checkpoint_valid = ok;
+    if (!ok) snprintf(err, errlen, "DeepSeek V4.1 draft rollback failed");
+    return ok ? 0 : 1;
 }
 
 #endif /* !DS4_NO_GPU */
@@ -69413,6 +69572,7 @@ static void model_warm_weights_sharded(const ds4_model *m,
         for (int t = 0; t < 3; t++) {
             const ds4_tensor *x = exps[t];
             if (!x || x->ndim != 3 || x->dim[2] < 2) continue;
+            if (dsv41_tp_layer_replicated(il)) continue;
             uint64_t in_dim = 0, out_dim = 0, row_bytes = 0;
             (void)tensor_expert_bytes(m, x, 0, &in_dim, &out_dim, &row_bytes);
             const uint64_t expert_bytes = out_dim * row_bytes;
@@ -71861,6 +72021,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
                  load_layer_end,
                  load_output,
                  load_output_optional);
+    /* DeepSeek V4.1 verifies its block in one pass under TP as well */
+    if (!opt->dspark_confidence_threshold_set && opt->tp.role != DS4_TP_NONE &&
+        ds4_model_is_dsv41()) {
+        e->dspark_confidence_threshold = e->backend == DS4_BACKEND_METAL ? 0.6f : 0.7f;
+    }
 
     /* TP always maps one contiguous routed-expert half per rank. Decide
      * immediately after binding so memory guards account only the bytes this
@@ -72970,6 +73135,11 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
             *step = 1;
             *per_token = sparse_layers * DS4_TP_GATES_PER_LAYER;
         }
+    } else if (ds4_model_is_dsv41()) {
+        /* one FFN gate per trunk layer; attention and the draft stages are replicated */
+        *start = DS4_TP_GATE_FFN;
+        *step = DS4_TP_GATES_PER_LAYER;
+        *per_token = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     } else {
         *start = 0;
         *step = 1;
@@ -73591,6 +73761,10 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     /* GLM keeps its replicated output head unsplit in v0: the
      * leader computes full logits and nothing crosses the wire. */
     e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA;
+    if (ds4_model_is_dsv41()) {
+        e->tp.vocab_split = false;
+        g_dsv41_tp.tp = &e->tp;
+    }
     e->tp.ctx = tp;
     e->tp.rank = ds4_tp_rank(tp);
     e->tp.eval_seq = 0;
@@ -73628,6 +73802,10 @@ void ds4_engine_close(ds4_engine *e) {
         ds4_gpu_tensor_free(e->tp.zero_vec);
         ds4_gpu_tensor_free(e->tp.slab);
         memset(&e->tp, 0, sizeof(e->tp));
+        if (g_dsv41_tp.tp == &e->tp) {
+            ds4_gpu_tensor_free(g_dsv41_tp.bounce);
+            memset(&g_dsv41_tp, 0, sizeof(g_dsv41_tp));
+        }
     }
 #endif
     ds4_expert_profile_close();
@@ -80576,6 +80754,7 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
         snprintf(err, errlen, "tp: spec cycle outside worker mode");
         return 1;
     }
+    if (ds4_session_is_dsv41(s)) return dsv41_session_tp_verify(s, drafts, draft_n, err, errlen);
     if (draft_n <= 0 || draft_n > DS4_DSPARK_MAX_BLOCK_SIZE) {
         snprintf(err, errlen, "tp: bad verify block size %d", draft_n);
         return 1;

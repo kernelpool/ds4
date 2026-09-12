@@ -90,6 +90,11 @@ draft with the target's own probability instead and preserves the sampling distr
 is the measured optimum in both modes, and `DS4_DSPARK_STATS=1` prints acceptance counts
 at exit.
 
+Two Macs can run it with tensor parallelism (see [DISTRIBUTED.md](DISTRIBUTED.md)): the
+trunk's routed experts are split between the ranks and everything else is replicated, so
+each rank holds half the experts plus the dense weights and the engram sidecar. Pass the
+same `--engram`, `--mtp-model` and DSpark options to the worker and the coordinator.
+
 Prefill runs in chunks of 64 tokens by default; `--prefill-chunk 512` is considerably
 faster on long prompts at the cost of transient buffers that scale with the chunk. The
 compressed caches, index keys and selections stay on the GPU, so long contexts do not

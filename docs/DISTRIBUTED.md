@@ -90,6 +90,12 @@ workers run `ds4`. Pass the same `--vision FILE` to both for image input.
 For GLM MTP, enable `--mtp` on both. For DeepSeek DSpark, both need the
 matching support model and DSpark options.
 
+DeepSeek V4.1 Flash splits its trunk's routed experts the same way and keeps
+attention, the indexer, the engram lookups and the draft stages replicated, so
+both ranks need the backbone, the engram sidecar (`--engram`) and, for DSpark,
+the heads file with the same options. A DSpark block is verified on both ranks
+in lockstep and the worker keeps the prefix the coordinator commits.
+
 TP disk-cache restore currently rebuilds the exact saved token prefix on both
 ranks rather than restoring the coordinator alone. Expect prefill on restore.
 See [speculation](SPECULATIVE_DECODING.md) and [serving](SERVER.md).
