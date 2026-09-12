@@ -1550,6 +1550,101 @@ typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
 template [[host_name("kernel_mul_mv_f32_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4>;
 template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4>;
 
+// The same walk for NT tokens: a block's weights are converted once and meet every
+// token's activations, so a small F16 matrix costs about one token's time for up to four.
+template<typename T0, typename T04, short NR0, short NT>
+void kernel_mul_mv_t_f32_4_nt_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+
+    const int nb = args.ne00/NB;
+    const int r0 = tgpig.x*NR0;
+    const int t0 = tgpig.y*NT;
+
+    device const T0  * ax [NR0];
+    device const T04 * ax4[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (uint64_t)min(r0 + row, args.ne01 - 1)*args.nb01;
+        ax [row] = (device const T0  *) (src0 + offset0);
+        ax4[row] = (device const T04 *) (src0 + offset0);
+    }
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+    const int ib0 = sgitg*NF + ix;
+
+    device const float  * y  [NT];
+    device const float4 * yb4[NT];
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        y[t]   = (device const float *) (src1 + (uint64_t)min(t0 + t, args.ne11 - 1)*args.nb11);
+        yb4[t] = (device const float4 *) y[t] + (ib0*NB + il*NF)/4;
+    }
+
+    float sumf[NT][NR0];
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[t][row] = 0.f;
+    }
+
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        float4 xf[NR0][NF4];
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const T04 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
+            FOR_UNROLL (short i = 0; i < NF4; ++i) xf[row][i] = float4(xb4[i]);
+        }
+        FOR_UNROLL (short t = 0; t < NT; ++t) {
+            const float4 y0 = yb4[t][0], y1 = yb4[t][1], y2 = yb4[t][2], y3 = yb4[t][3];
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                sumf[t][row] += dot(xf[row][0], y0) + dot(xf[row][1], y1) + dot(xf[row][2], y2) + dot(xf[row][3], y3);
+            }
+            yb4[t] += NSG*NF*NW/4;
+        }
+    }
+
+    for (int i = nb*NB + sgitg*NW + tiisg; i < args.ne00; i += NW*NSG) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            const float w = ax[row][i];
+            FOR_UNROLL (short t = 0; t < NT; ++t) sumf[t][row] += w * y[t][i];
+        }
+    }
+
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        if (t0 + t < args.ne11) {
+            device float * dst_f32 = (device float *) dst + (uint64_t)(t0 + t)*args.ne0;
+            helper_mv_reduce_and_write<NR0>(dst_f32, sumf[t], r0, args.ne01, tiisg, sgitg, shmem);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+template<short NT>
+kernel void kernel_mul_mv_f16_f32_4_nt(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_t_f32_4_nt_impl<half, half4, 2, NT>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+typedef decltype(kernel_mul_mv_f16_f32_4_nt<2>) mul_mv_f16_f32_4_nt_t;
+template [[host_name("kernel_mul_mv_f16_f32_4_nt2")]] kernel mul_mv_f16_f32_4_nt_t kernel_mul_mv_f16_f32_4_nt<2>;
+template [[host_name("kernel_mul_mv_f16_f32_4_nt3")]] kernel mul_mv_f16_f32_4_nt_t kernel_mul_mv_f16_f32_4_nt<3>;
+template [[host_name("kernel_mul_mv_f16_f32_4_nt4")]] kernel mul_mv_f16_f32_4_nt_t kernel_mul_mv_f16_f32_4_nt<4>;
+
 // DS4 compressor projections always compute two same-shaped F16 matvecs from
 // the same normalized activation: one for projected KV and one for pooling
 // scores.  This paired variant keeps the exact dense F16 row-reduction shape

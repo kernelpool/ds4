@@ -181,6 +181,59 @@ static int run_shape(const char *label, uint32_t DIM, uint32_t BUCKET, uint32_t 
     printf("  [%s] %-18s %s  gate 0, stream unchanged\n", label, "engram dead token",
            dead_ok ? "ok  " : "FAIL");
 
+    /* several rows at once against one-row calls on each row's inputs */
+    int rows_pass = 0;
+    {
+        const uint32_t R = 5u;
+        float *emb_r = malloc((size_t)R * IN_DIM * sizeof(float));
+        float *x_r = malloc((size_t)R * HC * DIM * sizeof(float));
+        for (uint32_t r = 0; r < R; r++) {
+            for (uint32_t i = 0; i < IN_DIM; i++) emb_r[(size_t)r * IN_DIM + i] = emb[i] * (1.0f + 0.1f * r);
+            for (uint32_t i = 0; i < HC * DIM; i++) x_r[(size_t)r * HC * DIM + i] = x[i] * (1.0f - 0.05f * r);
+        }
+        ds4_gpu_tensor *tr_emb = ds4_gpu_tensor_alloc((uint64_t)R * IN_DIM * sizeof(float));
+        ds4_gpu_tensor *tr_kv = ds4_gpu_tensor_alloc((uint64_t)R * OUT_DIM * sizeof(float));
+        ds4_gpu_tensor *tr_x = ds4_gpu_tensor_alloc((uint64_t)R * HC * DIM * sizeof(float));
+        ds4_gpu_tensor *tr_gate = ds4_gpu_tensor_alloc((uint64_t)R * HC * sizeof(float));
+        ds4_gpu_tensor *tr_out = ds4_gpu_tensor_alloc((uint64_t)R * HC * DIM * sizeof(float));
+        float *out_r = malloc((size_t)R * HC * DIM * sizeof(float)), *gate_r = malloc((size_t)R * HC * sizeof(float));
+        float *out_1 = malloc((size_t)HC * DIM * sizeof(float)), gate_1[HC];
+        int rows_ok = tr_emb && tr_kv && tr_x && tr_gate && tr_out &&
+            ds4_gpu_tensor_write(tr_emb, 0, emb_r, (uint64_t)R * IN_DIM * sizeof(float)) &&
+            ds4_gpu_tensor_write(tr_x, 0, x_r, (uint64_t)R * HC * DIM * sizeof(float)) &&
+            ds4_gpu_dsv41_engram(wkv, wkv_bytes, 0, IN_DIM, DIM, HC, EPS, R, NULL,
+                                 tr_emb, tr_kv, tr_x, t_qw, t_kw, tr_gate, tr_out, NULL) &&
+            ds4_gpu_tensor_read(tr_gate, 0, gate_r, (uint64_t)R * HC * sizeof(float)) &&
+            ds4_gpu_tensor_read(tr_out, 0, out_r, (uint64_t)R * HC * DIM * sizeof(float));
+        double rd = 0.0;
+        for (uint32_t r = 0; rows_ok && r < R; r++) {
+            rows_ok = ds4_gpu_tensor_write(t_emb, 0, emb_r + (size_t)r * IN_DIM, (uint64_t)IN_DIM * sizeof(float)) &&
+                      ds4_gpu_tensor_write(t_x, 0, x_r + (size_t)r * HC * DIM, (uint64_t)HC * DIM * sizeof(float)) &&
+                      ds4_gpu_dsv41_engram(wkv, wkv_bytes, 0, IN_DIM, DIM, HC, EPS, 1u, NULL,
+                                           t_emb, t_kv, t_x, t_qw, t_kw, t_gate, t_out, NULL) &&
+                      ds4_gpu_tensor_read(t_gate, 0, gate_1, sizeof(gate_1)) &&
+                      ds4_gpu_tensor_read(t_out, 0, out_1, (uint64_t)HC * DIM * sizeof(float));
+            for (uint32_t c = 0; rows_ok && c < HC; c++) rd = fmax(rd, fabs((double)gate_r[(size_t)r * HC + c] - gate_1[c]));
+            for (uint32_t i = 0; rows_ok && i < HC * DIM; i++)
+                rd = fmax(rd, fabs((double)out_r[(size_t)r * HC * DIM + i] - out_1[i]) / (oscale > 0.0 ? oscale : 1.0));
+        }
+        const double tr0 = now_ms();
+        for (int r = 0; rows_ok && r < reps; r++) {
+            rows_ok = ds4_gpu_dsv41_engram(wkv, wkv_bytes, 0, IN_DIM, DIM, HC, EPS, R, NULL,
+                                           tr_emb, tr_kv, tr_x, t_qw, t_kw, tr_gate, tr_out, NULL);
+        }
+        const double per_rows = (now_ms() - tr0) / reps;
+        const int pass = rows_ok && rd <= 1e-5;
+        printf("  [%s] %-18s %s  max rel %.3e vs one-row calls  (%u rows %.3f ms/call, 1 row %.3f)\n",
+               label, "engram rows", pass ? "ok  " : "FAIL", rd, R, per_rows, per_call);
+        rows_pass = pass;
+        (void)ds4_gpu_tensor_write(t_emb, 0, emb, (uint64_t)IN_DIM * sizeof(float));
+        (void)ds4_gpu_tensor_write(t_x, 0, x, (uint64_t)HC * DIM * sizeof(float));
+        ds4_gpu_tensor_free(tr_emb); ds4_gpu_tensor_free(tr_kv); ds4_gpu_tensor_free(tr_x);
+        ds4_gpu_tensor_free(tr_gate); ds4_gpu_tensor_free(tr_out);
+        free(emb_r); free(x_r); free(out_r); free(gate_r); free(out_1);
+    }
+
     /* a chunk: three tokens, the middle one dead.  Row 0 and row 2 carry the single-token
      * input, so both must reproduce the single-token result and row 1 must pass through. */
     int batch_ok = 0;
@@ -237,7 +290,7 @@ static int run_shape(const char *label, uint32_t DIM, uint32_t BUCKET, uint32_t 
 
     free(emb); free(x); free(qw); free(kw); free(kv_ref); free(out_ref); free(out_gpu);
     free(blob);
-    return !(gate_ok && out_ok && dead_ok && batch_ok);
+    return !(gate_ok && out_ok && dead_ok && batch_ok && rows_pass);
 }
 
 /* Sparse attention, transcribed independently from the released implementation:
@@ -1782,6 +1835,9 @@ int main(void) {
     fail |= run_rows_matmul("q8_0 5", 5120u, 1280u, 5u, 1);
     fail |= run_rows_matmul("q8_0 8", 4096u, 1001u, 8u, 1);
     fail |= run_rows_matmul("q8_0 5 wide", 1024u, 8192u, 5u, 1);
+    fail |= run_rows_matmul("f16 2", 5120u, 384u, 2u, 0);
+    fail |= run_rows_matmul("f16 5", 5120u, 384u, 5u, 0);
+    fail |= run_rows_matmul("f16 8", 4104u, 1001u, 8u, 0);
     fail |= run_rows_matmul("q8_0 8 wide", 1024u, 4100u, 8u, 1);
     fail |= run_rows_matmul("q8_0 40", 5120u, 2304u, 40u, 1);
     fail |= run_rows_matmul("f16 64", 5120u, 384u, 64u, 0);

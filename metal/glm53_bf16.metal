@@ -91,6 +91,70 @@ kernel void kernel_glm53_mul_mv_bf16_f32(
                               tgpig, lane, sg, nsg);
 }
 
+/* NT tokens at once: a simdgroup owns four rows and the threadgroup stages each 256-wide
+ * slice of the tokens' activations once, so the weights stream once per threadgroup
+ * rather than once per token.  in_dim must be a multiple of 32. */
+template<short NT>
+kernel void kernel_glm53_mul_mv_bf16_f32_nt(
+        constant glm53_bf16_matmul_args &args,
+        device const ushort             *weights,
+        device const float              *x,
+        device float                    *out,
+        threadgroup float               *xs [[threadgroup(0)]],   // [NT][CH]
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    constexpr short NR = 4, CH = 256;
+    const uint row0 = (tgpig.x * (uint)nsg + (uint)sg) * NR;
+    const uint t0 = tgpig.y * NT;
+    device const ushort *w[NR];
+    for (short r = 0; r < NR; r++) {
+        w[r] = weights + (ulong)min(row0 + (uint)r, args.out_dim - 1u) * args.in_dim;
+    }
+    float sum[NT][NR];
+    for (short t = 0; t < NT; t++) {
+        for (short r = 0; r < NR; r++) sum[t][r] = 0.0f;
+    }
+    const ushort nthr = nsg * 32u;
+    for (uint k0 = 0; k0 < args.in_dim; k0 += CH) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (ushort i = tid; i < NT * CH; i += nthr) {
+            const uint tt = min(t0 + (uint)(i / CH), args.n_rows - 1u);
+            const uint k = k0 + (uint)(i % CH);
+            xs[i] = k < args.in_dim ? x[(ulong)tt * args.in_dim + k] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short j = 0; j < CH / 32; j++) {
+            const uint k = k0 + (uint)j * 32u + lane;
+            if (k >= args.in_dim) continue;
+            float wv[NR];
+            for (short r = 0; r < NR; r++) wv[r] = glm53_bf16_to_f32(w[r][k]);
+            for (short t = 0; t < NT; t++) {
+                const float xv = xs[t * CH + j * 32 + lane];
+                for (short r = 0; r < NR; r++) sum[t][r] = fma(wv[r], xv, sum[t][r]);
+            }
+        }
+    }
+    for (short t = 0; t < NT; t++) {
+        for (short r = 0; r < NR; r++) {
+            const float v = simd_sum(sum[t][r]);
+            if (lane == 0u && t0 + (uint)t < args.n_rows && row0 + (uint)r < args.out_dim) {
+                out[(ulong)(t0 + (uint)t) * args.out_dim + row0 + (uint)r] = v;
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_glm53_mul_mv_bf16_f32_nt<2>) glm53_mul_mv_bf16_f32_nt_t;
+template [[host_name("kernel_glm53_mul_mv_bf16_f32_nt2")]] kernel glm53_mul_mv_bf16_f32_nt_t kernel_glm53_mul_mv_bf16_f32_nt<2>;
+template [[host_name("kernel_glm53_mul_mv_bf16_f32_nt3")]] kernel glm53_mul_mv_bf16_f32_nt_t kernel_glm53_mul_mv_bf16_f32_nt<3>;
+template [[host_name("kernel_glm53_mul_mv_bf16_f32_nt4")]] kernel glm53_mul_mv_bf16_f32_nt_t kernel_glm53_mul_mv_bf16_f32_nt<4>;
+template [[host_name("kernel_glm53_mul_mv_bf16_f32_nt5")]] kernel glm53_mul_mv_bf16_f32_nt_t kernel_glm53_mul_mv_bf16_f32_nt<5>;
+template [[host_name("kernel_glm53_mul_mv_bf16_f32_nt6")]] kernel glm53_mul_mv_bf16_f32_nt_t kernel_glm53_mul_mv_bf16_f32_nt<6>;
+template [[host_name("kernel_glm53_mul_mv_bf16_f32_nt8")]] kernel glm53_mul_mv_bf16_f32_nt_t kernel_glm53_mul_mv_bf16_f32_nt<8>;
+
 kernel void kernel_glm53_mul_mv_bf16_f32_qkv(
         constant glm53_bf16_matmul_args &args,
         device const ushort             *weights_q,

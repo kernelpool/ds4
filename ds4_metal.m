@@ -19320,7 +19320,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             /* wide matrices stage the activations per threadgroup (see the kernel) */
             static int64_t nts_min = -1;
             if (nts_min < 0) nts_min = (int64_t)ds4_gpu_env_u64("DS4_METAL_Q8_NTS_MIN_ROWS", 4096u, 1u, UINT32_MAX);
-            const bool staged = out_dim >= (uint64_t)nts_min;
+            const bool staged = out_dim >= (uint64_t)nts_min || (out_dim >= (uint64_t)nts_min / 2u && n_tok >= 4u);
             if (staged) {
                 mv_dispatch.nr0 = 4 * mv_dispatch.nsg;
                 mv_dispatch.smem = (NSUInteger)n_tok * (n_tok <= 6u ? 32u : 16u) * 32u * sizeof(float);
@@ -20922,6 +20922,35 @@ int ds4_gpu_matmul_f16_tensor(
 
             if (!ds4_gpu_finish_command_buffer(cb, owned, "F16 tensor matvec")) return 0;
             return 1;
+        }
+
+        /* 2..8 tokens: the one-token kernel's walk over up to four tokens at once; the
+         * mul_mv_ext family below runs these small matrices at a fraction of the rate */
+        static int f16_nt_off = -1;
+        if (f16_nt_off < 0) f16_nt_off = getenv("DS4_METAL_F16_MV_EXT") != NULL;
+        if (n_tok >= 2u && n_tok <= 8u && (in_dim % 4u) == 0 && !f16_nt_off) {
+            const uint32_t nt = n_tok <= 4u ? (uint32_t)n_tok : n_tok <= 6u ? 3u : 4u;
+            char fn[40];
+            snprintf(fn, sizeof(fn), "kernel_mul_mv_f16_f32_4_nt%u", nt);
+            ds4_gpu_f16_matvec_args mv_args = ds4_gpu_make_f16_mv_args(in_dim, out_dim);
+            mv_args.ne11 = (int32_t)n_tok;
+            mv_args.ne1 = (int32_t)n_tok;
+            const ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 0);
+            id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(fn, mv_dispatch.nsg);
+            if (pipeline) {
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:pipeline];
+                [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+                [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+                [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+                [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+                [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + 1u) / 2u, ((NSUInteger)n_tok + nt - 1u) / nt, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+                if (!ds4_gpu_finish_command_buffer(cb, owned, "F16 multi-token matvec")) return 0;
+                return 1;
+            }
         }
 
         if (n_tok <= 8 && (in_dim % 128u) == 0) {
@@ -47636,8 +47665,11 @@ int ds4_gpu_dsv41_engram(const void *model_map,
                 &inner, "engram wkv");
         }
         if (!weightbuf) return 0;
-        id<MTLComputePipelineState> mv =
-            ds4_gpu_get_pipeline("kernel_glm53_mul_mv_bf16_f32");
+        /* several tokens share one walk over the weights */
+        const uint32_t nt = rows < 2u || (in_dim % 32u) != 0u ? 1u : rows <= 6u ? rows : 8u;
+        char mv_fn[48];
+        snprintf(mv_fn, sizeof(mv_fn), nt > 1u ? "kernel_glm53_mul_mv_bf16_f32_nt%u" : "kernel_glm53_mul_mv_bf16_f32", nt);
+        id<MTLComputePipelineState> mv = ds4_gpu_get_pipeline(mv_fn);
         id<MTLComputePipelineState> gk =
             ds4_gpu_get_pipeline("kernel_dsv41_engram_gate");
         if (!mv || !gk) return 0;
@@ -47660,8 +47692,14 @@ int ds4_gpu_dsv41_engram(const void *model_map,
                 offset:ds4_gpu_tensor_offset(emb) atIndex:2];
         [enc setBuffer:ds4_gpu_tensor_buffer(kv_scratch)
                 offset:ds4_gpu_tensor_offset(kv_scratch) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake((out_dim + nsg - 1u) / nsg, rows, 1)
-            threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1, 1)];
+        if (nt > 1u) {
+            [enc setThreadgroupMemoryLength:(NSUInteger)nt * 256u * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((out_dim + 4u * nsg - 1u) / (4u * nsg), (rows + nt - 1u) / nt, 1)
+                threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1, 1)];
+        } else {
+            [enc dispatchThreadgroups:MTLSizeMake((out_dim + nsg - 1u) / nsg, rows, 1)
+                threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1, 1)];
+        }
 
         dsv41_gpu_engram_gate_args ga = {
             .dim = n_embd,
