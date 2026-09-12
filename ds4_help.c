@@ -188,7 +188,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
             opt(fp, c, "--mtp-timing", "Enable embedded MTP and print acceptance/timing counters.");
             opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp-model.");
-            opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Greedy/opportunistic default: Metal 0.6, CUDA/ROCm 0.7; exact sampling: 0.8");
+            opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Greedy/opportunistic default: Metal 0.6, CUDA/ROCm 0.7; exact sampling: 0.8 (DeepSeek V4.1 keeps the greedy default in both modes)");
             opt(fp, c, "--mtp-exact-sampling", "Preserve the ordinary temperature distribution instead of accepting target-matching greedy drafts directly.");
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
         } else if (tool == DS4_HELP_BENCH) {
