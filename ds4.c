@@ -57898,10 +57898,12 @@ static DS4_MAYBE_UNUSED int payload_write_u32(FILE *fp, uint32_t v, char *err, s
     return payload_write_bytes(fp, b, sizeof(b), err, errlen);
 }
 
+#ifndef DS4_NO_GPU
 static uint64_t dsv41_session_payload_bytes(ds4_session *s);
 static int dsv41_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 static int dsv41_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h, uint64_t *remaining,
                                       char *err, size_t errlen);
+#endif
 
 static DS4_MAYBE_UNUSED int payload_read_u32(FILE *fp, uint32_t *v, uint64_t *remaining, char *err, size_t errlen) {
     uint8_t b[4];
@@ -59489,7 +59491,9 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
     }
     if (!s || !s->checkpoint_valid) return 0;
     if (s->distributed) return 0;
+#ifndef DS4_NO_GPU
     if (ds4_session_is_dsv41(s)) return dsv41_session_payload_bytes(s);
+#endif
     if (ds4_session_is_cpu(s)) {
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -59990,7 +59994,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         return rc;
 #endif
     }
+#ifndef DS4_NO_GPU
     if (ds4_session_is_dsv41(s)) return dsv41_session_save_payload(s, fp, err, errlen);
+#endif
     if (ds4_session_is_cpu(s)) {
         const uint32_t raw_live = session_cpu_raw_live_rows(s);
         const uint32_t raw_cap = ds4_default_raw_cap((uint32_t)s->ctx_size);
@@ -60462,7 +60468,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         return 0;
 #endif
     }
+#ifndef DS4_NO_GPU
     if (ds4_session_is_dsv41(s)) return dsv41_session_load_payload(s, fp, h, &remaining, err, errlen);
+#endif
     if (ds4_session_is_cpu(s)) {
         const uint32_t saved_ctx = h[2];
         const uint32_t saved_prefill_cap = h[3];
@@ -73575,6 +73583,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         return 0;
     }
     ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
+    ds4_gpu_tp_set_batch_payload(ds4_tp_slab_batch_out_offset(tp, 0), DS4_TP_BATCH_MAX_ROWS);
     g_tp_block_ctx = tp;
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
     /* GLM keeps its replicated output head unsplit in v0: the
@@ -80354,6 +80363,8 @@ static int ds4_session_eval_dspark_speculative_stochastic(
         }
     }
 
+    /* A timed-out gate spin leaves the verifier tops stale. */
+    if (ok && e->tp.active && ds4_gpu_tp_failed()) ok = false;
     int accepted_drafts = ok ? 1 : 0;
     int replacement = -1;
     for (int i = 1; ok && i < draft_n; i++) {
@@ -80596,6 +80607,7 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                                              draft_n > 1 ? row_tops : NULL,
                                              NULL,
                                              NULL);
+    if (ok && ds4_gpu_tp_failed()) ok = false;
     int32_t commit_mode = DS4_TP_VERIFY_ROLLBACK_REPLAY;
     int32_t token_count = 0;
     if (!ds4_tp_recv_verify_commit(e->tp.ctx,

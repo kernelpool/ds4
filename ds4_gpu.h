@@ -675,6 +675,9 @@ typedef int (*ds4_gpu_tp_batch_exchange_fn)(void *ud, uint32_t layer,
                                             uint32_t rows, uint64_t seq);
 void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn);
 int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows);
+/* Batch out region base (layer stride max_rows * vec_bytes); enables the
+ * spin release for verify/session batch gates. */
+void ds4_gpu_tp_set_batch_payload(uint64_t batch_out_off, uint32_t max_rows);
 /* Prefill batch gates: the service thread exchanges `bytes` between two
  * CPU-visible bounce tensors directly (payloads far beyond slab slots). */
 typedef int (*ds4_gpu_tp_big_exchange_fn)(void *ud, uint32_t layer,

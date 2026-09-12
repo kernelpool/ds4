@@ -146,6 +146,11 @@ Keep default chunk sizes first. `--dist-prefill-window N` controls the number
 of chunks in flight; `--dist-prefill-chunk N` overrides the session-derived
 chunk size. `--debug` shows route and per-hop timings.
 
+Gate release between the ranks uses a spin kernel by default;
+`DS4_TP_DISABLE_SPIN_RELEASE=1` falls back to the poll gate and
+`DS4_TP_DISABLE_POLL_GATES=1` to shared-event waits, for diagnosis. The spin
+kernel keeps the GPU busy, so the keep-alive kernels stay off with it.
+
 Activations use 32-bit transport by default. `--dist-activation-bits 16` halves
 the payload; `8` is more aggressive. These change numerical precision on the
 wire, not weights or KV storage. Validate output when changing them.

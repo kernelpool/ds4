@@ -7084,3 +7084,62 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
 
     dst[ic * args.head_dim + id] = acc/sum;
 }
+
+// --- Tensor-parallel spin release ---------------------------------------
+//
+// The CPU releases the GPU by a plain store to a system-coherent word that a
+// one-thread kernel spin-reads inside the open command buffer (the MLX fence
+// pattern), so the stream neither parks on a shared event nor ends a command
+// buffer per gate.  Without that command-buffer boundary the partial and the
+// flag have to be pushed to system visibility explicitly: both are re-stored
+// through coherent(system) views followed by a system-scope fence.
+#pragma METAL internals : enable
+#ifndef __METAL_MEMORY_SCOPE_SYSTEM__
+#define __METAL_MEMORY_SCOPE_SYSTEM__ 3
+#endif
+namespace metal {
+constexpr constant metal::thread_scope thread_scope_system =
+    static_cast<thread_scope>(__METAL_MEMORY_SCOPE_SYSTEM__);
+}
+
+kernel void kernel_dsv4_tp_payload_publish(
+        volatile coherent(system) device uint * payload,
+        constant uint & n_words,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid < n_words) payload[tid] = payload[tid];
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+}
+
+// Bounded: a process killed mid-gate never stores the release word, and an
+// unbounded loop strands the kernel in GPU firmware until reboot (observed).
+// 2M iterations keeps the worst-case serial burnout of 86 stranded spins
+// under ~40 s while staying ~100x beyond any live exchange.
+kernel void kernel_dsv4_tp_release_wait(
+        volatile coherent(system) device uint * release_word,
+        constant uint & value) {
+    uint i = 0;
+    for (; i < 2000000u; i++) {
+        metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                   metal::memory_order_seq_cst,
+                                   metal::thread_scope_system);
+        if ((int)(release_word[0] - value) >= 0) break;
+    }
+    release_word[1] = i;   // spin telemetry, read under DS4_TP_GATE_PROFILE
+    // A timed-out spin opened the gate without the peer payload; record it
+    // so the CPU-side check fails the eval instead of combining stale data.
+    if (i >= 2000000u) release_word[2] = release_word[2] + 1u;
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+}
+
+kernel void kernel_dsv4_tp_flag_publish(
+        volatile coherent(system) device uint * flag,
+        constant uint & value) {
+    flag[0] = value;
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+}
