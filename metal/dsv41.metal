@@ -1224,6 +1224,155 @@ kernel void kernel_dsv41_moe_sum(
     out[(ulong)t * a.out_dim + j] = acc;
 }
 
+// ---- DSpark draft support ----------------------------------------------------------------
+
+// The draft head reads the mean over the hc copies of the stream entering each target
+// layer, packed side by side: out[t][out_off + j].
+struct dsv41_hc_mean_args {
+    uint dim;
+    uint hc;
+    uint out_stride;
+    uint out_off;
+};
+
+kernel void kernel_dsv41_hc_mean(
+        constant dsv41_hc_mean_args &args,
+        device const float          *stream,  // [rows, hc, dim]
+        device float                *out,
+        uint2 tpitg [[thread_position_in_threadgroup]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        uint2 ntg   [[threads_per_threadgroup]]) {
+    const uint j = tgpig.x * ntg.x + tpitg.x;
+    if (j >= args.dim) return;
+    const uint t = tgpig.y;
+    device const float *st = stream + (ulong)t * args.hc * args.dim;
+    float acc = 0.0f;
+    for (uint c = 0; c < args.hc; c++) acc += st[c * args.dim + j];
+    out[(ulong)t * args.out_stride + args.out_off + j] = acc / (float)args.hc;
+}
+
+// The Markov head: position `step`'s logits gain head[v] . embed[token[step]] and its
+// draft is the argmax; the confidence is proj . [x[step], embed[token[step]]].  The
+// chain runs on the device, one part/final pair per position, so no token comes back
+// to the host in between.  Tables are [vocab, rank] rows, F16 or F32.
+struct dsv41_markov_args {
+    uint vocab;
+    uint rank;
+    uint dim;
+    uint step;
+    uint n_parts;
+    uint f16;
+};
+
+static inline float dsv41_tab(device const void *p, ulong i, uint f16) {
+    return f16 ? (float)((device const half *)p)[i] : ((device const float *)p)[i];
+}
+
+#define DSV41_MARKOV_MAX_PER_LANE 16u   // rank <= 512
+
+// one simdgroup per row stride, lanes over the rank; ties go to the lower index, NaN loses
+kernel void kernel_dsv41_markov_part(
+        constant dsv41_markov_args &a,
+        device const float         *logits,   // [block, vocab]
+        device const void          *embed,
+        device const void          *head,
+        device const int           *tokens,   // [block + 1]
+        device float               *part_val, // [n_parts]
+        device int                 *part_idx,
+        threadgroup float          *e [[threadgroup(0)]],  // [rank]
+        uint   tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort ntg   [[threads_per_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]],
+        ushort nsg   [[simdgroups_per_threadgroup]]) {
+    threadgroup float sv[32];
+    threadgroup int si[32];
+    const uint per = a.rank / 32u;
+    if (per == 0u || per > DSV41_MARKOV_MAX_PER_LANE) return;
+    const int prev = tokens[a.step];
+    for (uint r = tid; r < a.rank; r += ntg) e[r] = dsv41_tab(embed, (ulong)prev * a.rank + r, a.f16);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ev[DSV41_MARKOV_MAX_PER_LANE];
+    for (uint i = 0; i < per; i++) ev[i] = e[i * 32u + lane];
+
+    device const float *lg = logits + (ulong)a.step * a.vocab;
+    float best = -INFINITY;
+    int bi = -1;
+    for (uint v = tgpig * nsg + sg; v < a.vocab; v += a.n_parts * nsg) {
+        float p = 0.0f;
+        for (uint i = 0; i < per; i++) {
+            p = fma(dsv41_tab(head, (ulong)v * a.rank + i * 32u + lane, a.f16), ev[i], p);
+        }
+        p = simd_sum(p) + lg[v];
+        if (p > best || (p == best && (int)v < bi)) { best = p; bi = (int)v; }
+    }
+    if (lane == 0) { sv[sg] = best; si[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        for (uint k = 1; k < nsg; k++) {
+            if (si[k] >= 0 && (sv[k] > best || (sv[k] == best && si[k] < bi))) { best = sv[k]; bi = si[k]; }
+        }
+        part_val[tgpig] = best;
+        part_idx[tgpig] = bi;
+    }
+}
+
+kernel void kernel_dsv41_markov_final(
+        constant dsv41_markov_args &a,
+        device const float         *part_val,
+        device const int           *part_idx,
+        device int                 *tokens,    // [block + 1]: tokens[step + 1] is written
+        device const float         *x,         // [block, dim], the head's input before its norm
+        device const void          *embed,
+        device const float         *conf_proj, // [dim + rank]
+        device float               *conf,      // [block]
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]],
+        ushort nsg  [[simdgroups_per_threadgroup]]) {
+    threadgroup float sv[32];
+    threadgroup int si[32];
+    float best = -INFINITY;
+    int bi = -1;
+    for (uint p = tid; p < a.n_parts; p += ntg) {
+        const float v = part_val[p];
+        const int i = part_idx[p];
+        if (i >= 0 && (v > best || (v == best && i < bi))) { best = v; bi = i; }
+    }
+    // simd reduce of (best, bi), then across simdgroups
+    for (uint o = 16; o > 0; o >>= 1) {
+        const float ov = simd_shuffle_down(best, o);
+        const int oi = simd_shuffle_down(bi, o);
+        if (oi >= 0 && (ov > best || (ov == best && oi < bi))) { best = ov; bi = oi; }
+    }
+    if (lane == 0) { sv[sg] = best; si[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        for (uint k = 1; k < nsg; k++) {
+            if (si[k] >= 0 && (sv[k] > best || (sv[k] == best && si[k] < bi))) { best = sv[k]; bi = si[k]; }
+        }
+        tokens[a.step + 1u] = bi < 0 ? 0 : bi;
+    }
+
+    const int prev = tokens[a.step];
+    float acc = 0.0f;
+    for (uint d = tid; d < a.dim; d += ntg) acc = fma(conf_proj[d], x[(ulong)a.step * a.dim + d], acc);
+    for (uint r = tid; r < a.rank; r += ntg) {
+        acc = fma(conf_proj[a.dim + r], dsv41_tab(embed, (ulong)prev * a.rank + r, a.f16), acc);
+    }
+    acc = simd_sum(acc);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) sv[sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float c = 0.0f;
+        for (uint k = 0; k < nsg; k++) c += sv[k];
+        conf[a.step] = c;
+    }
+}
+
 // Single-Pass mHC: one projection of the flattened, normalised residual stream, split
 // into the pre / post / comb coefficients, with `comb` made doubly stochastic by Sinkhorn.
 //

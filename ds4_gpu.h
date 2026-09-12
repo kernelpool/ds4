@@ -478,6 +478,27 @@ int ds4_gpu_dsv41_hc_pre(uint32_t rows, uint32_t dim, uint32_t hc,
                          const ds4_gpu_tensor *stream,
                          const ds4_gpu_tensor *mix,
                          ds4_gpu_tensor *out);
+/* DSpark draft support.  hc_mean writes the mean over the hc copies of each row into
+ * out[row * out_stride + out_off ..]. */
+int ds4_gpu_dsv41_hc_mean(uint32_t rows, uint32_t dim, uint32_t hc,
+                          const ds4_gpu_tensor *stream,
+                          ds4_gpu_tensor *out, uint32_t out_stride, uint32_t out_off);
+/* The Markov chain over a draft block: for each position, its logits gain the head row
+ * product with the previous token's embedding, the argmax becomes tokens[step + 1], and
+ * conf[step] = proj . [x[step], embed].  `tokens[0]` is the block's first token on entry.
+ * `embed`/`head` are [vocab, rank] F16 or F32 rows in a registered model map; `parts` is
+ * scratch of n_parts (float + int). */
+int ds4_gpu_dsv41_markov_chain(uint32_t block, uint32_t vocab, uint32_t rank, uint32_t dim,
+                               const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x,
+                               const void *model_map, uint64_t model_size,
+                               uint64_t embed_offset, int embed_f16,
+                               uint64_t head_offset, int head_f16,
+                               const ds4_gpu_tensor *conf_proj,
+                               ds4_gpu_tensor *tokens, ds4_gpu_tensor *conf,
+                               ds4_gpu_tensor *parts, uint32_t n_parts);
+/* Map a second GGUF (a sidecar) for the map-addressed kernels, alongside the model. */
+int ds4_gpu_add_model_map(const void *model_map, uint64_t model_size, uint64_t max_tensor_bytes);
+
 int ds4_gpu_dsv41_hc_post(uint32_t rows, uint32_t dim, uint32_t hc,
                           const ds4_gpu_tensor *sub,
                           const ds4_gpu_tensor *residual,

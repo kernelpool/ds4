@@ -11,7 +11,10 @@
  * engram sidecar it runs the same comparison at released precision, where the weights are
  * MXFP4 / Q8_0 / F16 and the layer topology is the real one:
  *
- *   tests/test_dsv41_layer <backbone.gguf> <engram.gguf>
+ *   tests/test_dsv41_layer <backbone.gguf> <engram.gguf> [<dspark.gguf>]
+ *
+ * With the DSpark heads sidecar as well, a draft block from the GPU is held to the CPU
+ * reference's: the ring rows it keeps, the head logits, the drafts and the confidences.
  */
 
 #include <math.h>
@@ -26,6 +29,9 @@ int ds4_test_dsv41_attn_gpu(const char *, const int *, unsigned, const unsigned 
 int ds4_test_dsv41_prefill(const char *, const int *, unsigned, float *, float *, float *,
                            float *, int32_t *, float *, const char *);
 int ds4_test_dsv41_gpu_picks(const char *, const int *, unsigned, unsigned, unsigned, int32_t *);
+int ds4_test_dsv41_gpu_rollback(const char *, const int *, unsigned, unsigned, unsigned, float *, float *);
+unsigned ds4_test_dsv41_gpu_draft(const char *, const char *, const char *, const int *, unsigned,
+                                  int *, float *, float *, int *, float *, float *, float *);
 
 #define MAX_CASES 10u
 
@@ -58,6 +64,7 @@ static const struct layer_case REAL_CASES[] = {
 int main(int argc, char **argv) {
     const char *gguf = argc > 1 ? argv[1] : "tests/deepseek_v41/mini/mini.gguf";
     const char *engram = argc > 2 ? argv[2] : NULL;
+    const char *dspark = argc > 3 ? argv[3] : NULL;
     const int real = argc > 1;
     const unsigned dim = real ? 5120u : 256u, hc = 4u, stream = dim * hc;
 
@@ -144,6 +151,63 @@ int main(int argc, char **argv) {
         free(ref); free(got);
         printf("v4.1 chunked selection: %s\n", pfail ? "FAILED" : "every query selects with its own reach");
         if (pfail) fail = 1;
+
+        /* A verify-style pass of k rows rolled back to its first row must leave the state a
+         * one-token pass would have left.  Passes of 2..8 rows differ from one-row passes in
+         * summation order, so the bar is F32 noise rather than bit equality. */
+        const unsigned splits[][2] = { {8, 3}, {n - 6, 5}, {n - 8, 6}, {n - 3, 2}, {n - 1, 1} };
+        const unsigned vocab = 512u;
+        float *ra = malloc(vocab * sizeof(float)), *rb = malloc(vocab * sizeof(float));
+        int rfail = 0;
+        for (unsigned i = 0; i < sizeof(splits) / sizeof(splits[0]); i++) {
+            const unsigned split = splits[i][0], k = splits[i][1];
+            double worst = 0.0, scale = 0.0;
+            const int ok = ds4_test_dsv41_gpu_rollback(gguf, tokens, n, split, k, ra, rb) == 0;
+            for (unsigned v = 0; ok && v < vocab; v++) {
+                worst = fmax(worst, fabs((double)ra[v] - rb[v]));
+                scale = fmax(scale, fabs((double)rb[v]));
+            }
+            const double rel = ok ? worst / (scale > 0.0 ? scale : 1.0) : 1.0;
+            const int pass = ok && rel <= 1e-6;
+            if (!pass) rfail = 1;
+            printf("  rollback split %-2u rows %u %s  rel=%.3e\n", split, k, pass ? "ok  " : "FAIL", rel);
+        }
+        free(ra); free(rb);
+        printf("v4.1 speculative rollback: %s\n", rfail ? "FAILED" : "a rejected tail leaves no trace");
+        if (rfail) fail = 1;
+    }
+
+    if (real && dspark) {
+        enum { MAXB = 16 };
+        const unsigned vocab = 129280u;
+        int tg[MAXB], tc[MAXB];
+        float cg[MAXB], cc[MAXB], kv_err[8];
+        float *lg = malloc((size_t)MAXB * vocab * sizeof(float));
+        float *lc = malloc((size_t)MAXB * vocab * sizeof(float));
+        const unsigned B = ds4_test_dsv41_gpu_draft(gguf, engram, dspark, tokens, n, tg, cg, lg, tc, cc, lc, kv_err);
+        int dfail = B == 0;
+        printf("V4.1 DSPARK DRAFT (3 stages, head, Markov chain, confidence) vs the CPU reference\n");
+        for (unsigned s = 0; s < 3 && !dfail; s++) {
+            const int ok = kv_err[s] <= 5e-5f;
+            if (!ok) dfail = 1;
+            printf("  stage %u main_kv ring row %s  rel=%.3e\n", s, ok ? "ok  " : "FAIL", (double)kv_err[s]);
+        }
+        for (unsigned i = 0; i < B; i++) {
+            double worst = 0.0, scale = 0.0;
+            for (unsigned v = 0; v < vocab; v++) {
+                worst = fmax(worst, fabs((double)lg[(size_t)i * vocab + v] - lc[(size_t)i * vocab + v]));
+                scale = fmax(scale, fabs((double)lc[(size_t)i * vocab + v]));
+            }
+            const double rel = worst / (scale > 0.0 ? scale : 1.0);
+            const double cd = fabs((double)cg[i] - cc[i]);
+            const int ok = rel <= 5e-5 && tg[i] == tc[i] && cd <= 1e-3 * fmax(1.0, fabs((double)cc[i]));
+            if (!ok) dfail = 1;
+            printf("  position %u %s  logits rel=%.3e  draft gpu=%d cpu=%d  confidence gpu=%.4f cpu=%.4f\n",
+                   i, ok ? "ok  " : "FAIL", rel, tg[i], tc[i], (double)cg[i], (double)cc[i]);
+        }
+        free(lg); free(lc);
+        printf("v4.1 dspark draft: %s\n", dfail ? "FAILED" : "the GPU drafts what the reference drafts");
+        if (dfail) fail = 1;
     }
     return fail;
 }

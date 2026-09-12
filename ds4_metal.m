@@ -12716,6 +12716,34 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size, 0);
 }
 
+int ds4_gpu_add_model_map(const void *model_map, uint64_t model_size, uint64_t max_tensor_bytes) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || model_size == 0 || max_tensor_bytes == 0 || max_tensor_bytes > model_size) return 0;
+    for (uint32_t i = 0; i < g_model_view_count; i++) {
+        if (g_model_views[i].model_map == model_map && g_model_views[i].model_size == model_size) return 1;
+    }
+    @autoreleasepool {
+        const uint32_t first = g_model_view_count;
+        uint64_t mapped = 0;
+        if (!ds4_gpu_add_model_view_range(model_map, model_size, 0, model_size, max_tensor_bytes,
+                                          false, &mapped)) {
+            return 0;
+        }
+#if TARGET_OS_OSX
+        if (@available(macOS 15.0, *)) {
+            if (g_model_residency_set) {
+                for (uint32_t i = first; i < g_model_view_count; i++) {
+                    [g_model_residency_set addAllocation:g_model_views[i].buffer];
+                }
+                [g_model_residency_set commit];
+                [g_model_residency_set requestResidency];
+            }
+        }
+#endif
+        return 1;
+    }
+}
+
 int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
     return 1;
@@ -46241,6 +46269,112 @@ int ds4_gpu_dsv41_hc_post(uint32_t rows, uint32_t dim, uint32_t hc,
     }
     return dsv41_gpu_hc_mix_dispatch("kernel_dsv41_hc_post", rows, dim, hc,
                                      sub, residual, post, comb, out, 4);
+}
+
+typedef struct {
+    uint32_t dim, hc, out_stride, out_off;
+} dsv41_gpu_hc_mean_args;
+
+int ds4_gpu_dsv41_hc_mean(uint32_t rows, uint32_t dim, uint32_t hc,
+                          const ds4_gpu_tensor *stream,
+                          ds4_gpu_tensor *out, uint32_t out_stride, uint32_t out_off) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (rows == 0 || dim == 0 || hc == 0 || out_off + dim > out_stride ||
+        !glm53_gpu_tensor_has(stream, (uint64_t)rows * hc * dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out, (uint64_t)rows * out_stride, sizeof(float))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 hc_mean received invalid buffers\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> p = ds4_gpu_get_pipeline("kernel_dsv41_hc_mean");
+        if (!p) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        dsv41_gpu_hc_mean_args a = { dim, hc, out_stride, out_off };
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:p];
+        [enc setBytes:&a length:sizeof(a) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(stream) offset:ds4_gpu_tensor_offset(stream) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake((dim + 255u) / 256u, rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 hc_mean");
+    }
+}
+
+typedef struct {
+    uint32_t vocab, rank, dim, step, n_parts, f16;
+} dsv41_gpu_markov_args;
+
+int ds4_gpu_dsv41_markov_chain(uint32_t block, uint32_t vocab, uint32_t rank, uint32_t dim,
+                               const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x,
+                               const void *model_map, uint64_t model_size,
+                               uint64_t embed_offset, int embed_f16,
+                               uint64_t head_offset, int head_f16,
+                               const ds4_gpu_tensor *conf_proj,
+                               ds4_gpu_tensor *tokens, ds4_gpu_tensor *conf,
+                               ds4_gpu_tensor *parts, uint32_t n_parts) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (block == 0 || vocab == 0 || rank == 0 || (rank % 32u) != 0u || rank > 512u || dim == 0 ||
+        n_parts == 0 || n_parts > 4096u || embed_f16 != head_f16 ||
+        !glm53_gpu_tensor_has(logits, (uint64_t)block * vocab, sizeof(float)) ||
+        !glm53_gpu_tensor_has(x, (uint64_t)block * dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(conf_proj, (uint64_t)dim + rank, sizeof(float)) ||
+        !glm53_gpu_tensor_has(tokens, (uint64_t)block + 1u, sizeof(int32_t)) ||
+        !glm53_gpu_tensor_has(conf, block, sizeof(float)) ||
+        !glm53_gpu_tensor_has(parts, (uint64_t)n_parts * 2u, sizeof(float))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 Markov chain received invalid buffers\n");
+        return 0;
+    }
+    @autoreleasepool {
+        const uint64_t elem = embed_f16 ? 2u : 4u;
+        uint64_t e_inner = 0, h_inner = 0;
+        id<MTLBuffer> ebuf = glm53_gpu_weight_buffer(model_map, model_size, embed_offset,
+                                                     (uint64_t)vocab * rank * elem, &e_inner, "markov embed");
+        id<MTLBuffer> hbuf = glm53_gpu_weight_buffer(model_map, model_size, head_offset,
+                                                     (uint64_t)vocab * rank * elem, &h_inner, "markov head");
+        if (!ebuf || !hbuf) return 0;
+        id<MTLComputePipelineState> p_part = ds4_gpu_get_pipeline("kernel_dsv41_markov_part");
+        id<MTLComputePipelineState> p_final = ds4_gpu_get_pipeline("kernel_dsv41_markov_final");
+        if (!p_part || !p_final) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLBuffer> pbuf = ds4_gpu_tensor_buffer(parts);
+        const NSUInteger p_val = ds4_gpu_tensor_offset(parts);
+        const NSUInteger p_idx = p_val + (NSUInteger)n_parts * sizeof(float);
+        for (uint32_t step = 0; step < block; step++) {
+            dsv41_gpu_markov_args a = { vocab, rank, dim, step, n_parts, embed_f16 ? 1u : 0u };
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:p_part];
+            [enc setBytes:&a length:sizeof(a) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(logits) offset:ds4_gpu_tensor_offset(logits) atIndex:1];
+            [enc setBuffer:ebuf offset:(NSUInteger)e_inner atIndex:2];
+            [enc setBuffer:hbuf offset:(NSUInteger)h_inner atIndex:3];
+            [enc setBuffer:ds4_gpu_tensor_buffer(tokens) offset:ds4_gpu_tensor_offset(tokens) atIndex:4];
+            [enc setBuffer:pbuf offset:p_val atIndex:5];
+            [enc setBuffer:pbuf offset:p_idx atIndex:6];
+            [enc setThreadgroupMemoryLength:(NSUInteger)rank * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(n_parts, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+
+            enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:p_final];
+            [enc setBytes:&a length:sizeof(a) atIndex:0];
+            [enc setBuffer:pbuf offset:p_val atIndex:1];
+            [enc setBuffer:pbuf offset:p_idx atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(tokens) offset:ds4_gpu_tensor_offset(tokens) atIndex:3];
+            [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:4];
+            [enc setBuffer:ebuf offset:(NSUInteger)e_inner atIndex:5];
+            [enc setBuffer:ds4_gpu_tensor_buffer(conf_proj) offset:ds4_gpu_tensor_offset(conf_proj) atIndex:6];
+            [enc setBuffer:ds4_gpu_tensor_buffer(conf) offset:ds4_gpu_tensor_offset(conf) atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 Markov chain");
+    }
 }
 
 typedef struct {

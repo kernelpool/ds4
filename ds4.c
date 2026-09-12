@@ -1015,6 +1015,14 @@ static uint32_t ds4_layer_expert_count(uint32_t il) {
     }
     return g_ds4_shape.n_expert;
 }
+static uint32_t ds4_layer_expert_used(uint32_t il) {
+    if (g_ds4_shape.n_dspark_expert_used != 0 &&
+        g_ds4_shape.n_layer > g_ds4_shape.n_nextn_predict &&
+        il >= g_ds4_shape.n_layer - g_ds4_shape.n_nextn_predict) {
+        return g_ds4_shape.n_dspark_expert_used;
+    }
+    return g_ds4_shape.n_expert_used;
+}
 #define DS4_N_LEADING_DENSE           (g_ds4_shape.n_leading_dense)
 #define DS4_N_KV_LORA                 (g_ds4_shape.n_kv_lora)
 #define DS4_N_KEY_MLA                 (g_ds4_shape.n_key_mla)
@@ -9090,6 +9098,43 @@ static void dspark_bind_block(
     l->ffn_down_shexp  = dspark_bind_tensor(dw, m, stage, "ffn_down_shexp.weight", true);
 }
 
+/* DeepSeek V4.1: the draft blocks are blk.N of the backbone, bound as its last layers; the
+ * support file carries the heads.  The Markov head is an embedding and a rank-256 head
+ * over the vocabulary, both stored [rank, vocab] like the token table. */
+static void dsv41_dspark_bind(ds4_dspark_weights *dw, const ds4_model *m) {
+    const uint32_t n_stage = DS4_N_NEXTN_PREDICT;
+    if (dw->n_stages != n_stage || n_stage == 0) {
+        dspark_weights_note_metadata_error(dw, "stage count does not match the backbone");
+        return;
+    }
+    ds4_dspark_stage_weights *first = &dw->stage[0], *last = &dw->stage[n_stage - 1u];
+    first->main_proj = dspark_bind_tensor(dw, m, 0, "main_proj.weight", true);
+    first->main_norm = dspark_bind_tensor(dw, m, 0, "main_norm.weight", true);
+    last->norm = dspark_bind_tensor(dw, m, n_stage - 1u, "norm.weight", true);
+    last->markov_w1 = dspark_bind_tensor(dw, m, n_stage - 1u, "markov_head.embed.weight", true);
+    last->markov_w2 = dspark_bind_tensor(dw, m, n_stage - 1u, "markov_head.head.weight", true);
+    last->confidence_proj = dspark_bind_tensor(dw, m, n_stage - 1u, "confidence_head.proj.weight", true);
+
+    dspark_weights_validate_metadata(dw);
+    dspark_validate_tensor_layout(dw, first->main_proj, "main_proj", DS4_DSPARK_LAYOUT_DENSE, 2,
+                                  (uint64_t)dw->target_layer_count * DS4_N_EMBD, DS4_N_EMBD, 0);
+    dspark_validate_tensor_layout(dw, first->main_norm, "main_norm", DS4_DSPARK_LAYOUT_F32, 1,
+                                  DS4_N_EMBD, 0, 0);
+    dspark_validate_tensor_layout(dw, last->norm, "norm", DS4_DSPARK_LAYOUT_F32, 1, DS4_N_EMBD, 0, 0);
+    dspark_validate_tensor_layout(dw, last->markov_w1, "markov embed", DS4_DSPARK_LAYOUT_PLAIN, 2,
+                                  dw->markov_rank, DS4_N_VOCAB, 0);
+    dspark_validate_tensor_layout(dw, last->markov_w2, "markov head", DS4_DSPARK_LAYOUT_PLAIN, 2,
+                                  dw->markov_rank, DS4_N_VOCAB, 0);
+    dspark_validate_tensor_layout(dw, last->confidence_proj, "confidence_proj",
+                                  DS4_DSPARK_LAYOUT_F32, 2,
+                                  (uint64_t)DS4_N_EMBD + dw->markov_rank, 1, 0);
+    for (uint32_t i = 0; i < dw->target_layer_count; i++) {
+        if (dw->target_layers[i] >= DS4_N_LAYER - n_stage) {
+            dspark_weights_note_metadata_error(dw, "a target layer is not a trunk layer");
+        }
+    }
+}
+
 static void dspark_weights_bind_optional(
         ds4_dspark_weights        *dw,
         const ds4_model           *m,
@@ -9111,6 +9156,11 @@ static void dspark_weights_bind_optional(
            summary->target_layers,
            (size_t)dw->target_layer_count * sizeof(dw->target_layers[0]));
     if (summary->stages > DS4_DSPARK_MAX_STAGES) dw->missing_tensors++;
+
+    if (ds4_model_is_dsv41()) {
+        dsv41_dspark_bind(dw, m);
+        return;
+    }
 
     for (uint32_t stage = 0; stage < dw->n_stages; stage++) {
         ds4_dspark_stage_weights *sw = &dw->stage[stage];
@@ -64825,6 +64875,7 @@ static void dsv41_ref_moe(const ds4_model *m, const ds4_layer_weights *l, const 
     free(logits); free(idx); free(w);
 }
 
+
 /* How many index-score scans took the candidate-restricted path and how many positions
  * that saved, so a test can prove the fast path is the one that ran. */
 static uint64_t g_dsv41_scan_restricted;
@@ -65213,11 +65264,22 @@ static void dsv41_ref_engram_inject(const dsv41_ref_engram *eng, uint32_t il,
 
 /* Block.forward.  `pre_mix` collapses the copies for this attention; the mix this block's
  * attention computes feeds its FFN, and the FFN's feeds the next block. */
+/* a draft stage attends over its ring of main_kv (slot = pos % win, positions <= P) and the
+ * block itself, see dsv41_ref_draft_attn */
+typedef struct {
+    const float *ring;
+    uint32_t P;
+} dsv41_ref_draft_ctx;
+
+static void dsv41_ref_draft_attn(const ds4_model *m, const ds4_weights *w, uint32_t il,
+                                 const float *ring, uint32_t P, const float *x, uint32_t B,
+                                 const dsv41_ref_freqs *f, float *out);
+
 static void dsv41_ref_block(const ds4_model *m, const ds4_weights *w, uint32_t il,
                             dsv41_ref_shared *sh, const dsv41_ref_engram *eng,
                             dsv41_ref_state *st, float *stream,
                             uint32_t s_len, float *pre_mix, const dsv41_ref_freqs *f,
-                            float *attn_out, float *ffn_out) {
+                            float *attn_out, float *ffn_out, const dsv41_ref_draft_ctx *draft) {
     const ds4_layer_weights *l = &w->layer[il];
     const uint32_t dim = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = dim * hc;
     const float hc_eps = DS4_HC_EPS;
@@ -65233,7 +65295,7 @@ static void dsv41_ref_block(const ds4_model *m, const ds4_weights *w, uint32_t i
     float *post_all = xmalloc((size_t)s_len * hc * sizeof(float));
     float *comb_all = xmalloc((size_t)s_len * hc * hc * sizeof(float));
 
-    dsv41_ref_engram_inject(eng, il, stream, s_len);
+    if (!draft) dsv41_ref_engram_inject(eng, il, stream, s_len);   /* drafts are text: no engram */
     memcpy(residual, stream, (size_t)s_len * hc_dim * sizeof(float));
     for (uint32_t t = 0; t < s_len; t++) {
         dsv41_ref_hc_mixes(m, l->hc_attn_fn, l->hc_attn_scale, l->hc_attn_base,
@@ -65252,7 +65314,8 @@ static void dsv41_ref_block(const ds4_model *m, const ds4_weights *w, uint32_t i
         qwen4_ref_rms(normed + (size_t)t * dim, dst, qwen4_ref_f32(m, l->attn_norm), dim, DS4_RMS_EPS);
     }
 
-    dsv41_ref_attn(m, w, il, sh, st, normed, s_len, f, qr, attn_out);
+    if (draft) dsv41_ref_draft_attn(m, w, il, draft->ring, draft->P, normed, s_len, f, attn_out);
+    else dsv41_ref_attn(m, w, il, sh, st, normed, s_len, f, qr, attn_out);
 
     /* hc_post: expand back to hc copies and mix the residual in through comb */
     for (uint32_t t = 0; t < s_len; t++) {
@@ -65286,7 +65349,7 @@ static void dsv41_ref_block(const ds4_model *m, const ds4_weights *w, uint32_t i
         }
         qwen4_ref_rms(normed + (size_t)t * dim, dst, qwen4_ref_f32(m, l->ffn_norm), dim, DS4_RMS_EPS);
         dsv41_ref_moe(m, l, normed + (size_t)t * dim, dim, DS4_N_FF_EXP,
-                      ds4_layer_expert_count(il), DS4_N_EXPERT_USED,
+                      ds4_layer_expert_count(il), ds4_layer_expert_used(il),
                       DS4_SWIGLU_CLAMP_EXP, DS4_EXPERT_WEIGHT_SCALE,
                       ffn_out + (size_t)t * dim);
     }
@@ -65343,7 +65406,7 @@ static DS4_MAYBE_UNUSED void dsv41_ref_prefill(const ds4_model *m, const ds4_wei
          * use compress_rope_theta with YaRN */
         const dsv41_ref_freqs *f = ds4_layer_compress_ratio(il)
                 ? (st ? &st->fc : &fc) : (st ? &st->f0 : &f0);
-        dsv41_ref_block(m, w, il, &sh, eng, st, stream, s_len, pre_mix, f, attn_out, ffn_out);
+        dsv41_ref_block(m, w, il, &sh, eng, st, stream, s_len, pre_mix, f, attn_out, ffn_out, NULL);
         if (dump_attn) {
             memcpy(dump_attn + (size_t)il * s_len * dim, attn_out, (size_t)s_len * dim * sizeof(float));
         }
@@ -65698,7 +65761,7 @@ static DS4_MAYBE_UNUSED void dsv41_ref_decode(const ds4_model *m, const ds4_weig
                           qwen4_ref_f32(m, half ? l->ffn_norm : l->attn_norm), dim, DS4_RMS_EPS);
             if (half) {
                 dsv41_ref_moe(m, l, normed, dim, DS4_N_FF_EXP, ds4_layer_expert_count(il),
-                              DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP,
+                              ds4_layer_expert_used(il), DS4_SWIGLU_CLAMP_EXP,
                               DS4_EXPERT_WEIGHT_SCALE, sub);
                 if (dump_ffn) memcpy(dump_ffn + (size_t)il * dim, sub, dim * sizeof(float));
             } else {
@@ -65727,6 +65790,138 @@ static DS4_MAYBE_UNUSED void dsv41_ref_decode(const ds4_model *m, const ds4_weig
     }
     free(stream); free(pre_mix); free(attn_pre); free(post); free(comb);
     free(residual); free(collapsed); free(normed); free(qr); free(sub);
+}
+
+/* ---- DSpark draft, CPU reference (DSparkBlock / forward_spec / forward_head in model.py).
+ *
+ * The block is [t0, noise x (B-1)] at positions P+1 .. P+B.  Each stage attends over its
+ * window of main_kv at the trunk positions up to P and over the whole block, then runs its
+ * FFN like any block.  The head applies the last mix, the stage norm and the trunk's output
+ * head; position i's logits gain the Markov head's bias for the token before it, its argmax
+ * is the draft, and the confidence is a projection of [x_i, embed(token before)]. */
+static void dsv41_ref_draft_attn(const ds4_model *m, const ds4_weights *w, uint32_t il,
+                                 const float *ring, uint32_t P, const float *x, uint32_t B,
+                                 const dsv41_ref_freqs *f, float *out) {
+    const ds4_layer_weights *l = &w->layer[il];
+    const uint32_t dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM, nh = DS4_N_HEAD;
+    const uint32_t rd = DS4_N_ROT, lq = DS4_N_LORA_Q, win = DS4_N_SWA;
+    const uint32_t groups = DS4_N_OUT_GROUP, lo = DS4_N_LORA_O;
+    const uint32_t topk = win + B;
+    float *q = xmalloc((size_t)B * nh * hd * sizeof(float));
+    float *joined = xmalloc((size_t)topk * hd * sizeof(float));
+    float *qa = xmalloc(lq * sizeof(float));
+    float *qr = xmalloc(lq * sizeof(float));
+    int32_t *idxs = xmalloc((size_t)B * topk * sizeof(int32_t));
+    memcpy(joined, ring, (size_t)win * hd * sizeof(float));
+    for (uint32_t t = 0; t < B; t++) {
+        const float *xt = x + (size_t)t * dim;
+        const uint32_t pos = P + 1u + t;
+        qwen4_ref_matvec(m, l->attn_q_a, xt, qa);
+        qwen4_ref_rms(qr, qa, qwen4_ref_f32(m, l->attn_q_a_norm), lq, DS4_RMS_EPS);
+        qwen4_ref_matvec(m, l->attn_q_b, qr, q + (size_t)t * nh * hd);
+        for (uint32_t h = 0; h < nh; h++) {
+            dsv41_ref_rope(q + ((size_t)t * nh + h) * hd + (hd - rd), rd, f, pos, false);
+        }
+        float *kvt = joined + (size_t)(win + t) * hd;
+        qwen4_ref_matvec(m, l->attn_kv, xt, kvt);
+        qwen4_ref_rms(kvt, kvt, qwen4_ref_f32(m, l->attn_kv_a_norm), hd, DS4_RMS_EPS);
+        dsv41_ref_rope(kvt + (hd - rd), rd, f, pos, false);
+        for (uint32_t j = 0; j < win; j++) {
+            const int64_t p = (int64_t)P - (int64_t)(win - 1u - j);
+            idxs[(size_t)t * topk + j] = p < 0 ? -1 : (int32_t)(p % win);
+        }
+        for (uint32_t u = 0; u < B; u++) idxs[(size_t)t * topk + win + u] = (int32_t)(win + u);
+    }
+    float *o = xmalloc((size_t)B * nh * hd * sizeof(float));
+    dsv41_ref_sparse_attn(q, joined, qwen4_ref_f32(m, l->attn_sinks), idxs, B, nh, hd, topk,
+                          1.0f / sqrtf((float)hd), o);
+    float *low = xmalloc((size_t)groups * lo * sizeof(float));
+    const uint64_t in_per_group = (uint64_t)hd * nh / groups;
+    for (uint32_t t = 0; t < B; t++) {
+        float *ot = o + (size_t)t * nh * hd;
+        for (uint32_t h = 0; h < nh; h++) dsv41_ref_rope(ot + (size_t)h * hd + (hd - rd), rd, f, P + 1u + t, true);
+        for (uint32_t g = 0; g < groups; g++) {
+            qwen4_ref_matvec_rows(m, l->attn_output_a, (uint64_t)g * lo, lo,
+                                  ot + (size_t)g * in_per_group, low + (size_t)g * lo);
+        }
+        qwen4_ref_matvec(m, l->attn_output_b, low, out + (size_t)t * dim);
+    }
+    free(q); free(joined); free(qa); free(qr); free(idxs); free(o); free(low);
+}
+
+/* the main_kv a stage keeps for trunk position `pos`: the projected mean stream of the
+ * target layers, through the stage's wkv */
+static DS4_MAYBE_UNUSED void dsv41_ref_main_kv(const ds4_model *m, const ds4_weights *w, const ds4_model *dm,
+                              const ds4_dspark_weights *dw, uint32_t stage, const float *main_hidden,
+                              uint32_t pos, const dsv41_ref_freqs *f, float *out) {
+    const uint32_t dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM, rd = DS4_N_ROT;
+    const ds4_layer_weights *l = &w->layer[DS4_N_LAYER - DS4_N_NEXTN_PREDICT + stage];
+    float *mx = xmalloc(dim * sizeof(float));
+    qwen4_ref_matvec(dm, dw->stage[0].main_proj, main_hidden, mx);
+    qwen4_ref_rms(mx, mx, qwen4_ref_f32(dm, dw->stage[0].main_norm), dim, DS4_RMS_EPS);
+    qwen4_ref_matvec(m, l->attn_kv, mx, out);
+    qwen4_ref_rms(out, out, qwen4_ref_f32(m, l->attn_kv_a_norm), hd, DS4_RMS_EPS);
+    dsv41_ref_rope(out + (hd - rd), rd, f, pos, false);
+    free(mx);
+}
+
+/* one draft block; `logits` receives the head's logits before the Markov bias */
+static DS4_MAYBE_UNUSED void dsv41_ref_draft(const ds4_model *m, const ds4_weights *w, const ds4_model *dm,
+                            const ds4_dspark_weights *dw, const float *const *rings, int t0,
+                            uint32_t P, uint32_t B, const dsv41_ref_freqs *f,
+                            int *tokens, float *conf, float *logits) {
+    const uint32_t dim = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = dim * hc, vocab = DS4_N_VOCAB;
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT, rank = dw->markov_rank;
+    const ds4_dspark_stage_weights *last = &dw->stage[dw->n_stages - 1u];
+    float *stream = xmalloc((size_t)B * hc_dim * sizeof(float));
+    float *pre_mix = xmalloc((size_t)B * hc * sizeof(float));
+    float *attn_out = xmalloc((size_t)B * dim * sizeof(float));
+    float *ffn_out = xmalloc((size_t)B * dim * sizeof(float));
+    for (uint32_t t = 0; t < B; t++) {
+        float *row = stream + (size_t)t * hc_dim;
+        qwen4_ref_row(m, w->token_embd, (uint64_t)(t == 0 ? t0 : (int)dw->noise_token_id), row);
+        for (uint32_t c = 1; c < hc; c++) memcpy(row + c * dim, row, dim * sizeof(float));
+        for (uint32_t c = 0; c < hc; c++) pre_mix[(size_t)t * hc + c] = c == 0 ? 1.0f : 0.0f;
+    }
+    dsv41_ref_shared sh;
+    memset(&sh, 0, sizeof(sh));
+    for (uint32_t st = 0; st < dw->n_stages; st++) {
+        const dsv41_ref_draft_ctx ctx = { rings[st], P };
+        dsv41_ref_block(m, w, n_trunk + st, &sh, NULL, NULL, stream, B, pre_mix, f,
+                        attn_out, ffn_out, &ctx);
+    }
+    float *x = xmalloc((size_t)B * dim * sizeof(float));
+    float *xn = xmalloc(dim * sizeof(float));
+    float *e = xmalloc(rank * sizeof(float));
+    float *bias = xmalloc(vocab * sizeof(float));
+    const float *proj = qwen4_ref_f32(dm, last->confidence_proj);
+    int prev = t0;
+    for (uint32_t t = 0; t < B; t++) {
+        float *xt = x + (size_t)t * dim;
+        for (uint32_t d = 0; d < dim; d++) {
+            float acc = 0.0f;
+            for (uint32_t c = 0; c < hc; c++) acc += pre_mix[(size_t)t * hc + c] * stream[(size_t)t * hc_dim + c * dim + d];
+            xt[d] = acc;
+        }
+        qwen4_ref_rms(xn, xt, qwen4_ref_f32(dm, last->norm), dim, DS4_RMS_EPS);
+        float *lg = logits + (size_t)t * vocab;
+        qwen4_ref_matvec(m, w->output, xn, lg);
+        qwen4_ref_row(dm, last->markov_w1, (uint64_t)prev, e);
+        qwen4_ref_matvec(dm, last->markov_w2, e, bias);
+        int best = 0;
+        for (uint32_t v = 0; v < vocab; v++) {
+            const float s = lg[v] + bias[v];
+            if (s > lg[best] + bias[best]) best = (int)v;
+        }
+        double c = 0.0;
+        for (uint32_t d = 0; d < dim; d++) c += (double)proj[d] * xt[d];
+        for (uint32_t r = 0; r < rank; r++) c += (double)proj[dim + r] * e[r];
+        tokens[t] = best;
+        conf[t] = (float)c;
+        prev = best;
+    }
+    free(stream); free(pre_mix); free(attn_out); free(ffn_out);
+    free(x); free(xn); free(e); free(bias);
 }
 
 
@@ -65882,9 +66077,11 @@ static bool dsv41_gpu_moe_fused(const ds4_model *m, const ds4_layer_weights *l, 
 
     /* Expert-major, in F32: tokens that share an expert read its weights once, and the
      * kernels pay for it per pair below two tokens per expert, so this path takes a chunk
-     * from that fill up (rows >= 128 at 384 experts top-6).  Needs the window's sort
-     * scratch and MXFP4 experts, else the paths below. */
-    if (ok && (uint64_t)rows * topk >= 2u * (uint64_t)n_exp && sort && sort[0] &&
+     * from that fill up (rows >= 128 at 384 experts top-6) -- and any multi-row block that
+     * is not top-6, which the one-pass id kernels below cannot take (the draft stages).
+     * Needs the window's sort scratch and MXFP4 experts, else the paths below. */
+    if (ok && rows > 1u && ((uint64_t)rows * topk >= 2u * (uint64_t)n_exp || topk != 6u) &&
+        sort && sort[0] &&
         l->ffn_gate_exps->type == DS4_TENSOR_MXFP4 && l->ffn_down_exps->type == DS4_TENSOR_MXFP4 &&
         !dsv41_env("DS4_DSV41_MOE_PER_TOKEN", &g_dsv41_env_moe_per_token) &&
         !dsv41_env("DS4_DSV41_MOE_TOKEN_MAJOR", &g_dsv41_env_moe_token_major) &&
@@ -65964,7 +66161,7 @@ static bool dsv41_gpu_moe_step(const ds4_model *m, const ds4_weights *w, uint32_
                                ds4_gpu_tensor *out, ds4_gpu_tensor *const *sort) {
     const ds4_layer_weights *l = &w->layer[il];
     const uint32_t dim = DS4_N_EMBD, ff = DS4_N_FF_EXP;
-    const uint32_t n_exp = ds4_layer_expert_count(il), topk = DS4_N_EXPERT_USED;
+    const uint32_t n_exp = ds4_layer_expert_count(il), topk = ds4_layer_expert_used(il);
     const bool fused = l->ffn_gate_exps->type != DS4_TENSOR_F32;
 
     bool ok = true;
@@ -66149,6 +66346,16 @@ static bool dsv41_gpu_engram_step(const dsv41_ref_engram *eng, const dsv41_gpu_e
 /* Per-layer constants a block uploads: the mHC scales and bases, the sinks and the
  * compressor norm.  Held for the session so a block binds them instead of allocating
  * and writing six small tensors per layer per call. */
+/* what a session with a DSpark support file drafts with: the stage count and block
+ * size, the trunk layers the head reads, and the heads themselves */
+typedef struct {
+    uint32_t n_stage, block, n_target, rank;
+    uint32_t targets[DS4_DSPARK_MAX_TARGET_LAYERS];
+    int noise_token;
+    const ds4_dspark_weights *w;
+    const ds4_model *m;         /* the support file the heads live in */
+} dsv41_draft_spec;
+
 typedef struct {
     ds4_gpu_tensor *hsc, *hba, *fsc, *fba, *sink, *cnorm;
 } dsv41_gpu_consts;
@@ -66178,6 +66385,21 @@ typedef struct {
     ds4_gpu_tensor *bkeep;      /* [chunk][max_blocks] int32 */
     ds4_gpu_tensor *rstate;     /* radix select: [chunk] x 5 u32 of refinement state */
     ds4_gpu_tensor *rhist;      /* radix select: [chunk] x 256 u32 histograms */
+    /* DSpark drafting: the target layers' stream means for the rows of the last trunk
+     * pass, the projected main_kv rows of those positions awaiting acceptance, and per
+     * stage the window of committed main_kv, slot = pos % win */
+    dsv41_draft_spec draft;     /* n_stage == 0: no drafting */
+    uint32_t draft_rows;        /* rows mh and dpend hold: the chunk, or the block + 1 */
+    uint32_t n_consts;          /* layers `consts` covers */
+    ds4_gpu_tensor *mh;         /* [draft_rows, n_target * dim] */
+    ds4_gpu_tensor *dpend;      /* [n_stage][draft_rows, hd] */
+    ds4_gpu_tensor *dring;      /* [n_stage][win, hd] */
+    ds4_gpu_tensor *conf_proj;  /* [dim + rank] F32 */
+    uint32_t mh_pos0, mh_rows;  /* the positions the last pass captured */
+    /* the compressor inputs of the last pass per pooled kv-source layer, from the open
+     * group's first position, so a rejected tail can be rolled back to any row */
+    ds4_gpu_tensor **pass_kv, **pass_sc;
+    uint32_t *pass_pos0, *pass_rows;
     /* the expert-major MoE's counting sort of a chunk's (token, slot) pairs */
     ds4_gpu_tensor *moe_counts; /* [n_expert] u32, zero between calls */
     ds4_gpu_tensor *moe_cursor; /* [n_expert + 1] u32 */
@@ -66203,6 +66425,11 @@ static void dsv41_gpu_window_close(dsv41_gpu_window *g) {
     ds4_gpu_tensor_free(g->rstate); ds4_gpu_tensor_free(g->rhist);
     ds4_gpu_tensor_free(g->moe_counts); ds4_gpu_tensor_free(g->moe_cursor);
     ds4_gpu_tensor_free(g->moe_groups); ds4_gpu_tensor_free(g->moe_sorted);
+    ds4_gpu_tensor_free(g->mh); ds4_gpu_tensor_free(g->dpend); ds4_gpu_tensor_free(g->dring);
+    ds4_gpu_tensor_free(g->conf_proj);
+    if (g->pass_kv) { for (uint32_t i = 0; i < g->n_layer; i++) ds4_gpu_tensor_free(g->pass_kv[i]); free(g->pass_kv); }
+    if (g->pass_sc) { for (uint32_t i = 0; i < g->n_layer; i++) ds4_gpu_tensor_free(g->pass_sc[i]); free(g->pass_sc); }
+    free(g->pass_pos0); free(g->pass_rows);
     if (g->ring) {
         for (uint32_t i = 0; i < g->n_layer; i++) ds4_gpu_tensor_free(g->ring[i]);
         free(g->ring);
@@ -66231,10 +66458,16 @@ static void dsv41_gpu_window_close(dsv41_gpu_window *g) {
     memset(g, 0, sizeof(*g));
 }
 
+static bool dsv41_gpu_const_put(ds4_gpu_tensor **t, const ds4_model *m, const ds4_tensor *src,
+                                uint64_t n);
+
 static bool dsv41_gpu_window_open(dsv41_gpu_window *g, uint32_t n_layer, uint32_t max_pos,
-                                  uint32_t chunk) {
+                                  uint32_t chunk, const dsv41_draft_spec *ds) {
     memset(g, 0, sizeof(*g));
-    g->ring_slots = DS4_N_SWA + (chunk ? chunk : 1u);
+    /* a chunk past the window, so a pass never overwrites a row still in some window --
+     * a verify pass of block + 1 rows included */
+    const uint32_t pass_max = ds && ds->n_stage && ds->block + 1u > chunk ? ds->block + 1u : (chunk ? chunk : 1u);
+    g->ring_slots = DS4_N_SWA + pass_max;
     const uint64_t ring_n = (uint64_t)g->ring_slots * DS4_N_HEAD_DIM;
     g->ring = xcalloc(n_layer, sizeof(*g->ring));
     g->n_layer = n_layer;
@@ -66295,8 +66528,35 @@ static bool dsv41_gpu_window_open(dsv41_gpu_window *g, uint32_t n_layer, uint32_
         dsv41_gpu_window_close(g);
         return false;
     }
+    g->pass_kv = xcalloc(n_layer, sizeof(*g->pass_kv));
+    g->pass_sc = xcalloc(n_layer, sizeof(*g->pass_sc));
+    g->pass_pos0 = xcalloc(n_layer, sizeof(*g->pass_pos0));
+    g->pass_rows = xcalloc(n_layer, sizeof(*g->pass_rows));
+    for (uint32_t i = 0; i < n_layer; i++) {
+        if (!g->pkv[i]) continue;
+        const uint64_t rows = (uint64_t)ds4_layer_compress_ratio(i) + pass_max;
+        g->pass_kv[i] = ds4_gpu_tensor_alloc(rows * DS4_N_HEAD_DIM * sizeof(float));
+        g->pass_sc[i] = ds4_gpu_tensor_alloc(rows * DS4_N_HEAD_DIM * sizeof(float));
+        if (!g->pass_kv[i] || !g->pass_sc[i]) { dsv41_gpu_window_close(g); return false; }
+    }
+    if (ds && ds->n_stage) {
+        g->draft = *ds;
+        g->draft_rows = chunk > ds->block + 1u ? chunk : ds->block + 1u;
+        const uint64_t ring_f = (uint64_t)ds->n_stage * DS4_N_SWA * DS4_N_HEAD_DIM;
+        g->mh = ds4_gpu_tensor_alloc((uint64_t)g->draft_rows * ds->n_target * DS4_N_EMBD * sizeof(float));
+        g->dpend = ds4_gpu_tensor_alloc((uint64_t)ds->n_stage * g->draft_rows * DS4_N_HEAD_DIM * sizeof(float));
+        g->dring = ds4_gpu_tensor_alloc(ring_f * sizeof(float));
+        if (!g->mh || !g->dpend || !g->dring || !ds4_gpu_tensor_fill_f32(g->dring, 0.0f, ring_f) ||
+            !dsv41_gpu_const_put(&g->conf_proj, ds->m, ds->w->stage[ds->n_stage - 1u].confidence_proj,
+                                 (uint64_t)DS4_N_EMBD + ds->rank)) {
+            dsv41_gpu_window_close(g);
+            return false;
+        }
+    }
     return true;
 }
+
+
 
 static bool dsv41_gpu_const_put(ds4_gpu_tensor **t, const ds4_model *m, const ds4_tensor *src,
                                 uint64_t n) {
@@ -66344,7 +66604,7 @@ static dsv41_gpu_consts *dsv41_gpu_consts_open(const ds4_model *m, const ds4_wei
  * this used to be a projection, a readback and two blits per token. */
 static bool dsv41_gpu_compress_chunk(const ds4_model *m, const ds4_layer_weights *l,
                                      uint32_t il, dsv41_ref_state *st,
-                                     const dsv41_gpu_window *win_gpu, uint32_t ratio,
+                                     dsv41_gpu_window *win_gpu, uint32_t ratio,
                                      uint32_t pos0, uint32_t n_tok,
                                      const ds4_gpu_tensor *x_all, const ds4_gpu_tensor *cnorm,
                                      const ds4_gpu_tensor *cos_t, const ds4_gpu_tensor *sin_t) {
@@ -66388,6 +66648,12 @@ static bool dsv41_gpu_compress_chunk(const ds4_model *m, const ds4_layer_weights
                  dsv41_gpu_matvec(m, l->attn_compressor_gate,
                                   l->attn_compressor_gate->abs_offset, dim, hd, n_tok, x_all, vs);
             ds4_gpu_tensor_free(vk); ds4_gpu_tensor_free(vs);
+        }
+        if (ok && win_gpu && win_gpu->pass_kv[il]) {
+            ok = ds4_gpu_tensor_copy(win_gpu->pass_kv[il], 0, b_kv.t, 0, total * row) != 0 &&
+                 ds4_gpu_tensor_copy(win_gpu->pass_sc[il], 0, b_sc.t, 0, total * row) != 0;
+            win_gpu->pass_pos0[il] = gpos0;
+            win_gpu->pass_rows[il] = total;
         }
         if (ok && groups) {
             ok = dsv41_gpu_buf_alloc(&b_lat, (uint64_t)groups * hd) &&
@@ -66459,7 +66725,8 @@ static bool dsv41_gpu_compress_chunk(const ds4_model *m, const ds4_layer_weights
  * is all the boundary layer owes the decoder: the global KV and index keys for every
  * position.  DSV41_BLOCK_REPLAY runs the block but leaves that publish to the earlier
  * pass. */
-enum { DSV41_BLOCK_FULL = 0, DSV41_BLOCK_PUBLISH = 1, DSV41_BLOCK_REPLAY = 2 };
+enum { DSV41_BLOCK_FULL = 0, DSV41_BLOCK_PUBLISH = 1, DSV41_BLOCK_REPLAY = 2,
+       DSV41_BLOCK_DRAFT = 3 };   /* a DSpark stage over a draft block, see below */
 
 static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32_t il,
                                 dsv41_ref_state *st, ds4_gpu_tensor *stream_t,
@@ -66467,7 +66734,7 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
                                 const ds4_gpu_tensor *cos_t, const ds4_gpu_tensor *sin_t,
                                 float *out,
                                 const dsv41_ref_engram *eng, const dsv41_gpu_engram *ge,
-                                const dsv41_gpu_window *win_gpu, int mode) {
+                                dsv41_gpu_window *win_gpu, int mode) {
     const ds4_layer_weights *l = &w->layer[il];
     const uint32_t dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM, nh = DS4_N_HEAD, win = DS4_N_SWA;
     const uint32_t rd = DS4_N_ROT, lq = DS4_N_LORA_Q;
@@ -66505,7 +66772,9 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
     int32_t *widx = NULL;
     /* the per-layer constants: the session's resident set, or a block's own upload */
     dsv41_gpu_consts own = {0};
-    const dsv41_gpu_consts *k = win_gpu && win_gpu->consts ? &win_gpu->consts[il] : NULL;
+    const dsv41_gpu_consts *k = win_gpu && win_gpu->consts && il < win_gpu->n_consts
+                                ? &win_gpu->consts[il] : NULL;
+    const bool draft = mode == DSV41_BLOCK_DRAFT;
     if (!k) {
         const bool pool = ratio > 1u && g_ds4_kv_source_layer[il] == il;
         ok = dsv41_gpu_const_put(&own.hsc, m, l->hc_attn_scale, 3) &&
@@ -66520,6 +66789,14 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
     /* the engram rewrites the stream entering the block, ahead of its mixes.  A replay
      * inherits a stream the publish pass already rewrote. */
     if (ok && mode != DSV41_BLOCK_REPLAY) ok = dsv41_gpu_engram_step(eng, ge, il, pos0, n_tok, stream_t);
+    /* the draft head reads the mean over the copies of the stream entering its target layers */
+    if (ok && win_gpu && win_gpu->draft.n_stage && mode != DSV41_BLOCK_PUBLISH) {
+        for (uint32_t j = 0; j < win_gpu->draft.n_target && ok; j++) {
+            if (win_gpu->draft.targets[j] != il) continue;
+            ok = ds4_gpu_dsv41_hc_mean(n_tok, dim, hc, stream_t, win_gpu->mh,
+                                       win_gpu->draft.n_target * dim, j * dim) != 0;
+        }
+    }
     /* This attention's mix is what the FFN's hc_pre reads, and the FFN's is what the next
      * block reads, so each hc_mixes writes its destination directly.  Routing both through
      * one scratch cost two blits a block, and a blit ends the compute encoder. */
@@ -66562,8 +66839,10 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
 
     /* The window latent goes out with q_a.  A single token can be projected straight into
      * its ring slot; a chunk's rows are moved in afterwards, in one or two runs. */
-    ds4_gpu_tensor *ring_t = win_gpu ? win_gpu->ring[il] : NULL;
-    const uint32_t rslots = win_gpu ? win_gpu->ring_slots : win;
+    /* a draft block's latents are not kept: its keys are the stage's ring of main_kv plus
+     * the block itself, and every query sees the whole window up to the block */
+    ds4_gpu_tensor *ring_t = win_gpu && !draft ? win_gpu->ring[il] : NULL;
+    const uint32_t rslots = win_gpu && !draft ? win_gpu->ring_slots : win;
     ds4_gpu_tensor *kv_dst = b_kv_all.t;
     ds4_gpu_tensor *kv_slot = NULL;
     if (ring_t && n_tok == 1u) {
@@ -66616,7 +66895,7 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
     widx = xmalloc((size_t)n_tok * win * sizeof(int32_t));
     for (uint32_t t = 0; t < n_tok; t++) {
         for (uint32_t j = 0; j < win; j++) {
-            const int64_t p = (int64_t)(pos0 + t) - (int64_t)(win - 1u - j);
+            const int64_t p = (int64_t)(draft ? pos0 - 1u : pos0 + t) - (int64_t)(win - 1u - j);
             widx[(size_t)t * win + j] = p < 0 ? -1 : (int32_t)((uint64_t)p % rslots);
         }
     }
@@ -66788,7 +67067,22 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
     /* --- attention for the whole chunk at once.  Every position's window is already in
      * the ring and every position's picks are in its source's rows, so a layer attends in
      * one dispatch of heads x tokens rather than tokens dispatches of heads. */
-    if (gpu_sel) {
+    if (gpu_sel && draft) {
+        const uint32_t stage = il - (DS4_N_LAYER - DS4_N_NEXTN_PREDICT);
+        int32_t *bidx = xmalloc((size_t)n_tok * n_tok * sizeof(int32_t));
+        for (uint32_t t = 0; t < n_tok * n_tok; t++) bidx[t] = (int32_t)(win + t % n_tok);
+        ds4_gpu_tensor *dr = ds4_gpu_tensor_view(win_gpu->dring,
+                (uint64_t)stage * win * hd * sizeof(float), (uint64_t)win * hd * sizeof(float));
+        t_idx = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_tok * sizeof(int32_t));
+        ok = dr && t_idx &&
+             ds4_gpu_tensor_write(t_idx, 0, bidx, (uint64_t)n_tok * n_tok * sizeof(int32_t)) != 0 &&
+             ds4_gpu_dsv41_sparse_attn(n_tok, nh, hd, win + n_tok, win, 1.0f / sqrtf((float)hd),
+                                       b_q_all.t, dr, b_kv_all.t, k->sink, t_widx, win, t_idx,
+                                       b_q_all.t) != 0;
+        free(bidx);
+        ds4_gpu_tensor_free(dr);
+        if (!ok) goto done;
+    } else if (gpu_sel) {
         const uint32_t k_all = ratio != 0 ? DS4_N_INDEXER_TOP_K : 0u;
         ok = ds4_gpu_dsv41_sparse_attn(n_tok, nh, hd, win + k_all, rslots,
                                        1.0f / sqrtf((float)hd), b_q_all.t, ring_t,
@@ -66965,15 +67259,153 @@ enum { DSV41_PHASE_ALL = 0, DSV41_PHASE_ENCODE = 1, DSV41_PHASE_DECODE = 2 };
  * decode are the same call -- attention is causal and the compressor's partial group is
  * carried in the state, so stepping the prompt one position at a time leaves exactly the
  * caches a batched prefill would. */
-static bool dsv41_gpu_forward_token(const ds4_model *m, const ds4_weights *w,
-                                    dsv41_ref_state *st, const int *tokens,
-                                    uint32_t n_tok, uint32_t pos0,
-                                    const dsv41_ref_engram *eng,
-                                    const dsv41_gpu_engram *ge,
-                                    const dsv41_gpu_rope *rope0,
-                                    const dsv41_gpu_rope *ropec,
-                                    const dsv41_gpu_window *win_gpu, float *logits,
-                                    dsv41_gpu_ced *ced, int phase) {
+/* ---- DSpark drafting.  The draft stages are the backbone's last blocks; what they need
+ * from the trunk is main_x, a projection of the mean stream entering the target layers,
+ * of which each stage keeps a window of wkv latents (main_kv) at the trunk positions.
+ * Those rows are computed with every trunk pass and committed to the rings once the
+ * positions are accepted, so a rejected draft leaves no trace. */
+
+/* main_kv rows for the positions the pass just ran, into the pending buffer */
+static bool dsv41_gpu_draft_pending(const ds4_model *m, const ds4_weights *w,
+                                    dsv41_gpu_window *g, uint32_t pos0, uint32_t n_tok,
+                                    const dsv41_gpu_rope *rope0) {
+    const dsv41_draft_spec *d = &g->draft;
+    const ds4_dspark_weights *dw = d->w;
+    const uint32_t dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM, rd = DS4_N_ROT;
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    if (n_tok > g->draft_rows) return false;
+    dsv41_gpu_buf b_mx = {0}, b_tmp = {0};
+    bool ok = dsv41_gpu_buf_alloc(&b_mx, (uint64_t)n_tok * dim) &&
+              dsv41_gpu_buf_alloc(&b_tmp, (uint64_t)n_tok * dim);
+    ok = ok && dsv41_gpu_matvec(d->m, dw->stage[0].main_proj, dw->stage[0].main_proj->abs_offset,
+                                (uint64_t)d->n_target * dim, dim, n_tok, g->mh, b_tmp.t);
+    ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(b_mx.t, b_tmp.t, d->m->map, d->m->size,
+                                                   dw->stage[0].main_norm->abs_offset, dim,
+                                                   n_tok, DS4_RMS_EPS);
+    for (uint32_t st = 0; st < d->n_stage && ok; st++) {
+        const ds4_layer_weights *l = &w->layer[n_trunk + st];
+        ds4_gpu_tensor *v = ds4_gpu_tensor_view(g->dpend,
+                (uint64_t)st * g->draft_rows * hd * sizeof(float), (uint64_t)n_tok * hd * sizeof(float));
+        ok = v && dsv41_gpu_matvec(m, l->attn_kv, l->attn_kv->abs_offset, dim, hd, n_tok, b_mx.t, v) &&
+             ds4_gpu_rms_norm_weight_rows_tensor(v, v, m->map, m->size, l->attn_kv_a_norm->abs_offset,
+                                                 hd, n_tok, DS4_RMS_EPS) &&
+             ds4_gpu_dsv41_rope(n_tok, 1, hd, rd, pos0, 0, v, rope0->cos, rope0->sin);
+        ds4_gpu_tensor_free(v);
+    }
+    ds4_gpu_tensor_free(b_mx.t); ds4_gpu_tensor_free(b_tmp.t);
+    if (ok) { g->mh_pos0 = pos0; g->mh_rows = n_tok; }
+    return ok;
+}
+
+/* the first n_rows pending positions into the rings; needs an open batch */
+static bool dsv41_gpu_draft_commit(dsv41_gpu_window *g, uint32_t pos0, uint32_t n_rows) {
+    const uint32_t win = DS4_N_SWA, hd = DS4_N_HEAD_DIM;
+    const uint64_t row = (uint64_t)hd * sizeof(float);
+    if (n_rows > g->mh_rows || pos0 != g->mh_pos0) return false;
+    const uint32_t r0 = n_rows > win ? n_rows - win : 0u;
+    for (uint32_t st = 0; st < g->draft.n_stage; st++) {
+        const uint64_t pend = (uint64_t)st * g->draft_rows * row, ring = (uint64_t)st * win * row;
+        for (uint32_t r = r0; r < n_rows; ) {
+            const uint32_t slot = (pos0 + r) % win;
+            uint32_t run = win - slot;
+            if (run > n_rows - r) run = n_rows - r;
+            if (!ds4_gpu_tensor_copy(g->dring, ring + (uint64_t)slot * row,
+                                     g->dpend, pend + (uint64_t)r * row, (uint64_t)run * row)) return false;
+            r += run;
+        }
+    }
+    return true;
+}
+
+/* Roll the compressed caches back to frontier F, the last accepted position: the
+ * published count is what positions <= F complete, and the open group's rows come back
+ * from the last pass's inputs.  Nothing else needs undoing -- the window rings hold a pass
+ * past the window, so a rejected row there is never addressed again, and every other
+ * per-position array is rewritten when the position runs again.  Needs an open batch. */
+static bool dsv41_gpu_window_rollback(dsv41_gpu_window *g, dsv41_ref_state *st, uint32_t F) {
+    const uint64_t row = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    for (uint32_t i = 0; i < g->n_layer; i++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(i);
+        if (ratio == 0 || g_ds4_kv_source_layer[i] != i) continue;
+        st->n_comp[i] = (F + 1u) / ratio;
+        const uint32_t lead = (F + 1u) % ratio;
+        if (lead == 0) continue;
+        const uint32_t G = F + 1u - lead;
+        if (!g->pass_kv[i] || G < g->pass_pos0[i] || F >= g->pass_pos0[i] + g->pass_rows[i]) return false;
+        const uint64_t off = (uint64_t)(G - g->pass_pos0[i]) * row;
+        if (!ds4_gpu_tensor_copy(g->pkv[i], 0, g->pass_kv[i], off, lead * row) ||
+            !ds4_gpu_tensor_copy(g->psc[i], 0, g->pass_sc[i], off, lead * row)) return false;
+    }
+    return true;
+}
+
+/* One draft block from the token the trunk just produced and the position it was produced
+ * at: the stages over [t0, noise x (block-1)], then the head, the Markov chain and the
+ * confidences, all in one command batch.  tokens_out[i] is the draft for position
+ * P + 2 + i, conf_out[i] the confidence logit that it is right. */
+static bool dsv41_gpu_draft_propose(const ds4_model *m, const ds4_weights *w, dsv41_ref_state *st,
+                                    dsv41_gpu_window *g, const dsv41_gpu_rope *rope0,
+                                    const dsv41_gpu_engram *ge, int t0, uint32_t P,
+                                    int *tokens_out, float *conf_out, float *head_logits) {
+    const dsv41_draft_spec *d = &g->draft;
+    const ds4_dspark_stage_weights *last = &d->w->stage[d->n_stage - 1u];
+    const uint32_t B = d->block, dim = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = dim * hc;
+    const uint32_t vocab = DS4_N_VOCAB, n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    float *stream = xmalloc((size_t)B * hc_dim * sizeof(float));
+    float *mix = xmalloc((size_t)B * hc * sizeof(float));
+    for (uint32_t t = 0; t < B; t++) {
+        float *row = stream + (size_t)t * hc_dim;
+        qwen4_ref_row(m, w->token_embd, (uint64_t)(t == 0 ? t0 : d->noise_token), row);
+        for (uint32_t c = 1; c < hc; c++) memcpy(row + c * dim, row, dim * sizeof(float));
+        for (uint32_t c = 0; c < hc; c++) mix[(size_t)t * hc + c] = c == 0 ? 1.0f : 0.0f;
+    }
+    dsv41_gpu_buf b_st = {0}, b_mix = {0}, b_x = {0}, b_xn = {0}, b_lg = {0}, b_conf = {0}, b_parts = {0};
+    ds4_gpu_tensor *t_tok = ds4_gpu_tensor_alloc(((uint64_t)B + 1u) * sizeof(int32_t));
+    const uint32_t n_parts = 256u;
+    const bool batched = ds4_gpu_begin_commands() != 0;
+    bool ok = t_tok && ds4_gpu_tensor_write(t_tok, 0, &t0, sizeof(int32_t)) != 0 &&
+              dsv41_gpu_buf_alloc(&b_st, (uint64_t)B * hc_dim) && dsv41_gpu_buf_put(&b_st, stream, (uint64_t)B * hc_dim) &&
+              dsv41_gpu_buf_alloc(&b_mix, (uint64_t)B * hc) && dsv41_gpu_buf_put(&b_mix, mix, (uint64_t)B * hc) &&
+              dsv41_gpu_buf_alloc(&b_x, (uint64_t)B * dim) && dsv41_gpu_buf_alloc(&b_xn, (uint64_t)B * dim) &&
+              dsv41_gpu_buf_alloc(&b_lg, (uint64_t)B * vocab) && dsv41_gpu_buf_alloc(&b_conf, B) &&
+              dsv41_gpu_buf_alloc(&b_parts, 2u * n_parts);
+    for (uint32_t stg = 0; stg < d->n_stage && ok; stg++) {
+        ok = dsv41_gpu_attn_step(m, w, n_trunk + stg, st, b_st.t, b_mix.t, P + 1u, B,
+                                 rope0->cos, rope0->sin, NULL, NULL, ge, g, DSV41_BLOCK_DRAFT);
+    }
+    ok = ok && ds4_gpu_dsv41_hc_pre(B, dim, hc, b_st.t, b_mix.t, b_x.t);
+    ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(b_xn.t, b_x.t, d->m->map, d->m->size,
+                                                   last->norm->abs_offset, dim, B, DS4_RMS_EPS);
+    ok = ok && dsv41_gpu_matvec(m, w->output, w->output->abs_offset, dim, vocab, B, b_xn.t, b_lg.t);
+    ok = ok && ds4_gpu_dsv41_markov_chain(B, vocab, d->rank, dim, b_lg.t, b_x.t, d->m->map, d->m->size,
+                                          last->markov_w1->abs_offset, last->markov_w1->type == DS4_TENSOR_F16,
+                                          last->markov_w2->abs_offset, last->markov_w2->type == DS4_TENSOR_F16,
+                                          g->conf_proj, t_tok, b_conf.t, b_parts.t, n_parts) != 0;
+    if (batched) (void)ds4_gpu_end_commands();
+    ok = ok && ds4_gpu_tensor_read(t_tok, sizeof(int32_t), tokens_out, (uint64_t)B * sizeof(int32_t)) != 0 &&
+         ds4_gpu_tensor_read(b_conf.t, 0, conf_out, (uint64_t)B * sizeof(float)) != 0 &&
+         (!head_logits || ds4_gpu_tensor_read(b_lg.t, 0, head_logits, (uint64_t)B * vocab * sizeof(float)) != 0);
+    ds4_gpu_tensor_free(t_tok);
+    ds4_gpu_tensor_free(b_st.t); ds4_gpu_tensor_free(b_mix.t); ds4_gpu_tensor_free(b_x.t);
+    ds4_gpu_tensor_free(b_xn.t); ds4_gpu_tensor_free(b_lg.t); ds4_gpu_tensor_free(b_conf.t);
+    ds4_gpu_tensor_free(b_parts.t);
+    free(stream); free(mix);
+    return ok;
+}
+
+/* `logits` receives the last `n_logit_rows` positions' rows.  With drafting on, the pass
+ * also projects its positions' main_kv; `commit_draft` puts them in the stage rings now,
+ * a verify pass commits only what it accepts. */
+static bool dsv41_gpu_forward_rows(const ds4_model *m, const ds4_weights *w,
+                                   dsv41_ref_state *st, const int *tokens,
+                                   uint32_t n_tok, uint32_t pos0,
+                                   const dsv41_ref_engram *eng,
+                                   const dsv41_gpu_engram *ge,
+                                   const dsv41_gpu_rope *rope0,
+                                   const dsv41_gpu_rope *ropec,
+                                   dsv41_gpu_window *win_gpu, float *logits,
+                                   uint32_t n_logit_rows, bool commit_draft,
+                                   dsv41_gpu_ced *ced, int phase) {
     const uint32_t dim = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = dim * hc;
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     const uint32_t bnd = phase == DSV41_PHASE_ALL ? 0u : dsv41_ced_boundary();
@@ -67023,24 +67455,32 @@ static bool dsv41_gpu_forward_token(const ds4_model *m, const ds4_weights *w,
         ok = ok && dsv41_gpu_ced_move(ced, b_mix.t, pos0, n_tok, hc, true, true);
     }
 
-    /* only the last position's logits are ever wanted */
-    if (ok && logits) {
+    if (ok && win_gpu && win_gpu->draft.n_stage && l1 == n_trunk) {
+        ok = dsv41_gpu_draft_pending(m, w, win_gpu, pos0, n_tok, rope0) &&
+             (!commit_draft || dsv41_gpu_draft_commit(win_gpu, pos0, n_tok));
+    }
+
+    /* the last rows' logits: one for decode and prefill, a verify pass wants them all */
+    if (ok && logits && n_logit_rows) {
         dsv41_gpu_buf b_coll = {0}, b_x = {0}, b_lg = {0};
-        const uint64_t last = (uint64_t)(n_tok - 1u);
-        ds4_gpu_tensor *v_st = ds4_gpu_tensor_view(b_st.t, last * hc_dim * sizeof(float),
-                                                   (uint64_t)hc_dim * sizeof(float));
-        ds4_gpu_tensor *v_mx = ds4_gpu_tensor_view(b_mix.t, last * hc * sizeof(float),
-                                                   (uint64_t)hc * sizeof(float));
+        const uint32_t rows = n_logit_rows < n_tok ? n_logit_rows : n_tok;
+        const uint64_t first = (uint64_t)(n_tok - rows);
+        ds4_gpu_tensor *v_st = ds4_gpu_tensor_view(b_st.t, first * hc_dim * sizeof(float),
+                                                   (uint64_t)rows * hc_dim * sizeof(float));
+        ds4_gpu_tensor *v_mx = ds4_gpu_tensor_view(b_mix.t, first * hc * sizeof(float),
+                                                   (uint64_t)rows * hc * sizeof(float));
         ok = v_st && v_mx &&
-             dsv41_gpu_buf_alloc(&b_coll, dim) && dsv41_gpu_buf_alloc(&b_x, dim) &&
-             dsv41_gpu_buf_alloc(&b_lg, DS4_N_VOCAB);
-        ok = ok && ds4_gpu_dsv41_hc_pre(1, dim, hc, v_st, v_mx, b_coll.t);
+             dsv41_gpu_buf_alloc(&b_coll, (uint64_t)rows * dim) &&
+             dsv41_gpu_buf_alloc(&b_x, (uint64_t)rows * dim) &&
+             dsv41_gpu_buf_alloc(&b_lg, (uint64_t)rows * DS4_N_VOCAB);
+        ok = ok && ds4_gpu_dsv41_hc_pre(rows, dim, hc, v_st, v_mx, b_coll.t);
         ds4_gpu_tensor_free(v_st); ds4_gpu_tensor_free(v_mx);
-        ok = ok && ds4_gpu_rms_norm_weight_tensor(b_x.t, b_coll.t, m->map, m->size,
-                                                  w->output_norm->abs_offset, dim, DS4_RMS_EPS);
+        ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(b_x.t, b_coll.t, m->map, m->size,
+                                                       w->output_norm->abs_offset, dim, rows,
+                                                       DS4_RMS_EPS);
         ok = ok && dsv41_gpu_matvec(m, w->output, w->output->abs_offset, dim, DS4_N_VOCAB,
-                                    1, b_x.t, b_lg.t);
-        ok = ok && dsv41_gpu_buf_get(&b_lg, logits, DS4_N_VOCAB);
+                                    rows, b_x.t, b_lg.t);
+        ok = ok && dsv41_gpu_buf_get(&b_lg, logits, (uint64_t)rows * DS4_N_VOCAB);
         ds4_gpu_tensor_free(b_coll.t); ds4_gpu_tensor_free(b_x.t); ds4_gpu_tensor_free(b_lg.t);
     }
     if (batched) (void)ds4_gpu_end_commands();
@@ -67048,6 +67488,19 @@ static bool dsv41_gpu_forward_token(const ds4_model *m, const ds4_weights *w,
     free(stream);
     free(pre_mix);
     return ok;
+}
+
+static bool dsv41_gpu_forward_token(const ds4_model *m, const ds4_weights *w,
+                                    dsv41_ref_state *st, const int *tokens,
+                                    uint32_t n_tok, uint32_t pos0,
+                                    const dsv41_ref_engram *eng,
+                                    const dsv41_gpu_engram *ge,
+                                    const dsv41_gpu_rope *rope0,
+                                    const dsv41_gpu_rope *ropec,
+                                    dsv41_gpu_window *win_gpu, float *logits,
+                                    dsv41_gpu_ced *ced, int phase) {
+    return dsv41_gpu_forward_rows(m, w, st, tokens, n_tok, pos0, eng, ge, rope0, ropec, win_gpu,
+                                  logits, 1u, true, ced, phase);
 }
 
 /* Prefill a run of positions and return the last one's logits.  Past the replay bound the
@@ -67067,7 +67520,7 @@ static int dsv41_gpu_prefill(const ds4_model *m, const ds4_weights *w,
                              dsv41_ref_state *st, const int *tokens, uint32_t n,
                              uint32_t pos0, const dsv41_ref_engram *eng,
                              const dsv41_gpu_engram *ge, const dsv41_gpu_rope *rope0,
-                             const dsv41_gpu_rope *ropec, const dsv41_gpu_window *win_gpu,
+                             const dsv41_gpu_rope *ropec, dsv41_gpu_window *win_gpu,
                              uint32_t chunk, float *logits, dsv41_gpu_ced *keep,
                              dsv41_prefill_tick tick, void *ud) {
     const uint32_t replay = dsv41_ced_replay();
@@ -67145,9 +67598,48 @@ static void dsv41_session_state_free(dsv41_session_state *ss) {
     free(ss);
 }
 
+/* The engine's DSpark heads as a draft spec, once the support file has been mapped for the
+ * kernels.  NULL when the engine does not draft or the heads are not usable. */
+static const dsv41_draft_spec *dsv41_draft_spec_get(ds4_engine *e) {
+    static dsv41_draft_spec spec;
+    static int state = 0;       /* 0 unknown, 1 ready, -1 off */
+    if (state == 0) {
+        const ds4_dspark_weights *dw = &e->dspark_weights;
+        state = -1;
+        if (e->dspark && e->support_kind == DS4_SUPPORT_DSPARK && dw->n_stages == DS4_N_NEXTN_PREDICT &&
+            dw->missing_tensors == 0 && dw->invalid_tensors == 0 && dw->metadata_errors == 0 &&
+            dw->block_size != 0 && dw->target_layer_count != 0) {
+            uint64_t largest = 0;
+            for (uint64_t i = 0; i < e->mtp_model.n_tensors; i++) {
+                if (e->mtp_model.tensors[i].bytes > largest) largest = e->mtp_model.tensors[i].bytes;
+            }
+            if (ds4_gpu_add_model_map(e->mtp_model.map, e->mtp_model.size, largest)) {
+                memset(&spec, 0, sizeof(spec));
+                spec.n_stage = dw->n_stages;
+                spec.block = dw->block_size;
+                spec.n_target = dw->target_layer_count;
+                spec.rank = dw->markov_rank;
+                memcpy(spec.targets, dw->target_layers, sizeof(spec.targets));
+                spec.noise_token = (int)dw->noise_token_id;
+                spec.w = dw;
+                spec.m = &e->mtp_model;
+                state = 1;
+                fprintf(stderr, "ds4: DSpark drafting: %u stages, block %u, target layers",
+                        spec.n_stage, spec.block);
+                for (uint32_t i = 0; i < spec.n_target; i++) fprintf(stderr, " %u", spec.targets[i]);
+                fprintf(stderr, "\n");
+            }
+        } else if (e->dspark) {
+            fprintf(stderr, "ds4: --dspark: the support file is not a usable DeepSeek V4.1 DSpark head set\n");
+        }
+    }
+    return state == 1 ? &spec : NULL;
+}
+
 static dsv41_session_state *dsv41_session_state_alloc(ds4_engine *e, uint32_t ctx) {
     dsv41_session_state *ss = xcalloc(1, sizeof(*ss));
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const dsv41_draft_spec *dsp = dsv41_draft_spec_get(e);
     ss->cap = ctx + 1u;
     ss->chunk = e->prefill_chunk ? e->prefill_chunk : 64u;
     if (ss->chunk > ctx) ss->chunk = ctx;
@@ -67172,8 +67664,9 @@ static dsv41_session_state *dsv41_session_state_alloc(ds4_engine *e, uint32_t ct
     if (!dsv41_gpu_engram_open(&ss->ge, ss->has_engram ? &ss->ctx : NULL) ||
         !dsv41_gpu_rope_open(&ss->rope0, &ss->st.f0) ||
         !dsv41_gpu_rope_open(&ss->ropec, &ss->st.fc) ||
-        !dsv41_gpu_window_open(&ss->win, n_trunk, ss->cap, ss->chunk) ||
-        !(ss->win.consts = dsv41_gpu_consts_open(&e->model, &e->weights, n_trunk))) {
+        !dsv41_gpu_window_open(&ss->win, n_trunk, ss->cap, ss->chunk, dsp) ||
+        !(ss->win.consts = dsv41_gpu_consts_open(&e->model, &e->weights,
+                                                 ss->win.n_consts = dsp ? DS4_N_LAYER : n_trunk))) {
         dsv41_session_state_free(ss);
         return NULL;
     }
@@ -67213,6 +67706,18 @@ static bool dsv41_session_step(dsv41_session_state *ss, const ds4_model *m,
                                    ss->has_engram ? &ss->ctx : NULL, &ss->ge,
                                    &ss->rope0, &ss->ropec, &ss->win, logits, NULL,
                                    DSV41_PHASE_ALL);
+}
+
+/* a verify pass: every row's logits, nothing committed to the draft rings yet */
+static bool dsv41_session_step_rows(dsv41_session_state *ss, const ds4_model *m,
+                                    const ds4_weights *w, const int *tokens, uint32_t n,
+                                    uint32_t pos0, float *logits_rows) {
+    if (pos0 + n > ss->cap) return false;
+    dsv41_session_note(ss, tokens, n, pos0);
+    return dsv41_gpu_forward_rows(m, w, &ss->st, tokens, n, pos0,
+                                  ss->has_engram ? &ss->ctx : NULL, &ss->ge,
+                                  &ss->rope0, &ss->ropec, &ss->win, logits_rows, n, false, NULL,
+                                  DSV41_PHASE_ALL);
 }
 
 /* A whole prompt, chunked and split by dsv41_gpu_prefill; the tick keeps the session's
@@ -67258,6 +67763,119 @@ static bool dsv41_session_prefill(dsv41_session_state *ss, ds4_session *s,
                                 &ss->ced, dsv41_sync_tick, &ud);
     *dirty = ud.dirty;
     return *status == DSV41_PREFILL_OK;
+}
+
+/* One DSpark cycle, greedy.  `first_token` is the token the target chose at the last
+ * position; the block drafts what follows it, the trunk runs first_token and the confident
+ * drafts in one pass, and the longest prefix the target agrees with is kept -- the target's
+ * own next token after that prefix is left in s->logits, exactly as a one-token step would.
+ * Rejected positions are rolled back: the compressed caches to the accepted frontier, the
+ * draft rings by committing only the accepted rows. */
+static int dsv41_session_spec_argmax(ds4_session *s, int first_token, int max_tokens,
+                                     int eos_token, bool ignore_eos, ds4_think_mode think_mode,
+                                     int *accepted, int accepted_cap, char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    dsv41_session_state *ss = s->dsv41;
+    dsv41_gpu_window *g = &ss->win;
+    const uint32_t B = g->draft.block, vocab = DS4_N_VOCAB;
+    const uint32_t P1 = (uint32_t)s->checkpoint.len;    /* first_token's position */
+    const bool stats = ds4_dspark_stats_enabled();
+    const double t0 = stats ? now_sec() : 0.0;
+    int drafts[DS4_DSPARK_MAX_BLOCK_SIZE];
+    float conf[DS4_DSPARK_MAX_BLOCK_SIZE];
+    uint32_t k = 0;
+    bool proposed = false;
+
+    /* the block continues the position whose stream the last pass captured */
+    if (P1 >= 1u && g->mh_rows && P1 - 1u >= g->mh_pos0 && P1 - 1u < g->mh_pos0 + g->mh_rows &&
+        P1 + B < ss->cap && max_tokens > 1 && accepted_cap > 1) {
+        const double tp = stats ? now_sec() : 0.0;
+        if (!dsv41_gpu_draft_propose(&e->model, &e->weights, &ss->st, g, &ss->rope0, &ss->ge,
+                                     first_token, P1 - 1u, drafts, conf, NULL)) {
+            if (errlen) snprintf(err, errlen, "DeepSeek V4.1 draft failed");
+            return -1;
+        }
+        if (stats) s->dspark_stats.propose_ms += (now_sec() - tp) * 1000.0;
+        proposed = true;
+        k = dspark_confident_prefix_len(conf, B, e->dspark_confidence_threshold);
+        if (k > (uint32_t)max_tokens - 1u) k = (uint32_t)max_tokens - 1u;
+        if (k > (uint32_t)accepted_cap - 1u) k = (uint32_t)accepted_cap - 1u;
+        if (k > ss->cap - P1 - 1u) k = ss->cap - P1 - 1u;
+        for (uint32_t i = 0; i < k; i++) {
+            if (drafts[i] < 0 || drafts[i] >= (int)vocab) { k = i; break; }
+            if (!ignore_eos && drafts[i] == eos_token) { k = i + 1u; break; }
+            if (ignore_eos && ds4_token_is_stop_for_think_mode(e, drafts[i], think_mode)) { k = i; break; }
+        }
+    }
+    if (stats) {
+        s->dspark_stats.cycles++;
+        if (k) {
+            s->dspark_stats.proposed_tokens += k;
+            ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist, k);
+        } else {
+            s->dspark_stats.no_draft++;
+        }
+    }
+    if (getenv("DS4_DSPARK_SPEC_LOG")) {
+        fprintf(stderr, "ds4: DSpark V4.1 pos=%u mh=[%u+%u) t0=%d k=%u", P1, g->mh_pos0, g->mh_rows,
+                first_token, k);
+        if (proposed) {
+            for (uint32_t i = 0; i < B; i++) fprintf(stderr, " %d:%.2f", drafts[i], (double)conf[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+    if (k == 0) {
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        if (stats) {
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+            s->dspark_stats.total_ms += (now_sec() - t0) * 1000.0;
+        }
+        return 1;
+    }
+
+    int toks[DS4_DSPARK_MAX_BLOCK_SIZE + 1];
+    toks[0] = first_token;
+    memcpy(toks + 1, drafts, k * sizeof(int));
+    float *rows = xmalloc((size_t)(k + 1u) * vocab * sizeof(float));
+    const double tv = stats ? now_sec() : 0.0;
+    bool ok = dsv41_session_step_rows(ss, &e->model, &e->weights, toks, k + 1u, P1, rows);
+    if (stats) s->dspark_stats.verify_ms += (now_sec() - tv) * 1000.0;
+    if (!ok) {
+        free(rows);
+        s->checkpoint_valid = false;
+        if (errlen) snprintf(err, errlen, "DeepSeek V4.1 verify failed");
+        return -1;
+    }
+    uint32_t j = 0;
+    while (j < k && sample_argmax(rows + (size_t)j * vocab, vocab) == drafts[j]) j++;
+    memcpy(s->logits, rows + (size_t)j * vocab, (size_t)vocab * sizeof(float));
+    free(rows);
+    for (uint32_t i = 0; i <= j; i++) {
+        token_vec_push(&s->checkpoint, toks[i]);
+        accepted[i] = toks[i];
+    }
+    s->mtp_draft_valid = false;
+
+    const bool batched = ds4_gpu_begin_commands() != 0;
+    ok = (j == k || dsv41_gpu_window_rollback(g, &ss->st, P1 + j)) && dsv41_gpu_draft_commit(g, P1, j + 1u);
+    if (batched) (void)ds4_gpu_end_commands();
+    s->checkpoint_valid = ok;
+    if (!ok) {
+        if (errlen) snprintf(err, errlen, "DeepSeek V4.1 draft rollback failed");
+        return -1;
+    }
+    if (stats) {
+        s->dspark_stats.accepted_draft_tokens += j;
+        s->dspark_stats.first_tokens++;
+        if (j == k) s->dspark_stats.full_accepts++;
+        ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, j);
+        s->dspark_stats.total_ms += (now_sec() - t0) * 1000.0;
+    }
+    if (getenv("DS4_DSPARK_SPEC_LOG")) {
+        fprintf(stderr, "ds4: DSpark V4.1 cycle pos=%u drafted=%u accepted=%u\n", P1, k, j);
+    }
+    return (int)(1u + j);
 }
 
 #endif /* !DS4_NO_GPU */
@@ -70291,8 +70909,8 @@ int ds4_test_dsv41_gpu_generate(const char *path, const char *engram_path,
     if (chunk == 0u) chunk = 1u;
     if (!dsv41_gpu_engram_open(&ge, ec) ||
         !dsv41_gpu_rope_open(&rope0, &st.f0) || !dsv41_gpu_rope_open(&ropec, &st.fc) ||
-        !dsv41_gpu_window_open(&win, n_trunk, total + 1u, chunk) ||
-        !(win.consts = dsv41_gpu_consts_open(&m, &w, n_trunk))) {
+        !dsv41_gpu_window_open(&win, n_trunk, total + 1u, chunk, NULL) ||
+        !(win.consts = dsv41_gpu_consts_open(&m, &w, win.n_consts = n_trunk))) {
         made = -1;
         goto done;
     }
@@ -70346,6 +70964,157 @@ done:
     return made;
 }
 
+/* Rollback check for the speculative path: prefill `split` tokens, then run a verify-style
+ * pass of `k` rows -- the true next token followed by k-1 wrong ones -- roll it back to the
+ * one accepted row, continue token by token and return the last logits; `clean` gets the
+ * same run without the detour.  The two must agree bit for bit. */
+int ds4_test_dsv41_gpu_rollback(const char *path, const int *tokens, unsigned n,
+                                unsigned split, unsigned k, float *logits, float *clean) {
+    ds4_model m;
+    ds4_weights w;
+    model_open(&m, path, true, false);
+    config_validate_model(&m);
+    weights_bind(&w, &m, false, 0, UINT32_MAX, true, false);
+    if (!ds4_gpu_init() || !ds4_gpu_set_model_map(m.map, m.size)) { model_close(&m); return -1; }
+    if (split == 0 || split >= n || k == 0 || k > DS4_DSPARK_MAX_BLOCK_SIZE || split + k > n) {
+        model_close(&m); return -1;
+    }
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    int rc = 0;
+    for (int pass = 0; pass < 2 && rc == 0; pass++) {
+        dsv41_ref_state st;
+        dsv41_ref_state_init(&st, n_trunk, n + 1u);
+        dsv41_gpu_engram ge;
+        dsv41_gpu_rope rope0 = {0}, ropec = {0};
+        dsv41_gpu_window win = {0};
+        float *out = pass ? clean : logits;
+        bool ok = dsv41_gpu_engram_open(&ge, NULL) &&
+                  dsv41_gpu_rope_open(&rope0, &st.f0) && dsv41_gpu_rope_open(&ropec, &st.fc) &&
+                  dsv41_gpu_window_open(&win, n_trunk, n + 1u, 16u, NULL) &&
+                  (win.consts = dsv41_gpu_consts_open(&m, &w, win.n_consts = n_trunk)) != NULL;
+        ok = ok && dsv41_gpu_prefill(&m, &w, &st, tokens, split, 0, NULL, &ge, &rope0, &ropec,
+                                     &win, 16u, out, NULL, NULL, NULL) == DSV41_PREFILL_OK;
+        unsigned i = split;
+        if (ok && pass == 0) {
+            int wrong[DS4_DSPARK_MAX_BLOCK_SIZE];
+            wrong[0] = tokens[split];
+            /* DS4_TEST_ROLLBACK_TRUE: the tail rows carry the true tokens, so any residual is
+             * the multi-row pass itself rather than the rollback */
+            for (unsigned j = 1; j < k; j++) {
+                wrong[j] = getenv("DS4_TEST_ROLLBACK_TRUE") ? tokens[split + j]
+                         : (tokens[split + j] + 7 * (int)j) % (int)DS4_N_VOCAB;
+            }
+            float *rows = xmalloc((size_t)k * DS4_N_VOCAB * sizeof(float));
+            ok = dsv41_gpu_forward_rows(&m, &w, &st, wrong, k, split, NULL, &ge, &rope0, &ropec,
+                                        &win, rows, k, false, NULL, DSV41_PHASE_ALL);
+            const bool b2 = ds4_gpu_begin_commands() != 0;
+            ok = ok && dsv41_gpu_window_rollback(&win, &st, split);
+            if (b2) (void)ds4_gpu_end_commands();
+            /* the accepted row's logits are what the target would have said next */
+            if (ok) memcpy(out, rows, (size_t)DS4_N_VOCAB * sizeof(float));
+            free(rows);
+            i = split + 1u;
+        }
+        for (; i < n && ok; i++) {
+            ok = dsv41_gpu_forward_token(&m, &w, &st, tokens + i, 1u, i, NULL, &ge, &rope0, &ropec,
+                                         &win, out, NULL, DSV41_PHASE_ALL);
+        }
+        if (!ok) rc = -1;
+        dsv41_gpu_window_close(&win);
+        dsv41_gpu_rope_close(&rope0); dsv41_gpu_rope_close(&ropec);
+        dsv41_gpu_engram_close(&ge);
+        dsv41_ref_state_free(&st);
+    }
+    model_close(&m);
+    return rc;
+}
+
+/* DSpark on the GPU against the CPU reference: prefill `n` tokens with drafting on, then
+ * propose from the last position.  Out: the block's tokens, confidences and head logits
+ * from both sides, and per stage the relative error of the ring row the GPU keeps for the
+ * last position against the reference's main_kv.  Returns the block size, or 0. */
+unsigned ds4_test_dsv41_gpu_draft(const char *path, const char *engram_path, const char *dspark_path,
+                                  const int *tokens, unsigned n,
+                                  int *tok_gpu, float *conf_gpu, float *lg_gpu,
+                                  int *tok_cpu, float *conf_cpu, float *lg_cpu, float *kv_err) {
+    ds4_model m, dm;
+    ds4_weights w;
+    model_open(&m, path, true, false);
+    config_validate_model(&m);
+    weights_bind(&w, &m, false, 0, UINT32_MAX, true, false);
+    model_open(&dm, dspark_path, false, false);
+    ds4_dspark_summary sum = model_dspark_summary(&dm);
+    ds4_dspark_weights dw;
+    dspark_weights_bind_optional(&dw, &dm, &sum);
+    uint64_t largest = 0;
+    for (uint64_t i = 0; i < dm.n_tensors; i++) if (dm.tensors[i].bytes > largest) largest = dm.tensors[i].bytes;
+    if (dw.n_stages != DS4_N_NEXTN_PREDICT || dw.missing_tensors || dw.invalid_tensors ||
+        dw.metadata_errors || !ds4_gpu_init() || !ds4_gpu_set_model_map(m.map, m.size) ||
+        !ds4_gpu_add_model_map(dm.map, dm.size, largest)) {
+        model_close(&dm); model_close(&m);
+        return 0;
+    }
+    dsv41_draft_spec spec = {0};
+    spec.n_stage = dw.n_stages; spec.block = dw.block_size; spec.n_target = dw.target_layer_count;
+    spec.rank = dw.markov_rank; spec.noise_token = (int)dw.noise_token_id; spec.w = &dw; spec.m = &dm;
+    memcpy(spec.targets, dw.target_layers, sizeof(spec.targets));
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT, B = spec.block;
+    const uint32_t dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM, win = DS4_N_SWA, vocab = DS4_N_VOCAB;
+    const uint32_t cap = n + B + 1u;
+    dsv41_ref_state st;
+    dsv41_ref_state_init(&st, n_trunk, cap);
+    dsv41_ref_engram_run eng;
+    dsv41_ref_engram_open(&eng, engram_path, tokens, n);
+    const dsv41_ref_engram *ec = eng.open ? &eng.ctx : NULL;
+    dsv41_gpu_engram ge;
+    dsv41_gpu_rope rope0 = {0}, ropec = {0};
+    dsv41_gpu_window win_gpu = {0};
+    float *lg = xmalloc((size_t)vocab * sizeof(float));
+    float *mh = xmalloc((size_t)spec.n_target * dim * sizeof(float));
+    float *rings = xmalloc((size_t)spec.n_stage * win * hd * sizeof(float));
+    float *kv = xmalloc((size_t)hd * sizeof(float));
+    const float *ring_ptrs[DS4_DSPARK_MAX_STAGES];
+    unsigned made = 0;
+    bool ok = dsv41_gpu_engram_open(&ge, ec) &&
+              dsv41_gpu_rope_open(&rope0, &st.f0) && dsv41_gpu_rope_open(&ropec, &st.fc) &&
+              dsv41_gpu_window_open(&win_gpu, n_trunk, cap, 16u, &spec) &&
+              (win_gpu.consts = dsv41_gpu_consts_open(&m, &w, win_gpu.n_consts = DS4_N_LAYER)) != NULL;
+    ok = ok && dsv41_gpu_prefill(&m, &w, &st, tokens, n, 0, ec, &ge, &rope0, &ropec, &win_gpu, 16u,
+                                 lg, NULL, NULL, NULL) == DSV41_PREFILL_OK;
+    int t0 = 0;
+    if (ok) {
+        for (uint32_t v = 1; v < vocab; v++) if (lg[v] > lg[t0]) t0 = (int)v;
+        ok = dsv41_gpu_draft_propose(&m, &w, &st, &win_gpu, &rope0, &ge, t0, n - 1u, tok_gpu, conf_gpu, lg_gpu);
+    }
+    /* what the GPU captured and committed for the last position */
+    ok = ok && ds4_gpu_tensor_read(win_gpu.mh, (uint64_t)(n - 1u - win_gpu.mh_pos0) * spec.n_target * dim * sizeof(float),
+                                   mh, (uint64_t)spec.n_target * dim * sizeof(float)) != 0 &&
+         ds4_gpu_tensor_read(win_gpu.dring, 0, rings, (uint64_t)spec.n_stage * win * hd * sizeof(float)) != 0;
+    if (ok) {
+        for (uint32_t s = 0; s < spec.n_stage; s++) {
+            ring_ptrs[s] = rings + (size_t)s * win * hd;
+            dsv41_ref_main_kv(&m, &w, &dm, &dw, s, mh, n - 1u, &st.f0, kv);
+            const float *got = ring_ptrs[s] + (size_t)((n - 1u) % win) * hd;
+            double worst = 0.0, scale = 0.0;
+            for (uint32_t i = 0; i < hd; i++) {
+                worst = fmax(worst, fabs((double)got[i] - kv[i]));
+                scale = fmax(scale, fabs((double)kv[i]));
+            }
+            kv_err[s] = (float)(worst / (scale > 0.0 ? scale : 1.0));
+        }
+        dsv41_ref_draft(&m, &w, &dm, &dw, ring_ptrs, t0, n - 1u, B, &st.f0, tok_cpu, conf_cpu, lg_cpu);
+        made = B;
+    }
+    dsv41_gpu_window_close(&win_gpu);
+    dsv41_gpu_rope_close(&rope0); dsv41_gpu_rope_close(&ropec);
+    dsv41_gpu_engram_close(&ge);
+    dsv41_ref_engram_close(&eng);
+    dsv41_ref_state_free(&st);
+    free(lg); free(mh); free(rings); free(kv);
+    model_close(&dm); model_close(&m);
+    return made;
+}
+
 /* The picks an index-source layer made for every position of a chunked GPU prefill, as
  * compressed positions (-1 for none), so they can be held against the CPU reference's per
  * position selection.  A chunk's candidate blocks are decided per query, which is what
@@ -70371,8 +71140,8 @@ int ds4_test_dsv41_gpu_picks(const char *path, const int *tokens, unsigned n_tok
     dsv41_gpu_window win = {0};
     int ok = chunk > 0 && layer < n_trunk && DS4_N_ENGRAM_LAYER == 0 &&
              dsv41_gpu_rope_open(&rope0, &st.f0) && dsv41_gpu_rope_open(&ropec, &st.fc) &&
-             dsv41_gpu_window_open(&win, n_trunk, n_tokens + 1u, chunk) &&
-             (win.consts = dsv41_gpu_consts_open(&m, &w, n_trunk)) != NULL;
+             dsv41_gpu_window_open(&win, n_trunk, n_tokens + 1u, chunk, NULL) &&
+             (win.consts = dsv41_gpu_consts_open(&m, &w, win.n_consts = n_trunk)) != NULL;
     for (unsigned i = 0; i < n_tokens && ok; i += chunk) {
         const unsigned n = n_tokens - i < chunk ? n_tokens - i : chunk;
         ok = dsv41_gpu_forward_token(&m, &w, &st, tokens + i, n, i, NULL, &ge,
@@ -82379,6 +83148,18 @@ static int ds4_session_eval_speculative_argmax_impl(
         accepted[0] = first_token;
         return 1;
     }
+    if (ds4_session_is_dsv41(s)) {
+        if (!accepted || accepted_cap <= 0) return 0;
+#ifndef DS4_NO_GPU
+        if (s->dsv41 && s->dsv41->win.draft.n_stage) {
+            return dsv41_session_spec_argmax(s, first_token, max_tokens, eos_token, ignore_eos,
+                                             think_mode, accepted, accepted_cap, err, errlen);
+        }
+#endif
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
     if (ds4_session_is_glm(s)) {
         (void)max_tokens;
         (void)eos_token;
@@ -83302,6 +84083,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
     }
     const bool opportunistic_dspark =
         e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+        !ds4_session_is_dsv41(s) &&
         !e->quality && !e->dspark_strict && !e->dspark_exact_sampling;
     if (opportunistic_dspark) {
         /* first_token was sampled with the requested temperature. Commit the
@@ -83313,6 +84095,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
     }
     const bool stochastic_dspark =
         e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+        !ds4_session_is_dsv41(s) &&
         !e->quality && !e->dspark_strict && e->dspark_exact_sampling;
     bool can_prepare = stochastic_dspark && !s->dspark_sched_bypass &&
         first_token != eos_token &&
