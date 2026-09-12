@@ -64516,6 +64516,1213 @@ static void qwen4_ref_mtp(const ds4_model *m, const ds4_weights *w, qwen4_ref_st
     free(ep); free(R); free(cat); free(hn); free(en); free(e);
 }
 
+
+/* ---- DeepSeek V4.1 Flash CPU reference -------------------------------------
+ * Independent float implementations of the mechanisms V4.1 adds over V4, used
+ * to score kernels and the converter.  Plain arrays rather than model tensors,
+ * so each piece can be checked against the released reference implementation.
+ */
+
+/* mHC: one projection of the residual stream splits into the pre/post scalars
+ * and a comb matrix that Sinkhorn makes doubly stochastic. */
+static void dsv41_ref_hc_split_sinkhorn(
+        const float *mixes, const float *hc_scale, const float *hc_base,
+        uint32_t hc, uint32_t iters, float eps,
+        float *pre, float *post, float *comb) {
+    for (uint32_t j = 0; j < hc; j++) {
+        pre[j]  = sigmoid_stable(mixes[j] * hc_scale[0] + hc_base[j]) + eps;
+        post[j] = 2.0f * sigmoid_stable(mixes[hc + j] * hc_scale[1] + hc_base[hc + j]);
+    }
+    for (uint32_t j = 0; j < hc * hc; j++) {
+        comb[j] = mixes[2u * hc + j] * hc_scale[2] + hc_base[2u * hc + j];
+    }
+    /* row softmax, then alternating column/row normalisation */
+    for (uint32_t j = 0; j < hc; j++) {
+        float *row = comb + (size_t)j * hc;
+        float mx = row[0];
+        for (uint32_t k = 1; k < hc; k++) if (row[k] > mx) mx = row[k];
+        double sum = 0.0;
+        for (uint32_t k = 0; k < hc; k++) { row[k] = expf(row[k] - mx); sum += row[k]; }
+        for (uint32_t k = 0; k < hc; k++) row[k] = (float)(row[k] / sum) + eps;
+    }
+    for (uint32_t k = 0; k < hc; k++) {
+        double col = 0.0;
+        for (uint32_t j = 0; j < hc; j++) col += comb[(size_t)j * hc + k];
+        const float inv = (float)(col + eps);
+        for (uint32_t j = 0; j < hc; j++) comb[(size_t)j * hc + k] /= inv;
+    }
+    for (uint32_t it = 1; it < iters; it++) {
+        for (uint32_t j = 0; j < hc; j++) {
+            double row = 0.0;
+            for (uint32_t k = 0; k < hc; k++) row += comb[(size_t)j * hc + k];
+            const float inv = (float)(row + eps);
+            for (uint32_t k = 0; k < hc; k++) comb[(size_t)j * hc + k] /= inv;
+        }
+        for (uint32_t k = 0; k < hc; k++) {
+            double col = 0.0;
+            for (uint32_t j = 0; j < hc; j++) col += comb[(size_t)j * hc + k];
+            const float inv = (float)(col + eps);
+            for (uint32_t j = 0; j < hc; j++) comb[(size_t)j * hc + k] /= inv;
+        }
+    }
+}
+
+/* Routing: score = sqrt(softplus(logit)).  The correction bias steers which
+ * experts win but never scales them, so the weights come from the raw scores. */
+static void dsv41_ref_route(
+        const float *logits, const float *bias, uint32_t n_expert, uint32_t topk,
+        float route_scale, bool norm_topk, int32_t *idx_out, float *w_out) {
+    float *scores = xmalloc(n_expert * sizeof(float));
+    for (uint32_t i = 0; i < n_expert; i++) scores[i] = sqrtf(softplus_stable(logits[i]));
+    for (uint32_t s = 0; s < topk; s++) {
+        int best = -1;
+        float best_v = DS4_NEG_INF;
+        for (uint32_t i = 0; i < n_expert; i++) {
+            bool taken = false;
+            for (uint32_t p = 0; p < s; p++) if (idx_out[p] == (int32_t)i) { taken = true; break; }
+            if (taken) continue;
+            const float v = scores[i] + (bias ? bias[i] : 0.0f);
+            if (v > best_v) { best_v = v; best = (int)i; }
+        }
+        idx_out[s] = (int32_t)best;
+        w_out[s] = scores[best];
+    }
+    if (norm_topk && topk > 1) {
+        double sum = 0.0;
+        for (uint32_t s = 0; s < topk; s++) sum += w_out[s];
+        for (uint32_t s = 0; s < topk; s++) w_out[s] = (float)(w_out[s] / (sum + 1e-20));
+    }
+    for (uint32_t s = 0; s < topk; s++) w_out[s] *= route_scale;
+    free(scores);
+}
+
+/* Attention over gathered positions.  A -1 index selects nothing; the running
+ * max starts finite so a query with no valid index comes out zero rather than
+ * NaN, and attn_sink is a per-head logit that only enters the denominator. */
+static void dsv41_ref_sparse_attn(
+        const float *q, const float *kv, const float *sink, const int32_t *idxs,
+        uint32_t s_len, uint32_t h, uint32_t d, uint32_t topk, float scale, float *out) {
+    float *sc = xmalloc(topk * sizeof(float));
+    for (uint32_t si = 0; si < s_len; si++) {
+        const int32_t *idx = idxs + (size_t)si * topk;
+        for (uint32_t hi = 0; hi < h; hi++) {
+            const float *qv = q + ((size_t)si * h + hi) * d;
+            float mx = DS4_NEG_INF;
+            for (uint32_t t = 0; t < topk; t++) {
+                if (idx[t] < 0) { sc[t] = DS4_NEG_INF; continue; }
+                const float *kvv = kv + (size_t)idx[t] * d;
+                double acc = 0.0;
+                for (uint32_t j = 0; j < d; j++) acc += (double)qv[j] * kvv[j];
+                sc[t] = (float)acc * scale;
+                if (sc[t] > mx) mx = sc[t];
+            }
+            double den = 0.0;
+            float *o = out + ((size_t)si * h + hi) * d;
+            for (uint32_t j = 0; j < d; j++) o[j] = 0.0f;
+            for (uint32_t t = 0; t < topk; t++) {
+                if (idx[t] < 0) continue;
+                const float e = expf(sc[t] - mx);
+                den += e;
+                const float *kvv = kv + (size_t)idx[t] * d;
+                for (uint32_t j = 0; j < d; j++) o[j] += e * kvv[j];
+            }
+            den += expf(sink[hi] - mx);
+            for (uint32_t j = 0; j < d; j++) o[j] = (float)(o[j] / den);
+        }
+    }
+    free(sc);
+}
+
+/* Compressor: pool `ratio` consecutive tokens into one latent, weighted by a
+ * softmax over the group taken per channel. */
+static void dsv41_ref_compress_pool(
+        const float *kv, const float *score, uint32_t groups, uint32_t ratio,
+        uint32_t d, float *out) {
+    for (uint32_t g = 0; g < groups; g++) {
+        for (uint32_t j = 0; j < d; j++) {
+            float mx = DS4_NEG_INF;
+            for (uint32_t r = 0; r < ratio; r++) {
+                const float v = score[((size_t)g * ratio + r) * d + j];
+                if (v > mx) mx = v;
+            }
+            double sum = 0.0, acc = 0.0;
+            for (uint32_t r = 0; r < ratio; r++) {
+                const float e = expf(score[((size_t)g * ratio + r) * d + j] - mx);
+                sum += e;
+                acc += (double)e * kv[((size_t)g * ratio + r) * d + j];
+            }
+            out[(size_t)g * d + j] = (float)(acc / sum);
+        }
+    }
+}
+
+/* Engram hash ids for one position: the (i+1)-gram ending here is a rolling XOR
+ * of id*multiplier over the lookbacks, folded into that bucket's prime range.
+ * Look-back stops at the start of the sequence and at any dead token. */
+/* Level one of the two-level indexer: score each block by its best position and
+ * keep the best `topk_blocks`, pinning the block holding the newest position. */
+static void dsv41_ref_candidate_blocks(
+        const float *logits, uint32_t width, uint32_t block, uint32_t topk_blocks,
+        uint32_t compress_len, int32_t *keep) {
+    const uint32_t nblk = (width + block - 1u) / block;
+    float *bs = xmalloc(nblk * sizeof(float));
+    for (uint32_t b = 0; b < nblk; b++) {
+        float mx = DS4_NEG_INF;
+        for (uint32_t j = b * block; j < (b + 1u) * block && j < width; j++) {
+            if (logits[j] > mx) mx = logits[j];
+        }
+        bs[b] = mx;
+    }
+    const uint32_t last = (compress_len - 1u) / block;
+    if (last < nblk) bs[last] = -DS4_NEG_INF;
+    for (uint32_t j = 0; j < width; j++) keep[j] = 0;
+    const uint32_t want = topk_blocks < nblk ? topk_blocks : nblk;
+    for (uint32_t s = 0; s < want; s++) {
+        int best = -1;
+        float best_v = DS4_NEG_INF;
+        for (uint32_t b = 0; b < nblk; b++) {
+            if (bs[b] > best_v) { best_v = bs[b]; best = (int)b; }
+        }
+        if (best < 0 || best_v <= DS4_NEG_INF * 0.5f) break;   /* nothing reachable left */
+        bs[best] = DS4_NEG_INF;
+        for (uint32_t j = (uint32_t)best * block; j < ((uint32_t)best + 1u) * block && j < width; j++) {
+            keep[j] = 1;
+        }
+    }
+    free(bs);
+}
+
+/* --------------------------------------------------------------------------
+ * DeepSeek V4.1 CPU reference forward.
+ *
+ * Runs the released implementation's maths in f32 against a GGUF, one token
+ * chunk at a time, so every stage can be scored against the oracle dumped by
+ * tests/deepseek_v41/make_mini_model.py.  Prefill only, batch 1.
+ * ------------------------------------------------------------------------ */
+
+typedef struct {
+    uint32_t n_pos;
+    uint32_t half;              /* rope_head_dim / 2 */
+    float *cos;                 /* [n_pos, half] */
+    float *sin;
+} dsv41_ref_freqs;
+
+/* precompute_freqs_cis: with original_seq_len > 0 this is YaRN -- dimensions whose
+ * wavelength already fits the training context keep their frequency, those far beyond
+ * it are divided by factor, and the beta_fast..beta_slow band fades across on a ramp. */
+static void dsv41_ref_freqs_init(dsv41_ref_freqs *f, uint32_t rd, uint32_t n_pos,
+                                 uint32_t orig_ctx, float base, float factor,
+                                 float beta_fast, float beta_slow) {
+    const uint32_t half = rd / 2u;
+    f->n_pos = n_pos;
+    f->half = half;
+    f->cos = xmalloc((size_t)n_pos * half * sizeof(float));
+    f->sin = xmalloc((size_t)n_pos * half * sizeof(float));
+
+    double *freq = xmalloc(half * sizeof(double));
+    for (uint32_t i = 0; i < half; i++) {
+        freq[i] = 1.0 / pow((double)base, (double)(2u * i) / (double)rd);
+    }
+    if (orig_ctx > 0) {
+        const double lb = 2.0 * log((double)base);
+        double lo = floor((double)rd * log((double)orig_ctx / ((double)beta_fast * 2.0 * M_PI)) / lb);
+        double hi = ceil((double)rd * log((double)orig_ctx / ((double)beta_slow * 2.0 * M_PI)) / lb);
+        if (lo < 0.0) lo = 0.0;
+        if (hi > (double)rd - 1.0) hi = (double)rd - 1.0;
+        double denom = hi - lo;
+        if (denom < 1e-3) denom = 1e-3;
+        for (uint32_t i = 0; i < half; i++) {
+            double ramp = ((double)i - lo) / denom;
+            if (ramp < 0.0) ramp = 0.0;
+            if (ramp > 1.0) ramp = 1.0;
+            const double smooth = 1.0 - ramp;
+            freq[i] = freq[i] / (double)factor * (1.0 - smooth) + freq[i] * smooth;
+        }
+    }
+    for (uint32_t p = 0; p < n_pos; p++) {
+        for (uint32_t i = 0; i < half; i++) {
+            const double a = (double)p * freq[i];
+            f->cos[(size_t)p * half + i] = (float)cos(a);
+            f->sin[(size_t)p * half + i] = (float)sin(a);
+        }
+    }
+    free(freq);
+}
+
+static void dsv41_ref_freqs_free(dsv41_ref_freqs *f) {
+    free(f->cos);
+    free(f->sin);
+    memset(f, 0, sizeof(*f));
+}
+
+/* apply_rotary_emb: adjacent element pairs as one complex number; `inverse` conjugates,
+ * which is how the attention output gets the query's rotation removed again. */
+static void dsv41_ref_rope(float *v, uint32_t rd, const dsv41_ref_freqs *f, uint32_t pos,
+                           bool inverse) {
+    const float *c = f->cos + (size_t)pos * f->half;
+    const float *s = f->sin + (size_t)pos * f->half;
+    for (uint32_t i = 0; i < rd / 2u; i++) {
+        const float re = v[2u * i], im = v[2u * i + 1u];
+        const float si = inverse ? -s[i] : s[i];
+        v[2u * i]      = re * c[i] - im * si;
+        v[2u * i + 1u] = re * si + im * c[i];
+    }
+}
+
+/* Expert.forward: the up branch is clamped on both sides, the gate branch only above.
+ * `expert` selects one slice of a stacked [in, out, n_expert] routed tensor; rows index
+ * straight through the stack, so no offset arithmetic is needed. */
+static void dsv41_ref_expert(const ds4_model *m, const ds4_tensor *w1, const ds4_tensor *w3,
+                             const ds4_tensor *w2, uint64_t expert, const float *x,
+                             uint32_t dim, uint32_t ff, float clamp, float weight, float *acc) {
+    float *gate = xmalloc(ff * sizeof(float));
+    float *up = xmalloc(ff * sizeof(float));
+    float *act = xmalloc(ff * sizeof(float));
+    float *out = xmalloc(dim * sizeof(float));
+    qwen4_ref_matvec_rows(m, w1, expert * w1->dim[1], w1->dim[1], x, gate);
+    qwen4_ref_matvec_rows(m, w3, expert * w3->dim[1], w3->dim[1], x, up);
+    for (uint32_t i = 0; i < ff; i++) {
+        float g = gate[i], u = up[i];
+        if (clamp > 0.0f) {
+            if (u > clamp) u = clamp;
+            if (u < -clamp) u = -clamp;
+            if (g > clamp) g = clamp;
+        }
+        act[i] = (g / (1.0f + expf(-g))) * u * weight;
+    }
+    qwen4_ref_matvec_rows(m, w2, expert * w2->dim[1], w2->dim[1], act, out);
+    for (uint32_t i = 0; i < dim; i++) acc[i] += out[i];
+    free(gate); free(up); free(act); free(out);
+}
+
+/* Gate.forward: sqrtsoftplus scores, the bias steers selection only, and the weights come
+ * from the unbiased scores, renormalised to routed_scaling_factor. */
+static void dsv41_ref_moe(const ds4_model *m, const ds4_layer_weights *l, const float *x,
+                          uint32_t dim, uint32_t ff, uint32_t n_exp, uint32_t topk,
+                          float clamp, float route_scale, float *out) {
+    float *logits = xmalloc(n_exp * sizeof(float));
+    int32_t *idx = xmalloc(topk * sizeof(int32_t));
+    float *w = xmalloc(topk * sizeof(float));
+    const float *bias = l->ffn_exp_probs_b ? qwen4_ref_f32(m, l->ffn_exp_probs_b) : NULL;
+
+    qwen4_ref_matvec(m, l->ffn_gate_inp, x, logits);
+    dsv41_ref_route(logits, bias, n_exp, topk, route_scale, 1, idx, w);
+
+    for (uint32_t i = 0; i < dim; i++) out[i] = 0.0f;
+    for (uint32_t k = 0; k < topk; k++) {
+        dsv41_ref_expert(m, l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps,
+                         (uint64_t)idx[k], x, dim, ff, clamp, w[k], out);
+    }
+    dsv41_ref_expert(m, l->ffn_gate_shexp, l->ffn_up_shexp, l->ffn_down_shexp,
+                     0, x, dim, ff, clamp, 1.0f, out);
+    free(logits); free(idx); free(w);
+}
+
+/* How many index-score scans took the candidate-restricted path and how many positions
+ * that saved, so a test can prove the fast path is the one that ran. */
+static uint64_t g_dsv41_scan_restricted;
+static uint64_t g_dsv41_scan_full;
+static uint64_t g_dsv41_scan_positions;
+static uint64_t g_dsv41_scan_positions_full;
+
+/* Everything decode carries between steps: the sliding-window ring, the shared compressed
+ * KV and index keys, and each compressor's partial group.  Prefill fills it so a decode
+ * step can continue from the same caches. */
+typedef struct {
+    uint32_t n_layer, win, hd, idim, max_pos;
+    dsv41_ref_freqs f0, fc;     /* window-only layers vs compressed layers */
+    float *window_kv;           /* [n_layer][win][hd] ring, slot = pos % win */
+    float *compress_kv;         /* [n_layer][max_pos][hd], written by kv-source layers */
+    float *index_k;             /* [n_layer][max_pos][idim] */
+    float *kv_state;            /* [n_layer][win][hd] partial compressor group */
+    float *score_state;
+    uint32_t *n_comp;           /* published compressed positions, per source layer */
+    int32_t *topk_idxs;         /* [n_layer][index_topk], the decode query's picks */
+    uint32_t *topk;
+    int32_t *candidates;        /* [n_layer][max_pos] from the candidate source */
+} dsv41_ref_state;
+
+/* What a compressed run of layers shares: the source layer publishes, the layers after it
+ * read.  Mirrors SharedAttentionRuntime -- one slot each, every source writes before its
+ * consumers read, so nothing needs resetting between layers. */
+typedef struct {
+    float *compress_kv;         /* [n_comp, head_dim], post-RoPE */
+    float *latent_pre;          /* [n_comp, head_dim], the compressor output before RoPE */
+    float *index_k;             /* [n_comp, index_head_dim], post-RoPE */
+    uint32_t n_comp;
+    int32_t *topk_idxs;         /* [s_len, index_topk], already offset into the joined KV */
+    uint32_t topk;
+    int32_t *candidates;        /* [s_len, n_comp] keep mask from the candidate source */
+    float *scores;              /* [s_len, n_comp] index scores, for diagnostics */
+    bool have_candidates;
+} dsv41_ref_shared;
+
+/* Compressor.forward, prefill: ratio 1 is a plain projection, above that the group is
+ * pooled with a per-channel softmax gate.  Returns the latent BEFORE RoPE, because the
+ * indexer needs the unrotated form.  Any trailing partial group is dropped here; it only
+ * matters for decode. */
+static uint32_t dsv41_ref_compressor(const ds4_model *m, const ds4_layer_weights *l,
+                                     const float *x, uint32_t s_len, uint32_t ratio,
+                                     float *latent, float *tail_kv, float *tail_score) {
+    const uint32_t dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM;
+    const uint32_t n_groups = s_len / ratio;
+    float *kv = xmalloc((size_t)s_len * hd * sizeof(float));
+    for (uint32_t t = 0; t < s_len; t++) {
+        qwen4_ref_matvec(m, l->attn_compressor_kv, x + (size_t)t * dim, kv + (size_t)t * hd);
+    }
+    if (ratio == 1) {
+        for (uint32_t g = 0; g < n_groups; g++) {
+            qwen4_ref_rms(latent + (size_t)g * hd, kv + (size_t)g * hd,
+                          qwen4_ref_f32(m, l->attn_compressor_norm), hd, DS4_RMS_EPS);
+        }
+        free(kv);
+        return n_groups;
+    }
+    float *score = xmalloc((size_t)s_len * hd * sizeof(float));
+    for (uint32_t t = 0; t < s_len; t++) {
+        qwen4_ref_matvec(m, l->attn_compressor_gate, x + (size_t)t * dim, score + (size_t)t * hd);
+    }
+    float *pooled = xmalloc(hd * sizeof(float));
+    for (uint32_t g = 0; g < n_groups; g++) {
+        dsv41_ref_compress_pool(kv + (size_t)g * ratio * hd, score + (size_t)g * ratio * hd,
+                                1, ratio, hd, pooled);
+        qwen4_ref_rms(latent + (size_t)g * hd, pooled,
+                      qwen4_ref_f32(m, l->attn_compressor_norm), hd, DS4_RMS_EPS);
+    }
+    /* the trailing partial group waits in the state for decode to finish it */
+    if (tail_kv) {
+        const uint32_t cutoff = n_groups * ratio;
+        for (uint32_t t = cutoff; t < s_len; t++) {
+            memcpy(tail_kv + (size_t)(t - cutoff) * hd, kv + (size_t)t * hd, hd * sizeof(float));
+            memcpy(tail_score + (size_t)(t - cutoff) * hd, score + (size_t)t * hd,
+                   hd * sizeof(float));
+        }
+    }
+    free(kv); free(score); free(pooled);
+    return n_groups;
+}
+
+/* Indexer.forward, prefill.  A small side attention: query heads against one shared key per
+ * compressed position, rectified, then combined by weights_proj.  With a candidate source
+ * this is level two; the source publishes the block mask in level one. */
+static void dsv41_ref_indexer(const ds4_model *m, const ds4_layer_weights *l,
+                              dsv41_ref_shared *sh, const float *x, const float *qr,
+                              uint32_t s_len, uint32_t ratio, uint32_t offset,
+                              const dsv41_ref_freqs *f, bool is_candidate_source,
+                              bool uses_candidates) {
+    const uint32_t dim = DS4_N_EMBD, ih = DS4_N_INDEXER_HEAD, idim = DS4_N_INDEXER_HEAD_DIM;
+    const uint32_t rd = DS4_N_ROT, lq = DS4_N_LORA_Q, n_comp = sh->n_comp;
+    const uint32_t topk = DS4_N_INDEXER_TOP_K < n_comp ? DS4_N_INDEXER_TOP_K : n_comp;
+
+    float *q = xmalloc((size_t)ih * idim * sizeof(float));
+    float *wts = xmalloc(ih * sizeof(float));
+    float *scores = xmalloc((size_t)n_comp * sizeof(float));
+    int32_t *keep = xmalloc((size_t)n_comp * sizeof(int32_t));
+    uint32_t *scan = xmalloc((size_t)n_comp * sizeof(uint32_t));
+    const float scale = (1.0f / sqrtf((float)idim)) / sqrtf((float)ih);
+
+    sh->topk = topk;
+    free(sh->scores);
+    sh->scores = xmalloc((size_t)s_len * n_comp * sizeof(float));
+    free(sh->topk_idxs);
+    sh->topk_idxs = xmalloc((size_t)s_len * topk * sizeof(int32_t));
+    if (is_candidate_source) {
+        free(sh->candidates);
+        sh->candidates = xmalloc((size_t)s_len * n_comp * sizeof(int32_t));
+        sh->have_candidates = true;
+    }
+
+    for (uint32_t t = 0; t < s_len; t++) {
+        qwen4_ref_matvec(m, l->indexer_attn_q_b, qr + (size_t)t * lq, q);
+        for (uint32_t h = 0; h < ih; h++) {
+            dsv41_ref_rope(q + (size_t)h * idim + (idim - rd), rd, f, t, false);
+        }
+        qwen4_ref_matvec(m, l->indexer_proj, x + (size_t)t * dim, wts);
+
+        const uint32_t clen = (t + 1u) / ratio;
+
+        /* A layer that reads a source's candidate blocks can only ever pick positions
+         * inside that set: everything else is masked to -inf and can never enter the
+         * top-k.  So it scores just those, not the whole compressed history.  That is
+         * exact whenever the set is at least `topk` large; below it the masked entries
+         * can be drawn, so fall back to the full scan and mask as the release does. */
+        uint32_t n_scan = 0;
+        const int32_t *cand = (uses_candidates && sh->have_candidates)
+                            ? sh->candidates + (size_t)t * n_comp : NULL;
+        if (cand) {
+            for (uint32_t j = 0; j < clen; j++) if (cand[j]) scan[n_scan++] = j;
+            if (n_scan < topk) { cand = NULL; n_scan = 0; }
+        }
+        if (!cand) {
+            n_scan = clen;
+            for (uint32_t j = 0; j < clen; j++) scan[j] = j;
+            g_dsv41_scan_full++;
+        } else {
+            g_dsv41_scan_restricted++;
+        }
+        g_dsv41_scan_positions += n_scan;
+        g_dsv41_scan_positions_full += clen;
+
+        for (uint32_t j = 0; j < n_comp; j++) scores[j] = DS4_NEG_INF;
+        for (uint32_t si = 0; si < n_scan; si++) {
+            const uint32_t j = scan[si];
+            double acc = 0.0;
+            for (uint32_t h = 0; h < ih; h++) {
+                double dot = 0.0;
+                for (uint32_t d = 0; d < idim; d++) {
+                    dot += (double)q[(size_t)h * idim + d] * sh->index_k[(size_t)j * idim + d];
+                }
+                if (dot > 0.0) acc += dot * (double)wts[h] * (double)scale;
+            }
+            scores[j] = (float)acc;
+        }
+
+        if (is_candidate_source) {
+            dsv41_ref_candidate_blocks(scores, n_comp, DS4_N_CANDIDATE_BLOCK_SIZE,
+                                       DS4_N_CANDIDATE_TOP_BLOCKS, clen,
+                                       sh->candidates + (size_t)t * n_comp);
+        } else if (cand) {
+            /* already restricted to the candidate set by construction */
+        } else if (uses_candidates && sh->have_candidates) {
+            const int32_t *c = sh->candidates + (size_t)t * n_comp;
+            for (uint32_t j = 0; j < n_comp; j++) if (!c[j]) scores[j] = DS4_NEG_INF;
+        }
+
+        memcpy(sh->scores + (size_t)t * n_comp, scores, (size_t)n_comp * sizeof(float));
+        /* top-k by score, then re-sorted into position order; anything the query cannot
+         * reach becomes -1 */
+        for (uint32_t j = 0; j < n_comp; j++) keep[j] = 0;
+        for (uint32_t s = 0; s < topk; s++) {
+            int best = -1;
+            float best_v = 0.0f;
+            for (uint32_t j = 0; j < n_comp; j++) {
+                if (keep[j]) continue;
+                if (best < 0 || scores[j] >= best_v) { best = (int)j; best_v = scores[j]; }
+            }
+            if (best >= 0) keep[best] = 1;
+        }
+        int32_t *dst = sh->topk_idxs + (size_t)t * topk;
+        uint32_t n = 0;
+        for (uint32_t j = 0; j < n_comp; j++) {
+            if (keep[j]) dst[n++] = j < clen ? (int32_t)(j + offset) : -1;
+        }
+        while (n < topk) dst[n++] = -1;
+    }
+    free(q); free(wts); free(scores); free(keep); free(scan);
+}
+
+/* Attention.forward: one 512-d latent is both K and V for every query head, over two KV
+ * sources concatenated into a single sparse_attn call -- a sliding window of raw KV plus,
+ * when compress_ratio > 0, index_topk compressed positions reaching further back. */
+static void dsv41_ref_attn(const ds4_model *m, const ds4_weights *w, uint32_t il,
+                           dsv41_ref_shared *sh, dsv41_ref_state *st, const float *x,
+                           uint32_t s_len, const dsv41_ref_freqs *f, float *qr_out, float *out) {
+    const ds4_layer_weights *l = &w->layer[il];
+    const uint32_t dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM, nh = DS4_N_HEAD;
+    const uint32_t rd = DS4_N_ROT, lq = DS4_N_LORA_Q, win = DS4_N_SWA;
+    const uint32_t groups = DS4_N_OUT_GROUP, lo = DS4_N_LORA_O;
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const uint32_t win_topk = s_len < win ? s_len : win;
+
+    float *q = xmalloc((size_t)s_len * nh * hd * sizeof(float));
+    float *win_kv = xmalloc((size_t)s_len * hd * sizeof(float));
+    float *qa = xmalloc(lq * sizeof(float));
+
+    for (uint32_t t = 0; t < s_len; t++) {
+        const float *xt = x + (size_t)t * dim;
+        qwen4_ref_matvec(m, l->attn_q_a, xt, qa);
+        qwen4_ref_rms(qr_out + (size_t)t * lq, qa, qwen4_ref_f32(m, l->attn_q_a_norm), lq, DS4_RMS_EPS);
+        qwen4_ref_matvec(m, l->attn_q_b, qr_out + (size_t)t * lq, q + (size_t)t * nh * hd);
+        for (uint32_t h = 0; h < nh; h++) {
+            dsv41_ref_rope(q + ((size_t)t * nh + h) * hd + (hd - rd), rd, f, t, false);
+        }
+        float *kvt = win_kv + (size_t)t * hd;
+        qwen4_ref_matvec(m, l->attn_kv, xt, kvt);
+        qwen4_ref_rms(kvt, kvt, qwen4_ref_f32(m, l->attn_kv_a_norm), hd, DS4_RMS_EPS);
+        dsv41_ref_rope(kvt + (hd - rd), rd, f, t, false);
+    }
+
+    /* the compressor runs before its latent is rotated, because the indexer needs the
+     * unrotated form; only a kv-source layer produces one, the rest read the cache */
+    if (ratio != 0 && g_ds4_kv_source_layer[il] == il) {
+        float *latent = xmalloc((size_t)(s_len / ratio) * hd * sizeof(float));
+        float *tail_kv = st ? st->kv_state + (size_t)il * st->win * hd : NULL;
+        float *tail_sc = st ? st->score_state + (size_t)il * st->win * hd : NULL;
+        const uint32_t n_comp = dsv41_ref_compressor(m, l, x, s_len, ratio, latent,
+                                                     tail_kv, tail_sc);
+        if (g_ds4_index_source_layer[il] == il) {
+            float *k = xmalloc((size_t)n_comp * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+            for (uint32_t g = 0; g < n_comp; g++) {
+                float *kg = k + (size_t)g * DS4_N_INDEXER_HEAD_DIM;
+                qwen4_ref_matvec(m, l->indexer_attn_k, latent + (size_t)g * hd, kg);
+                qwen4_ref_rms(kg, kg, qwen4_ref_f32(m, l->indexer_k_norm),
+                              DS4_N_INDEXER_HEAD_DIM, DS4_RMS_EPS);
+                /* a latent stands for the first token of its group, so group j sits at j*ratio */
+                dsv41_ref_rope(kg + (DS4_N_INDEXER_HEAD_DIM - rd), rd, f, g * ratio, false);
+            }
+            free(sh->index_k);
+            sh->index_k = k;
+        }
+        free(sh->latent_pre);
+        sh->latent_pre = xmalloc((size_t)n_comp * hd * sizeof(float));
+        memcpy(sh->latent_pre, latent, (size_t)n_comp * hd * sizeof(float));
+        for (uint32_t g = 0; g < n_comp; g++) {
+            dsv41_ref_rope(latent + (size_t)g * hd + (hd - rd), rd, f, g * ratio, false);
+        }
+        free(sh->compress_kv);
+        sh->compress_kv = latent;
+        sh->n_comp = n_comp;
+        if (st) {
+            memcpy(st->compress_kv + (size_t)il * st->max_pos * hd, latent,
+                   (size_t)n_comp * hd * sizeof(float));
+            if (sh->index_k) {
+                memcpy(st->index_k + (size_t)il * st->max_pos * st->idim, sh->index_k,
+                       (size_t)n_comp * st->idim * sizeof(float));
+            }
+            st->n_comp[il] = n_comp;
+        }
+    }
+
+    if (st) {
+        const uint32_t first = s_len > win ? s_len - win : 0u;
+        for (uint32_t t = first; t < s_len; t++) {
+            memcpy(st->window_kv + ((size_t)il * win + (t % win)) * hd,
+                   win_kv + (size_t)t * hd, hd * sizeof(float));
+        }
+    }
+
+    uint32_t topk = win_topk;
+    float *kv = win_kv;
+    int32_t *idxs = xmalloc((size_t)s_len * win_topk * sizeof(int32_t));
+    for (uint32_t t = 0; t < s_len; t++) {
+        const int32_t base = (int32_t)t + 1 - (int32_t)win;
+        for (uint32_t j = 0; j < win_topk; j++) {
+            const int32_t p = (base > 0 ? base : 0) + (int32_t)j;
+            idxs[(size_t)t * win_topk + j] = p > (int32_t)t ? -1 : p;
+        }
+    }
+
+    float *joined_kv = NULL;
+    int32_t *joined_idxs = NULL;
+    if (ratio != 0 && sh->n_comp > 0) {
+        if (g_ds4_index_source_layer[il] == il) {
+            dsv41_ref_indexer(m, l, sh, x, qr_out, s_len, ratio, s_len, f,
+                              il == g_ds4_candidate_source_layer,
+                              g_ds4_candidate_source_layer < il);
+        }
+        topk = win_topk + sh->topk;
+        joined_kv = xmalloc(((size_t)s_len + sh->n_comp) * hd * sizeof(float));
+        memcpy(joined_kv, win_kv, (size_t)s_len * hd * sizeof(float));
+        memcpy(joined_kv + (size_t)s_len * hd, sh->compress_kv,
+               (size_t)sh->n_comp * hd * sizeof(float));
+        joined_idxs = xmalloc((size_t)s_len * topk * sizeof(int32_t));
+        for (uint32_t t = 0; t < s_len; t++) {
+            memcpy(joined_idxs + (size_t)t * topk, idxs + (size_t)t * win_topk,
+                   win_topk * sizeof(int32_t));
+            memcpy(joined_idxs + (size_t)t * topk + win_topk,
+                   sh->topk_idxs + (size_t)t * sh->topk, sh->topk * sizeof(int32_t));
+        }
+        kv = joined_kv;
+    }
+
+    float *o = xmalloc((size_t)s_len * nh * hd * sizeof(float));
+    dsv41_ref_sparse_attn(q, kv, qwen4_ref_f32(m, l->attn_sinks),
+                          joined_idxs ? joined_idxs : idxs,
+                          s_len, nh, hd, topk, 1.0f / sqrtf((float)hd), o);
+
+    float *low = xmalloc((size_t)groups * lo * sizeof(float));
+    for (uint32_t t = 0; t < s_len; t++) {
+        float *ot = o + (size_t)t * nh * hd;
+        for (uint32_t h = 0; h < nh; h++) {
+            dsv41_ref_rope(ot + (size_t)h * hd + (hd - rd), rd, f, t, true);
+        }
+        const uint64_t in_per_group = (uint64_t)hd * nh / groups;
+        for (uint32_t g = 0; g < groups; g++) {
+            qwen4_ref_matvec_rows(m, l->attn_output_a, (uint64_t)g * lo, lo,
+                                  ot + (size_t)g * in_per_group, low + (size_t)g * lo);
+        }
+        qwen4_ref_matvec(m, l->attn_output_b, low, out + (size_t)t * dim);
+    }
+    free(q); free(win_kv); free(qa); free(idxs); free(o); free(low);
+    free(joined_kv); free(joined_idxs);
+}
+
+/* Block.hc_mixes: one projection of the flattened, normalised hc stream, split into the
+ * pre/post/comb coefficients.  The mix a sublayer computes is used by the NEXT one. */
+static void dsv41_ref_hc_mixes(const ds4_model *m, const ds4_tensor *fn, const ds4_tensor *scale,
+                               const ds4_tensor *base, const float *stream, uint32_t hc_dim,
+                               uint32_t hc, uint32_t iters, float eps,
+                               float *pre, float *post, float *comb) {
+    const uint32_t mix_hc = (2u + hc) * hc;
+    float *mixes = xmalloc(mix_hc * sizeof(float));
+    double ss = 0.0;
+    for (uint32_t i = 0; i < hc_dim; i++) ss += (double)stream[i] * stream[i];
+    const float rstd = (float)(1.0 / sqrt(ss / hc_dim + (double)DS4_RMS_EPS));
+    qwen4_ref_matvec(m, fn, stream, mixes);
+    for (uint32_t i = 0; i < mix_hc; i++) mixes[i] *= rstd;
+    dsv41_ref_hc_split_sinkhorn(mixes, qwen4_ref_f32(m, scale), qwen4_ref_f32(m, base),
+                                hc, iters, eps, pre, post, comb);
+    free(mixes);
+}
+
+/* The engram sidecar's inputs for one forward: the second mapping the 203 GB tables live
+ * in, and the compressed id history the n-gram hash looks back through.  `pos0` is the
+ * position of this call's first token, so a decode step reaches back into the prefill. */
+typedef struct {
+    const ds4_model *m;
+    const ds4_engram_weights *w;
+    const ds4_engram_hash *h;
+    const int32_t *ids;
+    const int32_t *dead;
+    uint32_t pos0;
+} dsv41_ref_engram;
+
+/* Transformer.forward runs `layer.engram` on the hc stream before Block.forward, so the
+ * injection lands between the previous sublayer's mHC post-mix and this block's mixes.
+ * Layers with no table, and runs with no sidecar open, pass through. */
+static void dsv41_ref_engram_inject(const dsv41_ref_engram *eng, uint32_t il,
+                                    float *stream, uint32_t s_len) {
+    if (!eng || !eng->m) {
+        /* without the tables those layers are simply missing a term, which shows up as
+         * plausible-looking logits rather than as a failure */
+        if (DS4_N_ENGRAM_LAYER != 0) ds4_die("this shape has engram layers: pass the sidecar");
+        return;
+    }
+    const uint32_t hc = DS4_N_HC, hc_dim = DS4_N_EMBD * hc;
+    for (uint32_t li = 0; li < eng->h->n_layer; li++) {
+        if (eng->h->layer_id[li] != il) continue;
+        float *gate = xmalloc(hc * sizeof(float));
+        float *out = xmalloc(hc_dim * sizeof(float));
+        for (uint32_t t = 0; t < s_len; t++) {
+            float *row = stream + (size_t)t * hc_dim;
+            engram_forward(eng->m, eng->w, eng->h, li, eng->ids, eng->dead, eng->pos0 + t,
+                           row, gate, out);
+            memcpy(row, out, hc_dim * sizeof(float));
+        }
+        free(gate);
+        free(out);
+    }
+}
+
+/* Block.forward.  `pre_mix` collapses the copies for this attention; the mix this block's
+ * attention computes feeds its FFN, and the FFN's feeds the next block. */
+static void dsv41_ref_block(const ds4_model *m, const ds4_weights *w, uint32_t il,
+                            dsv41_ref_shared *sh, const dsv41_ref_engram *eng,
+                            dsv41_ref_state *st, float *stream,
+                            uint32_t s_len, float *pre_mix, const dsv41_ref_freqs *f,
+                            float *attn_out, float *ffn_out) {
+    const ds4_layer_weights *l = &w->layer[il];
+    const uint32_t dim = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = dim * hc;
+    const float hc_eps = DS4_HC_EPS;
+    const uint32_t iters = DS4_N_HC_SINKHORN_ITER;
+
+    float *attn_pre = xmalloc((size_t)s_len * hc * sizeof(float));
+    float *post = xmalloc(hc * sizeof(float));
+    float *comb = xmalloc((size_t)hc * hc * sizeof(float));
+    float *collapsed = xmalloc((size_t)s_len * dim * sizeof(float));
+    float *normed = xmalloc((size_t)s_len * dim * sizeof(float));
+    float *residual = xmalloc((size_t)s_len * hc_dim * sizeof(float));
+    float *qr = xmalloc((size_t)s_len * DS4_N_LORA_Q * sizeof(float));
+    float *post_all = xmalloc((size_t)s_len * hc * sizeof(float));
+    float *comb_all = xmalloc((size_t)s_len * hc * hc * sizeof(float));
+
+    dsv41_ref_engram_inject(eng, il, stream, s_len);
+    memcpy(residual, stream, (size_t)s_len * hc_dim * sizeof(float));
+    for (uint32_t t = 0; t < s_len; t++) {
+        dsv41_ref_hc_mixes(m, l->hc_attn_fn, l->hc_attn_scale, l->hc_attn_base,
+                           stream + (size_t)t * hc_dim, hc_dim, hc, iters, hc_eps,
+                           attn_pre + (size_t)t * hc, post, comb);
+        memcpy(post_all + (size_t)t * hc, post, hc * sizeof(float));
+        memcpy(comb_all + (size_t)t * hc * hc, comb, (size_t)hc * hc * sizeof(float));
+        /* hc_pre: collapse the copies weighted by the previous sublayer's pre-mix */
+        const float *mix = pre_mix + (size_t)t * hc;
+        float *dst = collapsed + (size_t)t * dim;
+        for (uint32_t d = 0; d < dim; d++) {
+            float acc = 0.0f;
+            for (uint32_t c = 0; c < hc; c++) acc += mix[c] * stream[(size_t)t * hc_dim + c * dim + d];
+            dst[d] = acc;
+        }
+        qwen4_ref_rms(normed + (size_t)t * dim, dst, qwen4_ref_f32(m, l->attn_norm), dim, DS4_RMS_EPS);
+    }
+
+    dsv41_ref_attn(m, w, il, sh, st, normed, s_len, f, qr, attn_out);
+
+    /* hc_post: expand back to hc copies and mix the residual in through comb */
+    for (uint32_t t = 0; t < s_len; t++) {
+        const float *ao = attn_out + (size_t)t * dim;
+        const float *po = post_all + (size_t)t * hc;
+        const float *co = comb_all + (size_t)t * hc * hc;
+        const float *res = residual + (size_t)t * hc_dim;
+        float *dst = stream + (size_t)t * hc_dim;
+        for (uint32_t c = 0; c < hc; c++) {
+            for (uint32_t d = 0; d < dim; d++) {
+                float acc = po[c] * ao[d];
+                for (uint32_t k = 0; k < hc; k++) acc += co[k * hc + c] * res[k * dim + d];
+                dst[c * dim + d] = acc;
+            }
+        }
+    }
+
+    memcpy(residual, stream, (size_t)s_len * hc_dim * sizeof(float));
+    for (uint32_t t = 0; t < s_len; t++) {
+        dsv41_ref_hc_mixes(m, l->hc_ffn_fn, l->hc_ffn_scale, l->hc_ffn_base,
+                           stream + (size_t)t * hc_dim, hc_dim, hc, iters, hc_eps,
+                           pre_mix + (size_t)t * hc, post, comb);
+        memcpy(post_all + (size_t)t * hc, post, hc * sizeof(float));
+        memcpy(comb_all + (size_t)t * hc * hc, comb, (size_t)hc * hc * sizeof(float));
+        const float *mix = attn_pre + (size_t)t * hc;
+        float *dst = collapsed + (size_t)t * dim;
+        for (uint32_t d = 0; d < dim; d++) {
+            float acc = 0.0f;
+            for (uint32_t c = 0; c < hc; c++) acc += mix[c] * stream[(size_t)t * hc_dim + c * dim + d];
+            dst[d] = acc;
+        }
+        qwen4_ref_rms(normed + (size_t)t * dim, dst, qwen4_ref_f32(m, l->ffn_norm), dim, DS4_RMS_EPS);
+        dsv41_ref_moe(m, l, normed + (size_t)t * dim, dim, DS4_N_FF_EXP,
+                      ds4_layer_expert_count(il), DS4_N_EXPERT_USED,
+                      DS4_SWIGLU_CLAMP_EXP, DS4_EXPERT_WEIGHT_SCALE,
+                      ffn_out + (size_t)t * dim);
+    }
+    for (uint32_t t = 0; t < s_len; t++) {
+        const float *fo = ffn_out + (size_t)t * dim;
+        const float *po = post_all + (size_t)t * hc;
+        const float *co = comb_all + (size_t)t * hc * hc;
+        const float *res = residual + (size_t)t * hc_dim;
+        float *dst = stream + (size_t)t * hc_dim;
+        for (uint32_t c = 0; c < hc; c++) {
+            for (uint32_t d = 0; d < dim; d++) {
+                float acc = po[c] * fo[d];
+                for (uint32_t k = 0; k < hc; k++) acc += co[k * hc + c] * res[k * dim + d];
+                dst[c * dim + d] = acc;
+            }
+        }
+    }
+    free(attn_pre); free(post); free(comb); free(collapsed); free(normed);
+    free(residual); free(qr); free(post_all); free(comb_all);
+}
+
+/* Transformer.forward: embed, expand to hc copies, run the blocks, collapse with the last
+ * layer's hc_pre, then norm and head.  `dump` receives per-layer attn/ffn/stream when set. */
+static DS4_MAYBE_UNUSED void dsv41_ref_prefill(const ds4_model *m, const ds4_weights *w, const int *tokens,
+                              uint32_t s_len, uint32_t n_layer, float *logits,
+                              float *dump_attn, float *dump_ffn, float *dump_stream,
+                              int32_t *dump_idxs, float *dump_comp, dsv41_ref_state *st,
+                              const dsv41_ref_engram *eng) {
+    const uint32_t dim = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = dim * hc;
+    dsv41_ref_freqs f0, fc;
+    dsv41_ref_freqs_init(&f0, DS4_N_ROT, s_len, 0, DS4_ROPE_FREQ_BASE,
+                         DS4_ROPE_SCALE_FACTOR, DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW);
+    dsv41_ref_freqs_init(&fc, DS4_N_ROT, s_len, (uint32_t)DS4_ROPE_ORIG_CTX,
+                         DS4_COMPRESS_ROPE_FREQ_BASE, DS4_ROPE_SCALE_FACTOR,
+                         DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW);
+
+    dsv41_ref_shared sh;
+    memset(&sh, 0, sizeof(sh));
+    float *stream = xmalloc((size_t)s_len * hc_dim * sizeof(float));
+    float *pre_mix = xmalloc((size_t)s_len * hc * sizeof(float));
+    float *attn_out = xmalloc((size_t)s_len * dim * sizeof(float));
+    float *ffn_out = xmalloc((size_t)s_len * dim * sizeof(float));
+
+    for (uint32_t t = 0; t < s_len; t++) {
+        float *row = stream + (size_t)t * hc_dim;
+        qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], row);
+        for (uint32_t c = 1; c < hc; c++) memcpy(row + c * dim, row, dim * sizeof(float));
+        /* make_identity_pre_mix: the first copy carries everything to start with */
+        for (uint32_t c = 0; c < hc; c++) pre_mix[(size_t)t * hc + c] = c == 0 ? 1.0f : 0.0f;
+    }
+
+    for (uint32_t il = 0; il < n_layer; il++) {
+        /* window-only layers disable YaRN and use the base rope_theta; compressed layers
+         * use compress_rope_theta with YaRN */
+        const dsv41_ref_freqs *f = ds4_layer_compress_ratio(il)
+                ? (st ? &st->fc : &fc) : (st ? &st->f0 : &f0);
+        dsv41_ref_block(m, w, il, &sh, eng, st, stream, s_len, pre_mix, f, attn_out, ffn_out);
+        if (dump_attn) {
+            memcpy(dump_attn + (size_t)il * s_len * dim, attn_out, (size_t)s_len * dim * sizeof(float));
+        }
+        if (dump_ffn) {
+            memcpy(dump_ffn + (size_t)il * s_len * dim, ffn_out, (size_t)s_len * dim * sizeof(float));
+        }
+        if (dump_stream) {
+            memcpy(dump_stream + (size_t)il * s_len * hc_dim, stream,
+                   (size_t)s_len * hc_dim * sizeof(float));
+        }
+        if (dump_comp && sh.scores && ds4_layer_compress_ratio(il)) {
+            /* reuse the tail of the compressor slot for the scores of this layer */
+            float *dst = dump_comp + ((size_t)n_layer + il) * s_len * DS4_N_HEAD_DIM;
+            for (uint32_t t = 0; t < s_len; t++) {
+                memcpy(dst + (size_t)t * DS4_N_HEAD_DIM, sh.scores + (size_t)t * sh.n_comp,
+                       (sh.n_comp < DS4_N_HEAD_DIM ? sh.n_comp : DS4_N_HEAD_DIM) * sizeof(float));
+            }
+        }
+        if (dump_comp && sh.latent_pre && g_ds4_kv_source_layer[il] == il) {
+            memcpy(dump_comp + (size_t)il * s_len * DS4_N_HEAD_DIM, sh.latent_pre,
+                   (size_t)sh.n_comp * DS4_N_HEAD_DIM * sizeof(float));
+        }
+        if (dump_idxs) {
+            const uint32_t k = DS4_N_INDEXER_TOP_K;
+            int32_t *dst = dump_idxs + (size_t)il * s_len * k;
+            for (uint32_t i = 0; i < s_len * k; i++) dst[i] = -2;
+            if (sh.topk_idxs && sh.topk > 0 && ds4_layer_compress_ratio(il)) {
+                for (uint32_t t = 0; t < s_len; t++) {
+                    memcpy(dst + (size_t)t * k, sh.topk_idxs + (size_t)t * sh.topk,
+                           sh.topk * sizeof(int32_t));
+                }
+            }
+        }
+    }
+
+    if (logits) {
+        /* the final collapse reuses the last block's hc_pre with the mix it produced */
+        const uint32_t last = n_layer - 1u;
+        float *collapsed = xmalloc(dim * sizeof(float));
+        float *normed = xmalloc(dim * sizeof(float));
+        const uint32_t t = s_len - 1u;
+        const float *mix = pre_mix + (size_t)t * hc;
+        for (uint32_t d = 0; d < dim; d++) {
+            float acc = 0.0f;
+            for (uint32_t c = 0; c < hc; c++) acc += mix[c] * stream[(size_t)t * hc_dim + c * dim + d];
+            collapsed[d] = acc;
+        }
+        (void)last;
+        qwen4_ref_rms(normed, collapsed, qwen4_ref_f32(m, w->output_norm), dim, DS4_RMS_EPS);
+        qwen4_ref_matvec(m, w->output, normed, logits);
+        free(collapsed); free(normed);
+    }
+    free(sh.compress_kv); free(sh.index_k); free(sh.topk_idxs); free(sh.candidates);
+    free(sh.latent_pre); free(sh.scores);
+    free(stream); free(pre_mix); free(attn_out); free(ffn_out);
+    dsv41_ref_freqs_free(&f0);
+    dsv41_ref_freqs_free(&fc);
+}
+
+
+static DS4_MAYBE_UNUSED void dsv41_ref_state_init(dsv41_ref_state *st, uint32_t n_layer, uint32_t max_pos) {
+    memset(st, 0, sizeof(*st));
+    st->n_layer = n_layer;
+    st->win = DS4_N_SWA;
+    st->hd = DS4_N_HEAD_DIM;
+    st->idim = DS4_N_INDEXER_HEAD_DIM;
+    st->max_pos = max_pos;
+    dsv41_ref_freqs_init(&st->f0, DS4_N_ROT, max_pos, 0, DS4_ROPE_FREQ_BASE,
+                         DS4_ROPE_SCALE_FACTOR, DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW);
+    dsv41_ref_freqs_init(&st->fc, DS4_N_ROT, max_pos, (uint32_t)DS4_ROPE_ORIG_CTX,
+                         DS4_COMPRESS_ROPE_FREQ_BASE, DS4_ROPE_SCALE_FACTOR,
+                         DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW);
+    st->window_kv   = xcalloc((size_t)n_layer * st->win * st->hd, sizeof(float));
+    st->compress_kv = xcalloc((size_t)n_layer * max_pos * st->hd, sizeof(float));
+    st->index_k     = xcalloc((size_t)n_layer * max_pos * st->idim, sizeof(float));
+    st->kv_state    = xcalloc((size_t)n_layer * st->win * st->hd, sizeof(float));
+    st->score_state = xcalloc((size_t)n_layer * st->win * st->hd, sizeof(float));
+    st->n_comp      = xcalloc(n_layer, sizeof(uint32_t));
+    st->topk_idxs   = xcalloc((size_t)n_layer * DS4_N_INDEXER_TOP_K, sizeof(int32_t));
+    st->topk        = xcalloc(n_layer, sizeof(uint32_t));
+    st->candidates  = xcalloc((size_t)n_layer * max_pos, sizeof(int32_t));
+}
+
+static DS4_MAYBE_UNUSED void dsv41_ref_state_free(dsv41_ref_state *st) {
+    dsv41_ref_freqs_free(&st->f0);
+    dsv41_ref_freqs_free(&st->fc);
+    free(st->window_kv); free(st->compress_kv); free(st->index_k);
+    free(st->kv_state); free(st->score_state); free(st->n_comp);
+    free(st->topk_idxs); free(st->topk); free(st->candidates);
+    memset(st, 0, sizeof(*st));
+}
+
+/* Compressor.forward at decode: fill this step's slot, and pool only when the group just
+ * completed.  Returns true when a latent was produced. */
+static bool dsv41_ref_compressor_step(const ds4_model *m, const ds4_layer_weights *l,
+                                      dsv41_ref_state *st, uint32_t il, const float *x,
+                                      uint32_t pos, uint32_t ratio, float *latent) {
+    const uint32_t hd = st->hd;
+    float *kvs = st->kv_state + (size_t)il * st->win * hd;
+    float *scs = st->score_state + (size_t)il * st->win * hd;
+    if (ratio == 1) {
+        qwen4_ref_matvec(m, l->attn_compressor_kv, x, latent);
+        qwen4_ref_rms(latent, latent, qwen4_ref_f32(m, l->attn_compressor_norm), hd, DS4_RMS_EPS);
+        return true;
+    }
+    const uint32_t slot = pos % ratio;
+    qwen4_ref_matvec(m, l->attn_compressor_kv, x, kvs + (size_t)slot * hd);
+    qwen4_ref_matvec(m, l->attn_compressor_gate, x, scs + (size_t)slot * hd);
+    if ((pos + 1u) % ratio != 0u) return false;
+    float *pooled = xmalloc(hd * sizeof(float));
+    dsv41_ref_compress_pool(kvs, scs, 1, ratio, hd, pooled);
+    qwen4_ref_rms(latent, pooled, qwen4_ref_f32(m, l->attn_compressor_norm), hd, DS4_RMS_EPS);
+    free(pooled);
+    return true;
+}
+
+/* Candidate publication, masking, top-k and compaction for one decode query.  Split out
+ * so the GPU path can hand in scores the kernels produced and get the identical
+ * selection; `scores` is modified in place. */
+static void dsv41_ref_index_select(dsv41_ref_state *st, uint32_t il, uint32_t cand_src,
+                                   float *scores, uint32_t clen, uint32_t topk,
+                                   uint32_t offset, bool is_candidate_source,
+                                   bool mask_candidates) {
+    int32_t *keep = xmalloc((size_t)clen * sizeof(int32_t));
+    if (is_candidate_source) {
+        dsv41_ref_candidate_blocks(scores, clen, DS4_N_CANDIDATE_BLOCK_SIZE,
+                                   DS4_N_CANDIDATE_TOP_BLOCKS, clen,
+                                   st->candidates + (size_t)il * st->max_pos);
+    } else if (mask_candidates) {
+        const int32_t *cand = st->candidates + (size_t)cand_src * st->max_pos;
+        for (uint32_t j = 0; j < clen; j++) if (!cand[j]) scores[j] = DS4_NEG_INF;
+    }
+    for (uint32_t j = 0; j < clen; j++) keep[j] = 0;
+    for (uint32_t s = 0; s < topk; s++) {
+        int best = -1;
+        float best_v = 0.0f;
+        for (uint32_t j = 0; j < clen; j++) {
+            if (keep[j]) continue;
+            if (best < 0 || scores[j] >= best_v) { best = (int)j; best_v = scores[j]; }
+        }
+        if (best >= 0) keep[best] = 1;
+    }
+    int32_t *dst = st->topk_idxs + (size_t)il * DS4_N_INDEXER_TOP_K;
+    uint32_t n = 0;
+    for (uint32_t j = 0; j < clen; j++) if (keep[j]) dst[n++] = (int32_t)(j + offset);
+    while (n < topk) dst[n++] = -1;
+    st->topk[il] = topk;
+    free(keep);
+}
+
+/* Indexer.forward at decode: one query against every published compressed position. */
+static void dsv41_ref_indexer_step(const ds4_model *m, const ds4_layer_weights *l,
+                                   dsv41_ref_state *st, uint32_t il, uint32_t src,
+                                   const float *x, const float *qr, uint32_t pos,
+                                   uint32_t clen, uint32_t offset,
+                                   const dsv41_ref_freqs *f, bool is_candidate_source,
+                                   bool uses_candidates, uint32_t cand_src) {
+    const uint32_t ih = DS4_N_INDEXER_HEAD, idim = st->idim;
+    const uint32_t rd = DS4_N_ROT;
+    const uint32_t topk = DS4_N_INDEXER_TOP_K < clen ? DS4_N_INDEXER_TOP_K : clen;
+    const float *index_k = st->index_k + (size_t)src * st->max_pos * idim;
+    const float scale = (1.0f / sqrtf((float)idim)) / sqrtf((float)ih);
+
+    float *q = xmalloc((size_t)ih * idim * sizeof(float));
+    float *wts = xmalloc(ih * sizeof(float));
+    float *scores = xmalloc((size_t)clen * sizeof(float));
+    int32_t *keep = xmalloc((size_t)clen * sizeof(int32_t));
+    uint32_t *scan = xmalloc((size_t)clen * sizeof(uint32_t));
+
+    qwen4_ref_matvec(m, l->indexer_attn_q_b, qr, q);
+    for (uint32_t h = 0; h < ih; h++) {
+        dsv41_ref_rope(q + (size_t)h * idim + (idim - rd), rd, f, pos, false);
+    }
+    qwen4_ref_matvec(m, l->indexer_proj, x, wts);
+
+    /* see the prefill indexer: a candidate consumer scores only the source's set, which
+     * is exact while that set is at least `topk` large */
+    int32_t *cand = st->candidates + (size_t)cand_src * st->max_pos;
+    uint32_t n_scan = 0;
+    bool restricted = uses_candidates;
+    if (restricted) {
+        for (uint32_t j = 0; j < clen; j++) if (cand[j]) scan[n_scan++] = j;
+        if (n_scan < topk) { restricted = false; n_scan = 0; }
+    }
+    if (!restricted) {
+        n_scan = clen;
+        for (uint32_t j = 0; j < clen; j++) scan[j] = j;
+        g_dsv41_scan_full++;
+    } else {
+        g_dsv41_scan_restricted++;
+    }
+    g_dsv41_scan_positions += n_scan;
+    g_dsv41_scan_positions_full += clen;
+
+    for (uint32_t j = 0; j < clen; j++) scores[j] = DS4_NEG_INF;
+    for (uint32_t si = 0; si < n_scan; si++) {
+        const uint32_t j = scan[si];
+        double acc = 0.0;
+        for (uint32_t h = 0; h < ih; h++) {
+            double dot = 0.0;
+            for (uint32_t d = 0; d < idim; d++) {
+                dot += (double)q[(size_t)h * idim + d] * index_k[(size_t)j * idim + d];
+            }
+            if (dot > 0.0) acc += dot * (double)wts[h] * (double)scale;
+        }
+        scores[j] = (float)acc;
+    }
+
+    dsv41_ref_index_select(st, il, cand_src, scores, clen, topk, offset,
+                           is_candidate_source, uses_candidates && !restricted);
+    free(q); free(wts); free(scores); free(keep); free(scan);
+}
+
+/* Attention.forward for a single decode step: the query sees the whole ring, oldest first,
+ * plus the compressed positions the indexer picked. */
+static void dsv41_ref_attn_step(const ds4_model *m, const ds4_weights *w, uint32_t il,
+                                dsv41_ref_state *st, const float *x, uint32_t pos,
+                                float *qr, float *out) {
+    const ds4_layer_weights *l = &w->layer[il];
+    const uint32_t hd = st->hd, nh = DS4_N_HEAD, win = st->win;
+    const uint32_t rd = DS4_N_ROT, lq = DS4_N_LORA_Q;
+    const uint32_t groups = DS4_N_OUT_GROUP, lo = DS4_N_LORA_O;
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const dsv41_ref_freqs *f = ratio ? &st->fc : &st->f0;
+
+    float *q = xmalloc((size_t)nh * hd * sizeof(float));
+    float *qa = xmalloc(lq * sizeof(float));
+    qwen4_ref_matvec(m, l->attn_q_a, x, qa);
+    qwen4_ref_rms(qr, qa, qwen4_ref_f32(m, l->attn_q_a_norm), lq, DS4_RMS_EPS);
+    qwen4_ref_matvec(m, l->attn_q_b, qr, q);
+    for (uint32_t h = 0; h < nh; h++) {
+        dsv41_ref_rope(q + (size_t)h * hd + (hd - rd), rd, f, pos, false);
+    }
+
+    float *ring = st->window_kv + (size_t)il * win * hd;
+    float *slot = ring + (size_t)(pos % win) * hd;
+    qwen4_ref_matvec(m, l->attn_kv, x, slot);
+    qwen4_ref_rms(slot, slot, qwen4_ref_f32(m, l->attn_kv_a_norm), hd, DS4_RMS_EPS);
+    dsv41_ref_rope(slot + (hd - rd), rd, f, pos, false);
+
+    /* get_window_topk_idxs, decode: the whole ring listed oldest first, -1 while filling */
+    int32_t *idxs = xmalloc((size_t)(win + DS4_N_INDEXER_TOP_K) * sizeof(int32_t));
+    const uint32_t oldest = pos % win + 1u;
+    uint32_t n_idx = 0;
+    for (uint32_t j = oldest; j < win; j++) idxs[n_idx++] = j > pos ? -1 : (int32_t)j;
+    for (uint32_t j = 0; j < oldest; j++) idxs[n_idx++] = j > pos ? -1 : (int32_t)j;
+
+    const uint32_t src = ratio ? g_ds4_kv_source_layer[il] : 0u;
+    uint32_t clen = 0;
+    if (ratio != 0) {
+        if (g_ds4_kv_source_layer[il] == il) {
+            float *latent = xmalloc(hd * sizeof(float));
+            if (dsv41_ref_compressor_step(m, l, st, il, x, pos, ratio, latent)) {
+                const uint32_t g = st->n_comp[il];
+                /* a latent stands for the first token of its group */
+                const uint32_t gpos = pos + 1u - ratio;
+                if (g_ds4_index_source_layer[il] == il) {
+                    float *k = st->index_k + ((size_t)il * st->max_pos + g) * st->idim;
+                    qwen4_ref_matvec(m, l->indexer_attn_k, latent, k);
+                    qwen4_ref_rms(k, k, qwen4_ref_f32(m, l->indexer_k_norm), st->idim, DS4_RMS_EPS);
+                    dsv41_ref_rope(k + (st->idim - rd), rd, f, gpos, false);
+                }
+                float *dst = st->compress_kv + ((size_t)il * st->max_pos + g) * hd;
+                memcpy(dst, latent, hd * sizeof(float));
+                dsv41_ref_rope(dst + (hd - rd), rd, f, gpos, false);
+                st->n_comp[il] = g + 1u;
+            }
+            free(latent);
+        }
+        clen = (pos + 1u) / ratio;
+        if (clen > st->n_comp[src]) clen = st->n_comp[src];
+        if (clen > 0 && g_ds4_index_source_layer[il] == il) {
+            dsv41_ref_indexer_step(m, l, st, il, src, x, qr, pos, clen, win, f,
+                                   il == g_ds4_candidate_source_layer,
+                                   g_ds4_candidate_source_layer < il,
+                                   g_ds4_candidate_source_layer < DS4_N_LAYER
+                                       ? g_ds4_candidate_source_layer : 0u);
+        }
+    }
+
+    uint32_t topk = win;
+    float *kv = ring;
+    float *joined = NULL;
+    if (ratio != 0 && clen > 0) {
+        const uint32_t isrc = g_ds4_index_source_layer[il];
+        const uint32_t k = st->topk[isrc];
+        memcpy(idxs + win, st->topk_idxs + (size_t)isrc * DS4_N_INDEXER_TOP_K,
+               k * sizeof(int32_t));
+        topk = win + k;
+        joined = xmalloc(((size_t)win + clen) * hd * sizeof(float));
+        memcpy(joined, ring, (size_t)win * hd * sizeof(float));
+        memcpy(joined + (size_t)win * hd,
+               st->compress_kv + (size_t)src * st->max_pos * hd, (size_t)clen * hd * sizeof(float));
+        kv = joined;
+    }
+
+    float *o = xmalloc((size_t)nh * hd * sizeof(float));
+    dsv41_ref_sparse_attn(q, kv, qwen4_ref_f32(m, l->attn_sinks), idxs,
+                          1, nh, hd, topk, 1.0f / sqrtf((float)hd), o);
+    for (uint32_t h = 0; h < nh; h++) {
+        dsv41_ref_rope(o + (size_t)h * hd + (hd - rd), rd, f, pos, true);
+    }
+    float *low = xmalloc((size_t)groups * lo * sizeof(float));
+    const uint64_t in_per_group = (uint64_t)hd * nh / groups;
+    for (uint32_t g = 0; g < groups; g++) {
+        qwen4_ref_matvec_rows(m, l->attn_output_a, (uint64_t)g * lo, lo,
+                              o + (size_t)g * in_per_group, low + (size_t)g * lo);
+    }
+    qwen4_ref_matvec(m, l->attn_output_b, low, out);
+    free(q); free(qa); free(idxs); free(o); free(low); free(joined);
+}
+
+/* One decode step through the whole stack. */
+static DS4_MAYBE_UNUSED void dsv41_ref_decode(const ds4_model *m, const ds4_weights *w, dsv41_ref_state *st,
+                             int token, uint32_t pos, float *logits,
+                             float *dump_attn, float *dump_ffn, float *dump_stream,
+                             const dsv41_ref_engram *eng) {
+    const uint32_t dim = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = dim * hc;
+    const uint32_t n_layer = st->n_layer;
+    float *stream = xmalloc(hc_dim * sizeof(float));
+    float *pre_mix = xmalloc(hc * sizeof(float));
+    float *attn_pre = xmalloc(hc * sizeof(float));
+    float *post = xmalloc(hc * sizeof(float));
+    float *comb = xmalloc((size_t)hc * hc * sizeof(float));
+    float *residual = xmalloc(hc_dim * sizeof(float));
+    float *collapsed = xmalloc(dim * sizeof(float));
+    float *normed = xmalloc(dim * sizeof(float));
+    float *qr = xmalloc(DS4_N_LORA_Q * sizeof(float));
+    float *sub = xmalloc(dim * sizeof(float));
+
+    qwen4_ref_row(m, w->token_embd, (uint64_t)token, stream);
+    for (uint32_t c = 1; c < hc; c++) memcpy(stream + c * dim, stream, dim * sizeof(float));
+    for (uint32_t c = 0; c < hc; c++) pre_mix[c] = c == 0 ? 1.0f : 0.0f;
+
+    for (uint32_t il = 0; il < n_layer; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        dsv41_ref_engram_inject(eng, il, stream, 1);
+        for (int half = 0; half < 2; half++) {
+            const ds4_tensor *fn = half ? l->hc_ffn_fn : l->hc_attn_fn;
+            const ds4_tensor *sc = half ? l->hc_ffn_scale : l->hc_attn_scale;
+            const ds4_tensor *ba = half ? l->hc_ffn_base : l->hc_attn_base;
+            memcpy(residual, stream, hc_dim * sizeof(float));
+            dsv41_ref_hc_mixes(m, fn, sc, ba, stream, hc_dim, hc, DS4_N_HC_SINKHORN_ITER,
+                               DS4_HC_EPS, half ? pre_mix : attn_pre, post, comb);
+            const float *mix = half ? attn_pre : pre_mix;
+            for (uint32_t d = 0; d < dim; d++) {
+                float acc = 0.0f;
+                for (uint32_t c = 0; c < hc; c++) acc += mix[c] * stream[c * dim + d];
+                collapsed[d] = acc;
+            }
+            qwen4_ref_rms(normed, collapsed,
+                          qwen4_ref_f32(m, half ? l->ffn_norm : l->attn_norm), dim, DS4_RMS_EPS);
+            if (half) {
+                dsv41_ref_moe(m, l, normed, dim, DS4_N_FF_EXP, ds4_layer_expert_count(il),
+                              DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP,
+                              DS4_EXPERT_WEIGHT_SCALE, sub);
+                if (dump_ffn) memcpy(dump_ffn + (size_t)il * dim, sub, dim * sizeof(float));
+            } else {
+                dsv41_ref_attn_step(m, w, il, st, normed, pos, qr, sub);
+                if (dump_attn) memcpy(dump_attn + (size_t)il * dim, sub, dim * sizeof(float));
+            }
+            for (uint32_t c = 0; c < hc; c++) {
+                for (uint32_t d = 0; d < dim; d++) {
+                    float acc = post[c] * sub[d];
+                    for (uint32_t k = 0; k < hc; k++) acc += comb[k * hc + c] * residual[k * dim + d];
+                    stream[c * dim + d] = acc;
+                }
+            }
+        }
+        if (dump_stream) memcpy(dump_stream + (size_t)il * hc_dim, stream, hc_dim * sizeof(float));
+    }
+
+    if (logits) {
+        for (uint32_t d = 0; d < dim; d++) {
+            float acc = 0.0f;
+            for (uint32_t c = 0; c < hc; c++) acc += pre_mix[c] * stream[c * dim + d];
+            collapsed[d] = acc;
+        }
+        qwen4_ref_rms(normed, collapsed, qwen4_ref_f32(m, w->output_norm), dim, DS4_RMS_EPS);
+        qwen4_ref_matvec(m, w->output, normed, logits);
+    }
+    free(stream); free(pre_mix); free(attn_pre); free(post); free(comb);
+    free(residual); free(collapsed); free(normed); free(qr); free(sub);
+}
+
+
 static uint32_t qwen4_parse_token_list(const char *p, int *seq, uint32_t max) {
     uint32_t n = 0;
     while (*p && n < max) {
@@ -67021,6 +68228,257 @@ int ds4_test_session_read_logits(ds4_session *s, float *out,
 
 const int *ds4_test_engine_placement(const ds4_engine *e) {
     return e ? e->placement : NULL;
+}
+
+/* ---- DeepSeek V4.1 reference and layout helpers, exposed for tests -------- */
+/* The V4.1 shape entry, so a test can hold it against the released config.json. */
+void ds4_test_dsv41_shape(uint32_t *out) {
+    const ds4_shape *s = &DS4_SHAPE_FLASH_V41;
+    out[0] = s->n_layer;          out[1] = s->n_embd;        out[2] = s->n_vocab;
+    out[3] = s->n_head;           out[4] = s->n_head_dim;    out[5] = s->n_rot;
+    out[6] = s->n_lora_q;         out[7] = s->n_lora_o;      out[8] = s->n_out_group;
+    out[9] = s->n_expert;         out[10] = s->n_expert_used; out[11] = s->n_ff_exp;
+    out[12] = s->n_indexer_head;  out[13] = s->n_indexer_top_k; out[14] = s->n_swa;
+    out[15] = s->n_hc;            out[16] = s->n_nextn_predict; out[17] = s->n_hash_layer;
+    out[18] = s->n_engram_layer;  out[19] = s->n_engram_ngram;  out[20] = s->n_engram_head;
+    out[21] = s->n_engram_head_dim; out[22] = s->n_candidate_top_blocks;
+    out[23] = s->n_candidate_block_size;
+}
+
+void ds4_test_dsv41_source_layer_map(const uint32_t *sources, unsigned n_sources,
+                                     unsigned n_layer, uint32_t *out) {
+    dsv41_source_layer_map(sources, n_sources, n_layer, out);
+}
+
+void ds4_test_dsv41_hc_split_sinkhorn(const float *mixes, const float *scale, const float *base,
+                                      unsigned hc, unsigned iters, float eps,
+                                      float *pre, float *post, float *comb) {
+    dsv41_ref_hc_split_sinkhorn(mixes, scale, base, hc, iters, eps, pre, post, comb);
+}
+
+void ds4_test_dsv41_route(const float *logits, const float *bias, unsigned n_expert, unsigned topk,
+                          float route_scale, int norm_topk, int32_t *idx, float *w) {
+    dsv41_ref_route(logits, bias, n_expert, topk, route_scale, norm_topk != 0, idx, w);
+}
+
+void ds4_test_dsv41_sparse_attn(const float *q, const float *kv, const float *sink,
+                                const int32_t *idxs, unsigned s, unsigned h, unsigned d,
+                                unsigned topk, float scale, float *out) {
+    dsv41_ref_sparse_attn(q, kv, sink, idxs, s, h, d, topk, scale, out);
+}
+
+void ds4_test_dsv41_compress_pool(const float *kv, const float *score, unsigned groups,
+                                  unsigned ratio, unsigned d, float *out) {
+    dsv41_ref_compress_pool(kv, score, groups, ratio, d, out);
+}
+
+void ds4_test_dsv41_engram_hash(const int32_t *ids, const int32_t *dead, unsigned pos,
+                                unsigned max_ngram, unsigned n_head, int32_t pad_id,
+                                const int64_t *mult, const int64_t *primes, const int64_t *offs,
+                                int64_t *out) {
+    engram_hash_position(ids, dead, pos, max_ngram, n_head, pad_id, mult, primes, offs, out);
+}
+
+void ds4_test_dsv41_engram_gate(const float *x, const float *key, const float *val, const float *qw,
+                                const float *kw, unsigned hc, unsigned dim, float eps,
+                                float *gate, float *out) {
+    engram_gate(x, key, val, qw, kw, hc, dim, eps, gate, out);
+}
+
+void ds4_test_dsv41_candidate_blocks(const float *logits, unsigned width, unsigned block,
+                                     unsigned topk_blocks, unsigned compress_len, int32_t *keep) {
+    dsv41_ref_candidate_blocks(logits, width, block, topk_blocks, compress_len, keep);
+}
+
+void ds4_test_e4m3_dequant_row(const void *blocks, uint64_t n, float *out) {
+    ds4_dequant_e4m3_row((const block_e4m3 *)blocks, n, out);
+}
+
+uint32_t ds4_test_e4m3_type(void) { return DS4_TENSOR_F8_E4M3; }
+
+int ds4_test_tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes) {
+    return tensor_nbytes(type, elements, bytes) ? 1 : 0;
+}
+
+const char *ds4_test_tensor_type_name(uint32_t type) { return tensor_type_name(type); }
+
+/* out[0..3] = restricted scans, full scans, positions scored, positions a full scan
+ * would have scored. */
+void ds4_test_dsv41_scan_stats(uint64_t *out) {
+    out[0] = g_dsv41_scan_restricted;
+    out[1] = g_dsv41_scan_full;
+    out[2] = g_dsv41_scan_positions;
+    out[3] = g_dsv41_scan_positions_full;
+}
+
+/* Opens an engram sidecar and compresses the whole token sequence up front, so a decode
+ * step can look back past the prefill/decode split the way NgramHashState's cache does.
+ * No path means no engram, which is every model whose shape has no engram layers. */
+typedef struct {
+    ds4_model m;
+    ds4_engram_weights w;
+    dsv41_ref_engram ctx;
+    int32_t *ids;
+    int32_t *dead;
+    bool open;
+} dsv41_ref_engram_run;
+
+static void dsv41_ref_engram_open(dsv41_ref_engram_run *r, const char *path,
+                                  const int *tokens, uint32_t n) {
+    memset(r, 0, sizeof(*r));
+    if (!path || !*path || n == 0) return;
+    model_open(&r->m, path, false, false);
+    engram_weights_bind(&r->w, &g_ds4_engram, &r->m);
+    r->ids = xmalloc(n * sizeof(int32_t));
+    r->dead = xmalloc(n * sizeof(int32_t));
+    engram_compress_tokens(&g_ds4_engram, tokens, NULL, n, r->ids, r->dead);
+    r->ctx.m = &r->m;
+    r->ctx.w = &r->w;
+    r->ctx.h = &g_ds4_engram;
+    r->ctx.ids = r->ids;
+    r->ctx.dead = r->dead;
+    r->open = true;
+}
+
+static void dsv41_ref_engram_close(dsv41_ref_engram_run *r) {
+    if (!r->open) return;
+    free(r->ids);
+    free(r->dead);
+    model_close(&r->m);
+    r->open = false;
+}
+
+/* Prefills, then runs `n_steps` decode steps from the resulting caches.  Each step's
+ * per-layer attn/ffn/stream and logits are appended in order. */
+int ds4_test_dsv41_decode(const char *path, const int *tokens, unsigned n_tokens,
+                          const int *step_tokens, unsigned n_steps, float *logits,
+                          float *attn, float *ffn, float *stream, int32_t *idxs,
+                          float *cache_out, const char *engram_path) {
+    ds4_model m;
+    ds4_weights w;
+    dsv41_ref_state st;
+    model_open(&m, path, false, false);
+    config_validate_model(&m);
+    weights_bind(&w, &m, false, 0, UINT32_MAX, true, false);
+    const uint32_t n_layer = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const uint32_t dim = DS4_N_EMBD, hc_dim = dim * DS4_N_HC;
+    dsv41_ref_state_init(&st, n_layer, n_tokens + n_steps + 1u);
+    int *all = xmalloc((n_tokens + n_steps) * sizeof(int));
+    memcpy(all, tokens, n_tokens * sizeof(int));
+    memcpy(all + n_tokens, step_tokens, n_steps * sizeof(int));
+    dsv41_ref_engram_run eng;
+    dsv41_ref_engram_open(&eng, engram_path, all, n_tokens + n_steps);
+    free(all);
+    dsv41_ref_prefill(&m, &w, tokens, n_tokens, n_layer, NULL, NULL, NULL, NULL, NULL, NULL, &st,
+                      eng.open ? &eng.ctx : NULL);
+    if (cache_out) {
+        /* post-prefill caches: [n_layer][max_pos][hd] then [n_layer][max_pos][idim] */
+        memcpy(cache_out, st.compress_kv,
+               (size_t)n_layer * st.max_pos * st.hd * sizeof(float));
+        memcpy(cache_out + (size_t)n_layer * st.max_pos * st.hd, st.index_k,
+               (size_t)n_layer * st.max_pos * st.idim * sizeof(float));
+    }
+    for (unsigned s = 0; s < n_steps; s++) {
+        eng.ctx.pos0 = n_tokens + s;
+        dsv41_ref_decode(&m, &w, &st, step_tokens[s], n_tokens + s,
+                         logits ? logits + (size_t)s * DS4_N_VOCAB : NULL,
+                         attn ? attn + (size_t)s * n_layer * dim : NULL,
+                         ffn ? ffn + (size_t)s * n_layer * dim : NULL,
+                         stream ? stream + (size_t)s * n_layer * hc_dim : NULL,
+                         eng.open ? &eng.ctx : NULL);
+        if (idxs) {
+            for (uint32_t il = 0; il < n_layer; il++) {
+                memcpy(idxs + ((size_t)s * n_layer + il) * DS4_N_INDEXER_TOP_K,
+                       st.topk_idxs + (size_t)il * DS4_N_INDEXER_TOP_K,
+                       DS4_N_INDEXER_TOP_K * sizeof(int32_t));
+            }
+        }
+    }
+    dsv41_ref_state_free(&st);
+    dsv41_ref_engram_close(&eng);
+    model_close(&m);
+    return (int)n_layer;
+}
+
+/* Runs the V4.1 CPU reference over a GGUF without the engine, so it can be scored against
+ * tests/deepseek_v41/mini/oracle_prefill.npz.  Returns the layer count. */
+int ds4_test_dsv41_prefill(const char *path, const int *tokens, unsigned n_tokens,
+                           float *logits, float *attn, float *ffn, float *stream,
+                           int32_t *idxs, float *comp, const char *engram_path) {
+    ds4_model m;
+    ds4_weights w;
+    model_open(&m, path, false, false);
+    config_validate_model(&m);
+    weights_bind(&w, &m, false, 0, UINT32_MAX, true, false);
+    const uint32_t n_layer = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    dsv41_ref_engram_run eng;
+    dsv41_ref_engram_open(&eng, engram_path, tokens, n_tokens);
+    dsv41_ref_prefill(&m, &w, tokens, n_tokens, n_layer, logits, attn, ffn, stream, idxs, comp,
+                      NULL, eng.open ? &eng.ctx : NULL);
+    dsv41_ref_engram_close(&eng);
+    model_close(&m);
+    return (int)n_layer;
+}
+
+/* Opens an engram sidecar and gathers one position's rows, without the engine (and so
+ * without its instance lock), which lets the 203 GB file be checked while a server runs. */
+int ds4_test_engram_open(const char *path, const int *tokens, unsigned n_tokens,
+                         unsigned layer_index, int64_t *rows_out, float *values_out,
+                         uint64_t *table_rows_out) {
+    ds4_model m;
+    ds4_engram_weights w;
+    g_ds4_shape = DS4_SHAPE_FLASH_V41;
+    model_open(&m, path, false, false);
+    engram_weights_bind(&w, &g_ds4_engram, &m);
+    if (layer_index >= g_ds4_engram.n_layer || n_tokens == 0) {
+        model_close(&m);
+        return 0;
+    }
+
+    int32_t *ids = xmalloc(n_tokens * sizeof(*ids));
+    int32_t *dead = xmalloc(n_tokens * sizeof(*dead));
+    engram_compress_tokens(&g_ds4_engram, tokens, NULL, n_tokens, ids, dead);
+    engram_hash_rows(&g_ds4_engram, layer_index, ids, dead, n_tokens - 1u, rows_out);
+    for (uint32_t i = 0; i < g_ds4_engram.n_bucket; i++) {
+        engram_gather_row(&m, w.embed[layer_index], (uint64_t)rows_out[i],
+                          values_out + (size_t)i * DS4_N_ENGRAM_HEAD_DIM);
+    }
+    if (table_rows_out) *table_rows_out = g_ds4_engram.n_rows[layer_index];
+    const int n_bucket = (int)g_ds4_engram.n_bucket;
+    free(ids);
+    free(dead);
+    model_close(&m);
+    return n_bucket;
+}
+
+
+/* Runs one engram block from a sidecar against the supplied stream, again without the
+ * engine.  `x` and `out` are [hc, n_embd]; `gate_out` is one gate per hc copy. */
+int ds4_test_engram_forward(const char *path, const int *tokens, unsigned n_tokens,
+                            unsigned layer_index, const float *x, float *gate_out,
+                            float *out, int last_is_dead) {
+    ds4_model m;
+    ds4_engram_weights w;
+    g_ds4_shape = DS4_SHAPE_FLASH_V41;
+    model_open(&m, path, false, false);
+    engram_weights_bind(&w, &g_ds4_engram, &m);
+    if (layer_index >= g_ds4_engram.n_layer || n_tokens == 0) {
+        model_close(&m);
+        return 0;
+    }
+    int32_t *ids = xmalloc(n_tokens * sizeof(*ids));
+    int32_t *dead = xmalloc(n_tokens * sizeof(*dead));
+    bool *alive = xmalloc(n_tokens * sizeof(*alive));
+    for (unsigned i = 0; i < n_tokens; i++) alive[i] = true;
+    if (last_is_dead) alive[n_tokens - 1u] = false;
+    engram_compress_tokens(&g_ds4_engram, tokens, alive, n_tokens, ids, dead);
+    engram_forward(&m, &w, &g_ds4_engram, layer_index, ids, dead, n_tokens - 1u,
+                   x, gate_out, out);
+    free(alive);
+    free(ids);
+    free(dead);
+    model_close(&m);
+    return (int)DS4_N_HC;
 }
 #endif /* DS4_TEST_HOOKS */
 
