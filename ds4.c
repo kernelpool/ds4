@@ -57898,6 +57898,11 @@ static DS4_MAYBE_UNUSED int payload_write_u32(FILE *fp, uint32_t v, char *err, s
     return payload_write_bytes(fp, b, sizeof(b), err, errlen);
 }
 
+static uint64_t dsv41_session_payload_bytes(ds4_session *s);
+static int dsv41_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
+static int dsv41_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h, uint64_t *remaining,
+                                      char *err, size_t errlen);
+
 static DS4_MAYBE_UNUSED int payload_read_u32(FILE *fp, uint32_t *v, uint64_t *remaining, char *err, size_t errlen) {
     uint8_t b[4];
     if (remaining && *remaining < sizeof(b)) {
@@ -58545,7 +58550,7 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
         payload_set_err(err, errlen, "invalid session layer payload save");
         return 1;
     }
-    if (ds4_session_is_cpu(s)) {
+    if (ds4_session_is_cpu(s) || ds4_session_is_dsv41(s)) {
         payload_set_err(err, errlen, "distributed layer payloads require the graph backend");
         return 1;
     }
@@ -58813,7 +58818,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
         payload_set_err(err, errlen, "invalid session layer payload load");
         return 1;
     }
-    if (ds4_session_is_cpu(s)) {
+    if (ds4_session_is_cpu(s) || ds4_session_is_dsv41(s)) {
         payload_set_err(err, errlen, "distributed layer payloads require the graph backend");
         return 1;
     }
@@ -59484,6 +59489,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
     }
     if (!s || !s->checkpoint_valid) return 0;
     if (s->distributed) return 0;
+    if (ds4_session_is_dsv41(s)) return dsv41_session_payload_bytes(s);
     if (ds4_session_is_cpu(s)) {
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -59984,6 +59990,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         return rc;
 #endif
     }
+    if (ds4_session_is_dsv41(s)) return dsv41_session_save_payload(s, fp, err, errlen);
     if (ds4_session_is_cpu(s)) {
         const uint32_t raw_live = session_cpu_raw_live_rows(s);
         const uint32_t raw_cap = ds4_default_raw_cap((uint32_t)s->ctx_size);
@@ -60455,6 +60462,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         return 0;
 #endif
     }
+    if (ds4_session_is_dsv41(s)) return dsv41_session_load_payload(s, fp, h, &remaining, err, errlen);
     if (ds4_session_is_cpu(s)) {
         const uint32_t saved_ctx = h[2];
         const uint32_t saved_prefill_cap = h[3];
@@ -67759,6 +67767,216 @@ static void dsv41_session_note(dsv41_session_state *ss, const int *tokens, uint3
     }
 }
 
+/* The V4.1 checkpoint payload.  After the common header, the tokens and the logits come
+ * per trunk layer its published compressed count and its open compressor group's first
+ * position and row count, then the tensors: per layer the window rows of the last `win`
+ * positions in position order (the ring may be wider or narrower on load), a source
+ * layer's latents and index keys, a pooled layer's open group; last the draft rings.
+ * The engram ids are recomputed from the tokens on load, and the next pass recaptures
+ * the draft head's inputs. */
+static uint32_t dsv41_payload_ring_lo(uint32_t P) {
+    return P > DS4_N_SWA ? P - DS4_N_SWA : 0u;
+}
+
+static uint64_t dsv41_payload_tensor_bytes(const dsv41_gpu_window *g, const dsv41_ref_state *st,
+                                           uint32_t P) {
+    const uint64_t hd = DS4_N_HEAD_DIM, idim = DS4_N_INDEXER_HEAD_DIM;
+    const uint64_t nw = P - dsv41_payload_ring_lo(P);
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; il < g->n_layer; il++) {
+        bytes += nw * hd * sizeof(float);
+        if (g->ckv[il]) bytes += (uint64_t)st->n_comp[il] * (hd + idim) * sizeof(float);
+        if (g->pass_kv[il]) bytes += 2ull * g->pass_rows[il] * hd * sizeof(float);
+    }
+    return bytes + (uint64_t)g->draft.n_stage * nw * hd * sizeof(float);
+}
+
+/* positions [lo, hi) of a ring of `slots`, as at most two contiguous runs */
+static int dsv41_payload_ring_io(FILE *fp, ds4_gpu_tensor *t, uint64_t base, uint32_t slots,
+                                 uint32_t lo, uint32_t hi, uint64_t row, bool writing,
+                                 uint8_t *buf, uint64_t *remaining, char *err, size_t errlen) {
+    for (uint32_t pos = lo; pos < hi; ) {
+        const uint32_t slot = pos % slots;
+        uint32_t len = slots - slot;
+        if (len > hi - pos) len = hi - pos;
+        const uint64_t off = base + (uint64_t)slot * row, bytes = (uint64_t)len * row;
+        const int rc = writing
+            ? payload_write_tensor_span(fp, t, off, bytes, buf, DS4_SESSION_IO_CHUNK, err, errlen)
+            : payload_read_tensor_span(fp, t, off, bytes, buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+        if (rc != 0) return rc;
+        pos += len;
+    }
+    return 0;
+}
+
+static int dsv41_payload_write(FILE *fp, const dsv41_gpu_window *g, const dsv41_ref_state *st,
+                               uint32_t P, char *err, size_t errlen) {
+    const uint64_t hd = DS4_N_HEAD_DIM, idim = DS4_N_INDEXER_HEAD_DIM, row = hd * sizeof(float);
+    const uint32_t lo = dsv41_payload_ring_lo(P);
+    for (uint32_t il = 0; il < g->n_layer; il++) {
+        if (payload_write_u32(fp, st->n_comp[il], err, errlen) != 0 ||
+            payload_write_u32(fp, g->pass_pos0[il], err, errlen) != 0 ||
+            payload_write_u32(fp, g->pass_kv[il] ? g->pass_rows[il] : 0u, err, errlen) != 0) return 1;
+    }
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = 0;
+    for (uint32_t il = 0; rc == 0 && il < g->n_layer; il++) {
+        rc = dsv41_payload_ring_io(fp, g->ring[il], 0, g->ring_slots, lo, P, row, true, buf, NULL, err, errlen);
+        if (rc == 0 && g->ckv[il]) {
+            rc = payload_write_tensor_span(fp, g->ckv[il], 0, (uint64_t)st->n_comp[il] * row, buf,
+                                           DS4_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0) {
+                rc = payload_write_tensor_span(fp, g->ikey[il], 0, (uint64_t)st->n_comp[il] * idim * sizeof(float),
+                                               buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            }
+        }
+        if (rc == 0 && g->pass_kv[il] && g->pass_rows[il]) {
+            rc = payload_write_tensor_span(fp, g->pass_kv[il], 0, (uint64_t)g->pass_rows[il] * row, buf,
+                                           DS4_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0) {
+                rc = payload_write_tensor_span(fp, g->pass_sc[il], 0, (uint64_t)g->pass_rows[il] * row, buf,
+                                               DS4_SESSION_IO_CHUNK, err, errlen);
+            }
+        }
+    }
+    for (uint32_t stg = 0; rc == 0 && stg < g->draft.n_stage; stg++) {
+        rc = dsv41_payload_ring_io(fp, g->dring, (uint64_t)stg * DS4_N_SWA * row, DS4_N_SWA, lo, P, row,
+                                   true, buf, NULL, err, errlen);
+    }
+    free(buf);
+    return rc;
+}
+
+static int dsv41_payload_read(FILE *fp, dsv41_gpu_window *g, dsv41_ref_state *st, uint32_t P,
+                              uint64_t *remaining, char *err, size_t errlen) {
+    const uint64_t hd = DS4_N_HEAD_DIM, idim = DS4_N_INDEXER_HEAD_DIM, row = hd * sizeof(float);
+    const uint32_t lo = dsv41_payload_ring_lo(P);
+    for (uint32_t il = 0; il < g->n_layer; il++) {
+        uint32_t n_comp = 0, pos0 = 0, rows = 0;
+        if (payload_read_u32(fp, &n_comp, remaining, err, errlen) != 0 ||
+            payload_read_u32(fp, &pos0, remaining, err, errlen) != 0 ||
+            payload_read_u32(fp, &rows, remaining, err, errlen) != 0) return 1;
+        if (n_comp > st->max_pos || (n_comp && !g->ckv[il]) || (rows && !g->pass_kv[il]) ||
+            (rows && (uint64_t)rows * row > ds4_gpu_tensor_bytes(g->pass_kv[il]))) {
+            payload_set_err(err, errlen, "KV checkpoint was written for a different DeepSeek V4.1 layout");
+            return 1;
+        }
+        st->n_comp[il] = n_comp;
+        g->pass_pos0[il] = pos0;
+        g->pass_rows[il] = rows;
+    }
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = 0;
+    for (uint32_t il = 0; rc == 0 && il < g->n_layer; il++) {
+        rc = dsv41_payload_ring_io(fp, g->ring[il], 0, g->ring_slots, lo, P, row, false, buf, remaining, err, errlen);
+        if (rc == 0 && g->ckv[il]) {
+            rc = payload_read_tensor_span(fp, g->ckv[il], 0, (uint64_t)st->n_comp[il] * row, buf,
+                                          DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            if (rc == 0) {
+                rc = payload_read_tensor_span(fp, g->ikey[il], 0, (uint64_t)st->n_comp[il] * idim * sizeof(float),
+                                              buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            }
+        }
+        if (rc == 0 && g->pass_kv[il] && g->pass_rows[il]) {
+            rc = payload_read_tensor_span(fp, g->pass_kv[il], 0, (uint64_t)g->pass_rows[il] * row, buf,
+                                          DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            if (rc == 0) {
+                rc = payload_read_tensor_span(fp, g->pass_sc[il], 0, (uint64_t)g->pass_rows[il] * row, buf,
+                                              DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            }
+        }
+    }
+    for (uint32_t stg = 0; rc == 0 && stg < g->draft.n_stage; stg++) {
+        rc = dsv41_payload_ring_io(fp, g->dring, (uint64_t)stg * DS4_N_SWA * row, DS4_N_SWA, lo, P, row,
+                                   false, buf, remaining, err, errlen);
+    }
+    free(buf);
+    g->mh_rows = 0;
+    return rc;
+}
+
+static uint64_t dsv41_session_payload_bytes(ds4_session *s) {
+    const dsv41_session_state *ss = s->dsv41;
+    if (!ss) return 0;
+    uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
+    bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
+    bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
+    bytes += 3ull * ss->win.n_layer * sizeof(uint32_t);
+    return bytes + dsv41_payload_tensor_bytes(&ss->win, &ss->st, (uint32_t)s->checkpoint.len);
+}
+
+static int dsv41_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    dsv41_session_state *ss = s->dsv41;
+    if (!ss || ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen, "failed to synchronize accelerator before DeepSeek V4.1 snapshot");
+        return 1;
+    }
+    const uint32_t P = (uint32_t)s->checkpoint.len;
+    const uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
+        DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION, (uint32_t)s->ctx_size, s->prefill_cap,
+        ss->cap, DS4_N_SWA, DS4_N_HEAD_DIM, P, ss->win.n_layer, DS4_N_INDEXER_HEAD_DIM, DS4_N_VOCAB,
+        ss->win.draft.n_stage, ss->has_engram ? 1u : 0u,
+    };
+    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
+        if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
+    }
+    for (uint32_t i = 0; i < P; i++) {
+        if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
+    }
+    if (payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
+    return dsv41_payload_write(fp, &ss->win, &ss->st, P, err, errlen);
+}
+
+static int dsv41_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h, uint64_t *remaining,
+                                      char *err, size_t errlen) {
+    dsv41_session_state *ss = s->dsv41;
+    const uint32_t P = h[7];
+    if (!ss || P >= (uint32_t)s->ctx_size || P + 1u > ss->cap) {
+        payload_set_err(err, errlen, "KV checkpoint does not fit current context");
+        return 1;
+    }
+    if (h[5] != DS4_N_SWA || h[6] != DS4_N_HEAD_DIM || h[8] != ss->win.n_layer ||
+        h[9] != DS4_N_INDEXER_HEAD_DIM || h[10] != DS4_N_VOCAB || h[11] != ss->win.draft.n_stage ||
+        h[12] != (ss->has_engram ? 1u : 0u)) {
+        payload_set_err(err, errlen, "KV checkpoint was written for a different DeepSeek V4.1 setup");
+        return 1;
+    }
+    token_vec new_checkpoint = {0};
+    for (uint32_t i = 0; i < P; i++) {
+        uint32_t tok = 0;
+        if (payload_read_u32(fp, &tok, remaining, err, errlen) != 0) {
+            token_vec_free(&new_checkpoint);
+            return 1;
+        }
+        token_vec_push(&new_checkpoint, (int)tok);
+    }
+    if (payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), remaining, err, errlen) != 0) {
+        token_vec_free(&new_checkpoint);
+        return 1;
+    }
+    dsv41_session_state_reset(ss);
+    if (dsv41_payload_read(fp, &ss->win, &ss->st, P, remaining, err, errlen) != 0) {
+        token_vec_free(&new_checkpoint);
+        return 1;
+    }
+    if (*remaining != 0) {
+        token_vec_free(&new_checkpoint);
+        payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
+        return 1;
+    }
+    if (ds4_gpu_synchronize() == 0) {
+        token_vec_free(&new_checkpoint);
+        payload_set_err(err, errlen, "failed to synchronize accelerator after DeepSeek V4.1 KV restore");
+        return 1;
+    }
+    dsv41_session_note(ss, new_checkpoint.v, P, 0);
+    token_vec_free(&s->checkpoint);
+    s->checkpoint = new_checkpoint;
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    return 0;
+}
+
 static bool dsv41_session_step(dsv41_session_state *ss, const ds4_model *m,
                                const ds4_weights *w, const int *tokens, uint32_t n,
                                uint32_t pos0, float *logits) {
@@ -71051,6 +71269,99 @@ done:
     dsv41_ref_state_free(&st);
     model_close(&m);
     return made;
+}
+
+/* Checkpoint round trip on the GPU path: prefill `split` tokens, write the state's payload,
+ * read it into a fresh state whose window is `chunk2` wide, then finish the prompt and
+ * generate `n_predict` tokens from both -- the same chunks, so the two must agree bit for
+ * bit.  gen_a/lg_a are the original state's, gen_b/lg_b the restored one's. */
+int ds4_test_dsv41_gpu_payload(const char *path, const char *engram_path,
+                               const int *tokens, unsigned n_tokens, unsigned split,
+                               unsigned n_predict, unsigned chunk, unsigned chunk2,
+                               int *gen_a, int *gen_b, float *lg_a, float *lg_b) {
+    ds4_model m;
+    ds4_weights w;
+    model_open(&m, path, true, false);
+    config_validate_model(&m);
+    weights_bind(&w, &m, false, 0, UINT32_MAX, true, false);
+    if (!ds4_gpu_init() || !ds4_gpu_set_model_map(m.map, m.size)) {
+        model_close(&m);
+        return -1;
+    }
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const uint32_t total = n_tokens + n_predict;
+    int *hist = xmalloc(total * sizeof(int));
+    memcpy(hist, tokens, n_tokens * sizeof(int));
+    for (unsigned i = n_tokens; i < total; i++) hist[i] = tokens[n_tokens - 1u];
+    dsv41_ref_engram_run eng;
+    dsv41_ref_engram_open(&eng, engram_path, hist, total);
+    const dsv41_ref_engram *ec = eng.open ? &eng.ctx : NULL;
+    dsv41_gpu_engram ge;
+    dsv41_gpu_rope rope0 = {0}, ropec = {0};
+    dsv41_ref_state st[2];
+    dsv41_gpu_window win[2] = {{0}, {0}};
+    dsv41_ref_state_init(&st[0], n_trunk, total + 1u);
+    dsv41_ref_state_init(&st[1], n_trunk, total + 1u);
+    int rc = -1;
+    char err[160];
+    char *mem = NULL;
+    size_t mem_len = 0;
+    float *lg = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    if (!dsv41_gpu_engram_open(&ge, ec) ||
+        !dsv41_gpu_rope_open(&rope0, &st[0].f0) || !dsv41_gpu_rope_open(&ropec, &st[0].fc) ||
+        !dsv41_gpu_window_open(&win[0], n_trunk, total + 1u, chunk, NULL) ||
+        !dsv41_gpu_window_open(&win[1], n_trunk, total + 1u, chunk2, NULL) ||
+        !(win[0].consts = dsv41_gpu_consts_open(&m, &w, win[0].n_consts = n_trunk)) ||
+        !(win[1].consts = dsv41_gpu_consts_open(&m, &w, win[1].n_consts = n_trunk))) goto done;
+    if (dsv41_gpu_prefill(&m, &w, &st[0], hist, split, 0, ec, &ge, &rope0, &ropec, &win[0], chunk,
+                          lg, NULL, NULL, NULL) != DSV41_PREFILL_OK) goto done;
+    {
+        FILE *fp = open_memstream(&mem, &mem_len);
+        if (!fp || ds4_gpu_synchronize() == 0 ||
+            dsv41_payload_write(fp, &win[0], &st[0], split, err, sizeof(err)) != 0 || fclose(fp) != 0) goto done;
+        const uint64_t expect = dsv41_payload_tensor_bytes(&win[0], &st[0], split) +
+                                3ull * n_trunk * sizeof(uint32_t);
+        if ((uint64_t)mem_len != expect) {
+            fprintf(stderr, "ds4: V4.1 payload is %zu bytes, %llu expected\n", mem_len, (unsigned long long)expect);
+            goto done;
+        }
+        fp = fmemopen(mem, mem_len, "rb");
+        uint64_t remaining = mem_len;
+        if (!fp || dsv41_payload_read(fp, &win[1], &st[1], split, &remaining, err, sizeof(err)) != 0 ||
+            remaining != 0 || ds4_gpu_synchronize() == 0) {
+            if (fp) fclose(fp);
+            fprintf(stderr, "ds4: V4.1 payload read failed: %s\n", err);
+            goto done;
+        }
+        fclose(fp);
+    }
+    for (int side = 0; side < 2; side++) {
+        int *gen = side ? gen_b : gen_a;
+        float *out = side ? lg_b : lg_a;
+        if (dsv41_gpu_prefill(&m, &w, &st[side], hist + split, n_tokens - split, split, ec, &ge,
+                              &rope0, &ropec, &win[side], chunk, lg, NULL, NULL, NULL) != DSV41_PREFILL_OK) goto done;
+        for (unsigned i = n_tokens; ; i++) {
+            int best = 0;
+            for (uint32_t v = 1; v < DS4_N_VOCAB; v++) if (lg[v] > lg[best]) best = (int)v;
+            if (gen) gen[i - n_tokens] = best;
+            if (i + 1u >= total) { if (out) memcpy(out, lg, (size_t)DS4_N_VOCAB * sizeof(float)); break; }
+            hist[i] = best;
+            if (eng.open) { eng.ids[i] = engram_compress_token(&g_ds4_engram, best); eng.dead[i] = 0; }
+            if (!dsv41_gpu_forward_token(&m, &w, &st[side], &hist[i], 1u, i, ec, &ge, &rope0, &ropec,
+                                         &win[side], lg, NULL, DSV41_PHASE_ALL)) goto done;
+        }
+    }
+    rc = 0;
+done:
+    free(mem); free(lg);
+    dsv41_gpu_window_close(&win[0]); dsv41_gpu_window_close(&win[1]);
+    dsv41_gpu_rope_close(&rope0); dsv41_gpu_rope_close(&ropec);
+    dsv41_gpu_engram_close(&ge);
+    dsv41_ref_engram_close(&eng);
+    free(hist);
+    dsv41_ref_state_free(&st[0]); dsv41_ref_state_free(&st[1]);
+    model_close(&m);
+    return rc;
 }
 
 /* Rollback check for the speculative path: prefill `split` tokens, then run a verify-style

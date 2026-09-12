@@ -30,6 +30,8 @@ int ds4_test_dsv41_prefill(const char *, const int *, unsigned, float *, float *
                            float *, int32_t *, float *, const char *);
 int ds4_test_dsv41_gpu_picks(const char *, const int *, unsigned, unsigned, unsigned, int32_t *);
 int ds4_test_dsv41_gpu_rollback(const char *, const int *, unsigned, unsigned, unsigned, float *, float *);
+int ds4_test_dsv41_gpu_payload(const char *, const char *, const int *, unsigned, unsigned, unsigned,
+                               unsigned, unsigned, int *, int *, float *, float *);
 unsigned ds4_test_dsv41_gpu_draft(const char *, const char *, const char *, const int *, unsigned,
                                   int *, float *, float *, int *, float *, float *, float *);
 
@@ -184,6 +186,29 @@ int main(int argc, char **argv) {
         free(ra); free(rb);
         printf("v4.1 speculative rollback: %s\n", rfail ? "FAILED" : "a rejected tail leaves no trace");
         if (rfail) fail = 1;
+
+        /* A checkpoint written mid-prompt and read into a window of another width must
+         * continue exactly as the original state does. */
+        int cfail = 0;
+        const unsigned csplits[] = { 5, 11, n - 2 };
+        for (unsigned i = 0; i < sizeof(csplits) / sizeof(csplits[0]); i++) {
+            enum { NP = 4 };
+            int ga[NP], gb[NP];
+            float *la = malloc(vocab * sizeof(float)), *lb = malloc(vocab * sizeof(float));
+            const int ok = ds4_test_dsv41_gpu_payload(gguf, engram, tokens, n, csplits[i], NP, 7u, 9u,
+                                                      ga, gb, la, lb) == 0;
+            double worst = 0.0;
+            int same = ok;
+            for (unsigned v = 0; ok && v < vocab; v++) worst = fmax(worst, fabs((double)la[v] - lb[v]));
+            for (unsigned j = 0; ok && j < NP; j++) if (ga[j] != gb[j]) same = 0;
+            const int pass = ok && same && worst == 0.0;
+            if (!pass) cfail = 1;
+            printf("  checkpoint split %-2u %s  tokens %s, max|d|=%.3e\n", csplits[i], pass ? "ok  " : "FAIL",
+                   same ? "identical" : "DIFFER", worst);
+            free(la); free(lb);
+        }
+        printf("v4.1 checkpoint round trip: %s\n", cfail ? "FAILED" : "a restored state continues bit for bit");
+        if (cfail) fail = 1;
     }
 
     if (real && dspark) {
