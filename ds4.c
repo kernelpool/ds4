@@ -57290,6 +57290,8 @@ typedef struct {
     uint8_t fingerprint[32];
 } ds4_vision_identity;
 
+typedef struct dsv41_session_state dsv41_session_state;
+
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
@@ -57301,6 +57303,7 @@ struct ds4_session {
     bool glm_graph_ready;
     ds4_qwen4_gpu_graph qwen4_graph;
     bool qwen4_graph_ready;
+    dsv41_session_state *dsv41;
     float *qwen4_verify_logits;
     uint64_t qwen4_spec_cycles;
     uint64_t qwen4_spec_accepted;
@@ -58310,6 +58313,10 @@ static bool ds4_session_is_glm(const ds4_session *s) {
 
 static bool ds4_session_is_qwen4(const ds4_session *s) {
     return s && s->engine && ds4_model_is_qwen4();
+}
+
+static bool ds4_session_is_dsv41(const ds4_session *s) {
+    return s && s->engine && ds4_model_is_dsv41();
 }
 
 #ifndef DS4_NO_GPU
@@ -61447,7 +61454,7 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
-    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
+    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_dsv41(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
     }
@@ -61926,7 +61933,7 @@ int ds4_engine_generate_argmax(
                     ds4_backend_name(e->backend));
             return 1;
         }
-        if (e->multi_tier) {
+        if (e->multi_tier || ds4_model_is_dsv41()) {
             ds4_session *s = NULL;
             char err[256] = {0};
             const double t_prefill0 = now_sec();
@@ -65723,6 +65730,1463 @@ static DS4_MAYBE_UNUSED void dsv41_ref_decode(const ds4_model *m, const ds4_weig
 }
 
 
+#ifndef DS4_NO_GPU
+/* --------------------------------------------------------------------------
+ * The V4.1 attention sub-block composed entirely from the Metal kernels, for one
+ * decode step.  It mirrors dsv41_ref_attn_step exactly, so the CPU reference --
+ * which is scored stage by stage against the released implementation -- is the
+ * parity oracle for the whole composition, not just for each kernel in isolation.
+ *
+ * The caches still live on the host here: only the arithmetic moves.  Wiring the
+ * caches into GPU residency is a separate step.
+ * ------------------------------------------------------------------------ */
+
+#define DSV41_GPU_MAX_HC 8
+
+typedef struct {
+    ds4_gpu_tensor *t;
+    uint64_t bytes;
+} dsv41_gpu_buf;
+
+static bool dsv41_gpu_buf_alloc(dsv41_gpu_buf *b, uint64_t n_floats) {
+    b->bytes = n_floats * sizeof(float);
+    b->t = ds4_gpu_tensor_alloc(b->bytes);
+    return b->t != NULL;
+}
+
+static bool dsv41_gpu_buf_put(dsv41_gpu_buf *b, const float *src, uint64_t n) {
+    return ds4_gpu_tensor_write(b->t, 0, src, n * sizeof(float)) != 0;
+}
+
+/* A readback needs the encoded work to have RUN, not merely to have been committed:
+ * end_commands commits and waits, and the batch reopens for whatever follows.  With no
+ * batch open every dispatch already ran synchronously, so there is nothing to wait for. */
+static bool dsv41_gpu_buf_get(const dsv41_gpu_buf *b, float *dst, uint64_t n) {
+    if (ds4_gpu_commands_active()) {
+        (void)ds4_gpu_end_commands();
+        (void)ds4_gpu_begin_commands();
+    }
+    return ds4_gpu_tensor_read(b->t, 0, dst, n * sizeof(float)) != 0;
+}
+
+
+/* Environment switches read once.  Several of these sat in per-token loops, where
+ * getenv's scan of the environment ran thousands of times a token. */
+static bool dsv41_env(const char *name, int *cache) {
+    if (*cache < 0) *cache = getenv(name) != NULL;
+    return *cache != 0;
+}
+static int g_dsv41_env_host_select = -1, g_dsv41_env_attn_only = -1;
+static int g_dsv41_env_moe_only = -1, g_dsv41_env_moe_grouped = -1;
+
+/* A model-resident mat-vec at whatever precision the checkpoint stores: the mini model is
+ * F32 throughout, the released one mixes F16 and Q8_0. */
+static bool dsv41_gpu_matvec(const ds4_model *m, const ds4_tensor *t, uint64_t offset,
+                             uint64_t in_dim, uint64_t out_dim, uint64_t rows,
+                             const ds4_gpu_tensor *x, ds4_gpu_tensor *out) {
+    if (t->type == DS4_TENSOR_F32) {
+        return ds4_gpu_matmul_f32_tensor(out, m->map, m->size, offset,
+                                         in_dim, out_dim, x, rows) != 0;
+    }
+    if (t->type == DS4_TENSOR_F16) {
+        return ds4_gpu_matmul_f16_tensor(out, m->map, m->size, offset,
+                                         in_dim, out_dim, x, rows) != 0;
+    }
+    return ds4_gpu_matmul_quant_tensor(out, m->map, m->size, offset, t->type,
+                                       in_dim, out_dim, x, rows) != 0;
+}
+
+/* Two projections reading the same input, in one dispatch.  The pair kernel takes a
+ * single row, so a prefill chunk keeps the two separate calls. */
+static bool dsv41_gpu_matvec_pair(const ds4_model *m,
+                                  const ds4_tensor *t0, const ds4_tensor *t1,
+                                  uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+                                  uint64_t rows, const ds4_gpu_tensor *x,
+                                  ds4_gpu_tensor *o0, ds4_gpu_tensor *o1) {
+    if (rows == 1u && t0->type == DS4_TENSOR_Q8_0 && t1->type == DS4_TENSOR_Q8_0 &&
+        ds4_gpu_matmul_q8_0_pair_tensor(o0, o1, m->map, m->size,
+                                        t0->abs_offset, t1->abs_offset,
+                                        in_dim, out0_dim, out1_dim, x, 1) != 0) {
+        return true;
+    }
+    return dsv41_gpu_matvec(m, t0, t0->abs_offset, in_dim, out0_dim, rows, x, o0) &&
+           dsv41_gpu_matvec(m, t1, t1->abs_offset, in_dim, out1_dim, rows, x, o1);
+}
+
+/* The released checkpoint's experts, through DS4's fused routed-MoE kernels.
+ *
+ * V4.1's expert is DS4's existing one: the fused MXFP4 pair+SwiGLU kernel already applies
+ * min(gate, clamp) / clamp(up) / silu * routed weight, so the whole routed set is one
+ * dispatch pair.  The shared expert is a dense SwiGLU FFN at weight 1 and rides in as the
+ * down step's addend, which is what `add_in` exists for. */
+static bool dsv41_gpu_moe_fused(const ds4_model *m, const ds4_layer_weights *l, uint32_t il,
+                                uint32_t n_exp, uint32_t topk, uint32_t rows,
+                                const ds4_gpu_tensor *x,
+                                const ds4_gpu_tensor *sel, const ds4_gpu_tensor *wts,
+                                ds4_gpu_tensor *out) {
+    const uint32_t dim = DS4_N_EMBD, ff = DS4_N_FF_EXP;
+    const uint64_t g_row = routed_expert_row_bytes(l->ffn_gate_exps);
+    const uint64_t d_row = routed_expert_row_bytes(l->ffn_down_exps);
+    const uint64_t g_exp = l->ffn_gate_exps->dim[1] * g_row;
+    const uint64_t d_exp = l->ffn_down_exps->dim[1] * d_row;
+
+    bool ok = true;
+    dsv41_gpu_buf b_g = {0}, b_u = {0}, b_mid = {0}, b_dn = {0}, b_sh = {0}, b_sa = {0};
+    ok = ok && dsv41_gpu_buf_alloc(&b_g, (uint64_t)rows * topk * ff);
+    ok = ok && dsv41_gpu_buf_alloc(&b_u, (uint64_t)rows * topk * ff);
+    ok = ok && dsv41_gpu_buf_alloc(&b_mid, (uint64_t)rows * topk * ff);
+    ok = ok && dsv41_gpu_buf_alloc(&b_dn, (uint64_t)rows * topk * dim);
+    ok = ok && dsv41_gpu_buf_alloc(&b_sh, (uint64_t)rows * dim);
+    ok = ok && dsv41_gpu_buf_alloc(&b_sa, (uint64_t)rows * ff);
+
+    /* the shared expert is a dense FFN, so the whole chunk goes through it at once; it
+     * borrows the routed gate/up scratch, which the fused calls below overwrite anyway */
+    ok = ok && dsv41_gpu_matvec_pair(m, l->ffn_gate_shexp, l->ffn_up_shexp,
+                                     dim, ff, ff, rows, x, b_g.t, b_u.t);
+    ok = ok && ds4_gpu_swiglu_tensor(b_sa.t, b_g.t, b_u.t, rows * ff,
+                                     DS4_SWIGLU_CLAMP_EXP, 1.0f);
+    ok = ok && dsv41_gpu_matvec(m, l->ffn_down_shexp, l->ffn_down_shexp->abs_offset,
+                                ff, dim, rows, b_sa.t, b_sh.t);
+
+    /* The addend only reaches the fused pair+sum6 decode path, which is a top-6 kernel.
+     * Folding also disqualifies the specialized MXFP4 decode family, whose gate wants
+     * add_in == NULL -- but that family measures no faster here than the generic one, so
+     * the fold stays and saves a dispatch. */
+    const bool fold_shared = (topk == 6u);
+
+    /* The grouped matmul launches a tile per (token, expert) pair where the decode kernels
+     * launch one thin row per token.  Opt-in for now: it stages the activations and the
+     * SwiGLU intermediate as half, which moves the released model's logits by ~5e-02
+     * relative against the per-token F32 path this chain is scored on, for 1.24x at chunk
+     * 512 and nothing at the default 64.  Above 1024 rows its scratch stops being
+     * allocatable. */
+    bool mid_f16 = false;
+    if (ok && rows > 1u && rows <= 1024u &&
+        dsv41_env("DS4_DSV41_MOE_GROUPED", &g_dsv41_env_moe_grouped) &&
+        ds4_gpu_routed_moe_batch_tensor(out, b_g.t, b_u.t, b_mid.t, b_dn.t,
+                                        m->map, m->size,
+                                        l->ffn_gate_exps->abs_offset,
+                                        l->ffn_up_exps->abs_offset,
+                                        l->ffn_down_exps->abs_offset,
+                                        l->ffn_gate_exps->type, l->ffn_down_exps->type,
+                                        g_exp, g_row, d_exp, d_row,
+                                        dim, ff, dim, sel, wts, n_exp, topk,
+                                        DS4_SWIGLU_CLAMP_EXP, x, il, rows,
+                                        &mid_f16, false) != 0) {
+        /* the batched kernel has no addend, so the shared expert lands after it */
+        ok = ds4_gpu_add_tensor(out, out, b_sh.t,
+                                (uint32_t)((uint64_t)rows * dim)) != 0;
+        goto done;
+    }
+
+    for (uint32_t t = 0; t < rows && ok; t++) {
+        ds4_gpu_tensor *v_x = ds4_gpu_tensor_view((ds4_gpu_tensor *)x,
+                (uint64_t)t * dim * sizeof(float), (uint64_t)dim * sizeof(float));
+        ds4_gpu_tensor *v_o = ds4_gpu_tensor_view(out,
+                (uint64_t)t * dim * sizeof(float), (uint64_t)dim * sizeof(float));
+        ds4_gpu_tensor *v_sh = ds4_gpu_tensor_view(b_sh.t,
+                (uint64_t)t * dim * sizeof(float), (uint64_t)dim * sizeof(float));
+        ds4_gpu_tensor *v_s = ds4_gpu_tensor_view((ds4_gpu_tensor *)sel,
+                (uint64_t)t * topk * sizeof(int32_t), (uint64_t)topk * sizeof(int32_t));
+        ds4_gpu_tensor *v_w = ds4_gpu_tensor_view((ds4_gpu_tensor *)wts,
+                (uint64_t)t * topk * sizeof(float), (uint64_t)topk * sizeof(float));
+        ok = v_x && v_o && v_sh && v_s && v_w &&
+             ds4_gpu_routed_moe_one_tensor(v_o, b_g.t, b_u.t, b_mid.t, b_dn.t,
+                                           m->map, m->size,
+                                           l->ffn_gate_exps->abs_offset,
+                                           l->ffn_up_exps->abs_offset,
+                                           l->ffn_down_exps->abs_offset,
+                                           l->ffn_gate_exps->type,
+                                           l->ffn_down_exps->type,
+                                           g_exp, g_row, d_exp, d_row,
+                                           dim, ff, dim, v_s, v_w, n_exp, topk,
+                                           DS4_SWIGLU_CLAMP_EXP, v_x,
+                                           fold_shared ? v_sh : NULL, il, false) != 0;
+        ok = ok && (fold_shared || ds4_gpu_add_tensor(v_o, v_o, v_sh, dim) != 0);
+        ds4_gpu_tensor_free(v_x); ds4_gpu_tensor_free(v_o); ds4_gpu_tensor_free(v_sh);
+        ds4_gpu_tensor_free(v_s); ds4_gpu_tensor_free(v_w);
+    }
+
+done:
+    ds4_gpu_tensor_free(b_g.t); ds4_gpu_tensor_free(b_u.t); ds4_gpu_tensor_free(b_mid.t);
+    ds4_gpu_tensor_free(b_dn.t); ds4_gpu_tensor_free(b_sh.t); ds4_gpu_tensor_free(b_sa.t);
+    return ok;
+}
+
+/* The MoE sublayer for one decode token, composed from the kernels.
+ *
+ * Only the routing needed a new kernel.  Quantized experts go through the fused path
+ * above; the mini model's F32 experts have no fused kernel, so they walk the selected set
+ * one at a time through ds4_gpu_matmul_f32_tensor at a per-expert weight offset.  DS4's
+ * existing kernel_swiglu_f32 already has V4.1's asymmetric clamp (gate from above only, up
+ * on both sides) and a scalar weight, which is exactly the routed weight.
+ */
+static bool dsv41_gpu_moe_step(const ds4_model *m, const ds4_weights *w, uint32_t il,
+                               uint32_t rows, const ds4_gpu_tensor *x,
+                               ds4_gpu_tensor *out) {
+    const ds4_layer_weights *l = &w->layer[il];
+    const uint32_t dim = DS4_N_EMBD, ff = DS4_N_FF_EXP;
+    const uint32_t n_exp = ds4_layer_expert_count(il), topk = DS4_N_EXPERT_USED;
+    const bool fused = l->ffn_gate_exps->type != DS4_TENSOR_F32;
+
+    bool ok = true;
+    dsv41_gpu_buf b_log = {0}, b_bias = {0}, b_w = {0}, b_g = {0}, b_u = {0};
+    dsv41_gpu_buf b_act = {0}, b_e = {0};
+    ds4_gpu_tensor *t_idx = NULL;
+    int32_t *idx_all = NULL;
+    float *wt_all = NULL;
+
+    ok = ok && dsv41_gpu_buf_alloc(&b_log, (uint64_t)rows * n_exp);
+    ok = ok && dsv41_gpu_buf_alloc(&b_bias, n_exp);
+    ok = ok && dsv41_gpu_buf_alloc(&b_w, (uint64_t)rows * topk);
+    if (!fused) {
+        idx_all = xmalloc((size_t)rows * topk * sizeof(int32_t));
+        wt_all = xmalloc((size_t)rows * topk * sizeof(float));
+        ok = ok && dsv41_gpu_buf_alloc(&b_g, ff) && dsv41_gpu_buf_alloc(&b_u, ff);
+        ok = ok && dsv41_gpu_buf_alloc(&b_act, ff);
+        ok = ok && dsv41_gpu_buf_alloc(&b_e, dim);
+    }
+    t_idx = ds4_gpu_tensor_alloc((uint64_t)rows * topk * sizeof(int32_t));
+    ok = ok && t_idx != NULL;
+    if (ok) {
+        float *bias = xcalloc(n_exp, sizeof(float));
+        if (l->ffn_exp_probs_b) {
+            memcpy(bias, qwen4_ref_f32(m, l->ffn_exp_probs_b), n_exp * sizeof(float));
+        }
+        ok = dsv41_gpu_buf_put(&b_bias, bias, n_exp);
+        free(bias);
+    }
+    if (!ok) goto done;
+
+    ok = ok && dsv41_gpu_matvec(m, l->ffn_gate_inp, l->ffn_gate_inp->abs_offset,
+                                dim, n_exp, rows, x, b_log.t);
+    ok = ok && ds4_gpu_dsv41_route(rows, n_exp, topk, DS4_EXPERT_WEIGHT_SCALE, 1,
+                                   b_log.t, b_bias.t, t_idx, b_w.t);
+    if (!ok) goto done;
+    if (fused) {
+        ok = dsv41_gpu_moe_fused(m, l, il, n_exp, topk, rows, x, t_idx, b_w.t, out);
+        goto done;
+    }
+    /* the selection has to come back to the host: an F32 expert is addressed by a weight
+     * offset, not by an id the kernel resolves.  buf_get waits for the routing kernel to
+     * have RUN; flushing alone only commits it. */
+    ok = dsv41_gpu_buf_get(&b_w, wt_all, (uint64_t)rows * topk);
+    ok = ok && ds4_gpu_tensor_read(t_idx, 0, idx_all,
+                                   (uint64_t)rows * topk * sizeof(int32_t)) != 0;
+    if (!ok) goto done;
+
+    for (uint32_t t = 0; t < rows && ok; t++) {
+        const int32_t *idx = idx_all + (size_t)t * topk;
+        const float *wt = wt_all + (size_t)t * topk;
+        ds4_gpu_tensor *v_x = ds4_gpu_tensor_view((ds4_gpu_tensor *)x,
+                (uint64_t)t * dim * sizeof(float), (uint64_t)dim * sizeof(float));
+        ds4_gpu_tensor *v_o = ds4_gpu_tensor_view(out,
+                (uint64_t)t * dim * sizeof(float), (uint64_t)dim * sizeof(float));
+        ok = v_x != NULL && v_o != NULL;
+        /* the first expert writes `out`, the rest accumulate -- no separate zeroing */
+        for (uint32_t s = 0; s <= topk && ok; s++) {
+            const bool shared = (s == topk);
+            const uint64_t e = shared ? 0u : (uint64_t)idx[s];
+            const float weight = shared ? 1.0f : wt[s];
+            const ds4_tensor *t1 = shared ? l->ffn_gate_shexp : l->ffn_gate_exps;
+            const ds4_tensor *t3 = shared ? l->ffn_up_shexp : l->ffn_up_exps;
+            const ds4_tensor *t2 = shared ? l->ffn_down_shexp : l->ffn_down_exps;
+            const uint64_t off1 = t1->abs_offset + e * ff * dim * sizeof(float);
+            const uint64_t off3 = t3->abs_offset + e * ff * dim * sizeof(float);
+            const uint64_t off2 = t2->abs_offset + e * dim * ff * sizeof(float);
+
+            ok = ok && ds4_gpu_matmul_f32_tensor(b_g.t, m->map, m->size, off1, dim, ff, v_x, 1);
+            ok = ok && ds4_gpu_matmul_f32_tensor(b_u.t, m->map, m->size, off3, dim, ff, v_x, 1);
+            ok = ok && ds4_gpu_swiglu_tensor(b_act.t, b_g.t, b_u.t, ff,
+                                             DS4_SWIGLU_CLAMP_EXP, weight);
+            if (s == 0) {
+                ok = ok && ds4_gpu_matmul_f32_tensor(v_o, m->map, m->size, off2, ff, dim,
+                                                     b_act.t, 1);
+            } else {
+                ok = ok && ds4_gpu_matmul_f32_tensor(b_e.t, m->map, m->size, off2, ff, dim,
+                                                     b_act.t, 1);
+                ok = ok && ds4_gpu_add_tensor(v_o, v_o, b_e.t, dim);
+            }
+        }
+        ds4_gpu_tensor_free(v_x); ds4_gpu_tensor_free(v_o);
+    }
+
+done:
+    ds4_gpu_tensor_free(b_log.t); ds4_gpu_tensor_free(b_bias.t); ds4_gpu_tensor_free(b_w.t);
+    ds4_gpu_tensor_free(b_g.t); ds4_gpu_tensor_free(b_u.t); ds4_gpu_tensor_free(b_act.t);
+    ds4_gpu_tensor_free(b_e.t);
+    if (t_idx) ds4_gpu_tensor_free(t_idx);
+    free(idx_all); free(wt_all);
+    return ok;
+}
+
+/* The engram's GPU side.  The 203 GB tables stay on the CPU exactly as they are for the
+ * reference -- a token touches 24 rows of 256 values, gathered straight out of the page
+ * cache -- so only the gathered rows cross to the GPU.  The dense wkv projection is
+ * 314.6 MB per engram layer and is uploaded once, because the sidecar is a second mapping
+ * and registering it would evict the backbone's model views. */
+typedef struct {
+    ds4_gpu_tensor *wkv[DS4_MAX_ENGRAM_LAYER];
+    ds4_gpu_tensor *qw[DS4_MAX_ENGRAM_LAYER];
+    ds4_gpu_tensor *kw[DS4_MAX_ENGRAM_LAYER];
+    uint32_t n_layer;
+} dsv41_gpu_engram;
+
+static void dsv41_gpu_engram_close(dsv41_gpu_engram *g) {
+    for (uint32_t i = 0; i < DS4_MAX_ENGRAM_LAYER; i++) {
+        ds4_gpu_tensor_free(g->wkv[i]); ds4_gpu_tensor_free(g->qw[i]);
+        ds4_gpu_tensor_free(g->kw[i]);
+    }
+    memset(g, 0, sizeof(*g));
+}
+
+static bool dsv41_gpu_engram_open(dsv41_gpu_engram *g, const dsv41_ref_engram *eng) {
+    memset(g, 0, sizeof(*g));
+    if (!eng || !eng->m) return true;
+    const uint32_t hc_dim = DS4_N_EMBD * DS4_N_HC;
+    bool ok = true;
+    g->n_layer = eng->h->n_layer;
+    for (uint32_t li = 0; li < g->n_layer && ok; li++) {
+        const ds4_tensor *t = eng->w->wkv[li];
+        const uint64_t n = t->dim[0] * t->dim[1];
+        g->wkv[li] = ds4_gpu_tensor_alloc(n * sizeof(uint16_t));
+        ok = g->wkv[li] != NULL &&
+             ds4_gpu_tensor_write(g->wkv[li], 0, tensor_data(eng->m, t),
+                                  n * sizeof(uint16_t)) != 0;
+        float *tmp = xmalloc(hc_dim * sizeof(float));
+        g->qw[li] = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
+        g->kw[li] = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
+        ok = ok && g->qw[li] != NULL && g->kw[li] != NULL;
+        if (ok) {
+            engram_bf16_tensor(eng->m, eng->w->q_weight[li], tmp);
+            ok = ds4_gpu_tensor_write(g->qw[li], 0, tmp, hc_dim * sizeof(float)) != 0;
+            engram_bf16_tensor(eng->m, eng->w->k_weight[li], tmp);
+            ok = ok && ds4_gpu_tensor_write(g->kw[li], 0, tmp, hc_dim * sizeof(float)) != 0;
+        }
+        free(tmp);
+    }
+    if (!ok) dsv41_gpu_engram_close(g);
+    return ok;
+}
+
+/* Rewrites the stream entering block `il` for a whole chunk, the same position
+ * dsv41_ref_engram_inject holds in the CPU reference.  The rows are gathered on the host
+ * for every token, then wkv runs once over the chunk and the gate takes a token per
+ * threadgroup row.  `stream` is updated in place. */
+static bool dsv41_gpu_engram_step(const dsv41_ref_engram *eng, const dsv41_gpu_engram *g,
+                                  uint32_t il, uint32_t pos0, uint32_t n_tok,
+                                  ds4_gpu_tensor *stream) {
+    if (!eng || !eng->m) return true;
+    const uint32_t dim = DS4_N_EMBD, hc = DS4_N_HC;
+    const uint32_t in_dim = eng->h->n_bucket * DS4_N_ENGRAM_HEAD_DIM;
+    bool ok = true;
+    for (uint32_t li = 0; li < eng->h->n_layer && ok; li++) {
+        if (eng->h->layer_id[li] != il) continue;
+        dsv41_gpu_buf b_emb = {0}, b_kv = {0}, b_gate = {0};
+        ds4_gpu_tensor *t_dead = ds4_gpu_tensor_alloc((uint64_t)n_tok * sizeof(int32_t));
+        float *emb = xmalloc((size_t)n_tok * in_dim * sizeof(float));
+        for (uint32_t t = 0; t < n_tok; t++) {
+            engram_lookup(eng->m, eng->w, eng->h, li, eng->ids, eng->dead, pos0 + t,
+                          emb + (size_t)t * in_dim);
+        }
+        ok = t_dead != NULL &&
+             ds4_gpu_tensor_write(t_dead, 0, eng->dead + pos0,
+                                  (uint64_t)n_tok * sizeof(int32_t)) != 0 &&
+             dsv41_gpu_buf_alloc(&b_emb, (uint64_t)n_tok * in_dim) &&
+             dsv41_gpu_buf_put(&b_emb, emb, (uint64_t)n_tok * in_dim) &&
+             dsv41_gpu_buf_alloc(&b_kv, (uint64_t)n_tok * dim * (hc + 1u)) &&
+             dsv41_gpu_buf_alloc(&b_gate, (uint64_t)n_tok * hc);
+        ok = ok && ds4_gpu_dsv41_engram(NULL, 0, 0, in_dim, dim, hc, DS4_RMS_EPS,
+                                        n_tok, t_dead, b_emb.t, b_kv.t, stream,
+                                        g->qw[li], g->kw[li], b_gate.t, stream,
+                                        g->wkv[li]) != 0;
+        free(emb);
+        ds4_gpu_tensor_free(t_dead);
+        ds4_gpu_tensor_free(b_emb.t); ds4_gpu_tensor_free(b_kv.t);
+        ds4_gpu_tensor_free(b_gate.t);
+    }
+    return ok;
+}
+
+/* Per-layer constants a block uploads: the mHC scales and bases, the sinks and the
+ * compressor norm.  Held for the session so a block binds them instead of allocating
+ * and writing six small tensors per layer per call. */
+typedef struct {
+    ds4_gpu_tensor *hsc, *hba, *fsc, *fba, *sink, *cnorm;
+} dsv41_gpu_consts;
+
+/* What a decode step should not have to allocate or copy again.  The sliding window is
+ * the only cache the GPU both writes and reads within a step, so holding it on the device
+ * removes a readback and a 256 KB re-upload per block; the joined KV and the gathered
+ * index keys grow with context, so allocating them per block gets steadily more expensive
+ * as a session fills.  NULL keeps the per-block path, which is what the comparison
+ * harness scores against. */
+typedef struct {
+    /* The window is wider than the window: at win + chunk slots, a chunk's writes cannot
+     * reach a position any token in that chunk still attends to, so the whole chunk goes
+     * in with one move instead of a blit per token -- and each blit ended the encoder. */
+    ds4_gpu_tensor **ring;      /* [n_layer] of [win + chunk, hd] */
+    uint32_t ring_slots;
+    uint32_t n_layer;
+    dsv41_gpu_buf join;         /* [win + max_pos, hd] */
+    dsv41_gpu_buf sc;           /* [max_pos] */
+    /* selection, kept on the device: the picks per index-source layer, the candidate
+     * source's block decision, and the rank pass's scratch */
+    ds4_gpu_tensor **picks;     /* [n_layer] of [chunk][index_top_k] int32 */
+    uint32_t chunk;
+    dsv41_gpu_buf bscore;       /* [max_blocks] */
+    ds4_gpu_tensor *bkeep;      /* [max_blocks] int32 */
+    ds4_gpu_tensor *keep;       /* [max_pos] int32 */
+    ds4_gpu_tensor *bout;       /* [candidate_top_blocks] int32, compaction scratch */
+    ds4_gpu_tensor *rstate;     /* radix select: 5 u32 of refinement state */
+    ds4_gpu_tensor *rhist;      /* radix select: 256 u32 histogram */
+    /* the published compressed caches, on the device.  Only a layer that is its own kv
+     * source has them, which is 4 layers of 40; uploading them per block per token cost
+     * clen*hd floats a layer, which at long context is the whole budget. */
+    ds4_gpu_tensor **ckv;       /* [n_layer] of [max_pos, head_dim] or NULL */
+    ds4_gpu_tensor **ikey;      /* [n_layer] of [max_pos, index_head_dim] or NULL */
+    /* the compressor group a chunk boundary cut through, [ratio, head_dim] each; only a
+     * kv-source layer above ratio 1 has one */
+    ds4_gpu_tensor **pkv;
+    ds4_gpu_tensor **psc;
+    dsv41_gpu_consts *consts;   /* [n_layer] once bound, else NULL */
+} dsv41_gpu_window;
+
+static void dsv41_gpu_consts_free(dsv41_gpu_consts *c, uint32_t n_layer);
+
+static void dsv41_gpu_window_close(dsv41_gpu_window *g) {
+    ds4_gpu_tensor_free(g->join.t); ds4_gpu_tensor_free(g->sc.t); ds4_gpu_tensor_free(g->bscore.t);
+    ds4_gpu_tensor_free(g->bkeep); ds4_gpu_tensor_free(g->keep);
+    ds4_gpu_tensor_free(g->bout);
+    ds4_gpu_tensor_free(g->rstate); ds4_gpu_tensor_free(g->rhist);
+    if (g->ring) {
+        for (uint32_t i = 0; i < g->n_layer; i++) ds4_gpu_tensor_free(g->ring[i]);
+        free(g->ring);
+    }
+    if (g->picks) {
+        for (uint32_t i = 0; i < g->n_layer; i++) ds4_gpu_tensor_free(g->picks[i]);
+        free(g->picks);
+    }
+    if (g->ckv) {
+        for (uint32_t i = 0; i < g->n_layer; i++) ds4_gpu_tensor_free(g->ckv[i]);
+        free(g->ckv);
+    }
+    if (g->ikey) {
+        for (uint32_t i = 0; i < g->n_layer; i++) ds4_gpu_tensor_free(g->ikey[i]);
+        free(g->ikey);
+    }
+    if (g->pkv) {
+        for (uint32_t i = 0; i < g->n_layer; i++) ds4_gpu_tensor_free(g->pkv[i]);
+        free(g->pkv);
+    }
+    if (g->psc) {
+        for (uint32_t i = 0; i < g->n_layer; i++) ds4_gpu_tensor_free(g->psc[i]);
+        free(g->psc);
+    }
+    dsv41_gpu_consts_free(g->consts, g->n_layer);
+    memset(g, 0, sizeof(*g));
+}
+
+static bool dsv41_gpu_window_open(dsv41_gpu_window *g, uint32_t n_layer, uint32_t max_pos,
+                                  uint32_t chunk) {
+    memset(g, 0, sizeof(*g));
+    g->ring_slots = DS4_N_SWA + (chunk ? chunk : 1u);
+    const uint64_t ring_n = (uint64_t)g->ring_slots * DS4_N_HEAD_DIM;
+    g->ring = xcalloc(n_layer, sizeof(*g->ring));
+    g->n_layer = n_layer;
+    for (uint32_t i = 0; i < n_layer; i++) {
+        g->ring[i] = ds4_gpu_tensor_alloc(ring_n * sizeof(float));
+        if (!g->ring[i] || !ds4_gpu_tensor_fill_f32(g->ring[i], 0.0f, ring_n)) {
+            dsv41_gpu_window_close(g);
+            return false;
+        }
+    }
+    const uint32_t blk = DS4_N_CANDIDATE_BLOCK_SIZE ? DS4_N_CANDIDATE_BLOCK_SIZE : 1u;
+    const uint32_t max_blocks = (max_pos + blk - 1u) / blk;
+    g->picks = xcalloc(n_layer, sizeof(*g->picks));
+    g->chunk = chunk;
+    for (uint32_t i = 0; i < n_layer; i++) {
+        g->picks[i] = ds4_gpu_tensor_alloc((uint64_t)chunk * DS4_N_INDEXER_TOP_K *
+                                           sizeof(int32_t));
+        if (!g->picks[i]) { dsv41_gpu_window_close(g); return false; }
+    }
+    g->bkeep = ds4_gpu_tensor_alloc((uint64_t)max_blocks * sizeof(int32_t));
+    g->keep = ds4_gpu_tensor_alloc((uint64_t)max_pos * sizeof(int32_t));
+    g->bout = ds4_gpu_tensor_alloc((uint64_t)max_blocks * sizeof(int32_t));
+    g->rstate = ds4_gpu_tensor_alloc(5u * sizeof(uint32_t));
+    g->rhist = ds4_gpu_tensor_alloc(256u * sizeof(uint32_t));
+    g->ckv = xcalloc(n_layer, sizeof(*g->ckv));
+    g->ikey = xcalloc(n_layer, sizeof(*g->ikey));
+    g->pkv = xcalloc(n_layer, sizeof(*g->pkv));
+    g->psc = xcalloc(n_layer, sizeof(*g->psc));
+    for (uint32_t i = 0; i < n_layer; i++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(i);
+        if (ratio == 0 || g_ds4_kv_source_layer[i] != i) continue;
+        g->ckv[i] = ds4_gpu_tensor_alloc((uint64_t)max_pos * DS4_N_HEAD_DIM * sizeof(float));
+        g->ikey[i] = ds4_gpu_tensor_alloc((uint64_t)max_pos * DS4_N_INDEXER_HEAD_DIM *
+                                          sizeof(float));
+        if (!g->ckv[i] || !g->ikey[i]) { dsv41_gpu_window_close(g); return false; }
+        if (ratio > 1u) {
+            const uint64_t n = (uint64_t)ratio * DS4_N_HEAD_DIM;
+            g->pkv[i] = ds4_gpu_tensor_alloc(n * sizeof(float));
+            g->psc[i] = ds4_gpu_tensor_alloc(n * sizeof(float));
+            if (!g->pkv[i] || !g->psc[i]) { dsv41_gpu_window_close(g); return false; }
+        }
+    }
+    if (!dsv41_gpu_buf_alloc(&g->join, ((uint64_t)DS4_N_SWA + max_pos) * DS4_N_HEAD_DIM) ||
+        !dsv41_gpu_buf_alloc(&g->sc, max_pos) ||
+        !dsv41_gpu_buf_alloc(&g->bscore, max_blocks) ||
+        !g->bkeep || !g->keep || !g->bout || !g->rstate || !g->rhist) {
+        dsv41_gpu_window_close(g);
+        return false;
+    }
+    return true;
+}
+
+static bool dsv41_gpu_const_put(ds4_gpu_tensor **t, const ds4_model *m, const ds4_tensor *src,
+                                uint64_t n) {
+    if (!src) return true;
+    *t = ds4_gpu_tensor_alloc(n * sizeof(float));
+    return *t && ds4_gpu_tensor_write(*t, 0, qwen4_ref_f32(m, src), n * sizeof(float)) != 0;
+}
+
+static void dsv41_gpu_consts_free(dsv41_gpu_consts *c, uint32_t n_layer) {
+    if (!c) return;
+    for (uint32_t i = 0; i < n_layer; i++) {
+        ds4_gpu_tensor_free(c[i].hsc); ds4_gpu_tensor_free(c[i].hba);
+        ds4_gpu_tensor_free(c[i].fsc); ds4_gpu_tensor_free(c[i].fba);
+        ds4_gpu_tensor_free(c[i].sink); ds4_gpu_tensor_free(c[i].cnorm);
+    }
+    free(c);
+}
+
+static dsv41_gpu_consts *dsv41_gpu_consts_open(const ds4_model *m, const ds4_weights *w,
+                                               uint32_t n_layer) {
+    const uint32_t mix_hc = (2u + DS4_N_HC) * DS4_N_HC;
+    dsv41_gpu_consts *c = xcalloc(n_layer, sizeof(*c));
+    for (uint32_t il = 0; il < n_layer; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        const bool pool = ds4_layer_compress_ratio(il) > 1u && g_ds4_kv_source_layer[il] == il;
+        if (!dsv41_gpu_const_put(&c[il].hsc, m, l->hc_attn_scale, 3) ||
+            !dsv41_gpu_const_put(&c[il].hba, m, l->hc_attn_base, mix_hc) ||
+            !dsv41_gpu_const_put(&c[il].fsc, m, l->hc_ffn_scale, 3) ||
+            !dsv41_gpu_const_put(&c[il].fba, m, l->hc_ffn_base, mix_hc) ||
+            !dsv41_gpu_const_put(&c[il].sink, m, l->attn_sinks, DS4_N_HEAD) ||
+            !dsv41_gpu_const_put(&c[il].cnorm, m, pool ? l->attn_compressor_norm : NULL,
+                                 DS4_N_HEAD_DIM)) {
+            dsv41_gpu_consts_free(c, n_layer);
+            return NULL;
+        }
+    }
+    return c;
+}
+
+/* Compressor.forward over a chunk.  ratio 1 is a plain projection; above it the tokens
+ * are pooled in groups, and the group the chunk boundary cuts through is carried between
+ * calls -- on the device beside the ring, or on the host when there is no resident
+ * window.  Publishes the rotated latent and the index key of every group the chunk
+ * completes and advances n_comp.  One projection, one pool and one move per chunk, where
+ * this used to be a projection, a readback and two blits per token. */
+static bool dsv41_gpu_compress_chunk(const ds4_model *m, const ds4_layer_weights *l,
+                                     uint32_t il, dsv41_ref_state *st,
+                                     const dsv41_gpu_window *win_gpu, uint32_t ratio,
+                                     uint32_t pos0, uint32_t n_tok,
+                                     const ds4_gpu_tensor *x_all, const ds4_gpu_tensor *cnorm,
+                                     const ds4_gpu_tensor *cos_t, const ds4_gpu_tensor *sin_t) {
+    const uint32_t dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM, rd = DS4_N_ROT;
+    const uint32_t idim = DS4_N_INDEXER_HEAD_DIM;
+    const uint32_t lead = pos0 % ratio;         /* rows already waiting in the open group */
+    const uint32_t total = lead + n_tok;
+    const uint32_t groups = total / ratio;
+    const uint32_t left = total % ratio;
+    const uint32_t g0 = st->n_comp[il];
+    const uint32_t gpos0 = pos0 - lead;         /* a latent stands for its group's first token */
+    const uint64_t row = (uint64_t)hd * sizeof(float);
+    bool ok = true;
+    dsv41_gpu_buf b_kv = {0}, b_sc = {0}, b_lat = {0}, b_ik = {0};
+
+    if (ratio == 1u) {
+        ok = dsv41_gpu_buf_alloc(&b_lat, (uint64_t)n_tok * hd) &&
+             dsv41_gpu_matvec(m, l->attn_compressor_kv, l->attn_compressor_kv->abs_offset,
+                              dim, hd, n_tok, x_all, b_lat.t) &&
+             ds4_gpu_rms_norm_weight_rows_tensor(b_lat.t, b_lat.t, m->map, m->size,
+                                                 l->attn_compressor_norm->abs_offset, hd,
+                                                 n_tok, DS4_RMS_EPS);
+    } else {
+        float *kvs = st->kv_state + (size_t)il * st->win * hd;
+        float *scs = st->score_state + (size_t)il * st->win * hd;
+        ok = dsv41_gpu_buf_alloc(&b_kv, (uint64_t)total * hd) &&
+             dsv41_gpu_buf_alloc(&b_sc, (uint64_t)total * hd);
+        if (ok && lead) {
+            ok = win_gpu
+               ? ds4_gpu_tensor_copy(b_kv.t, 0, win_gpu->pkv[il], 0, lead * row) != 0 &&
+                 ds4_gpu_tensor_copy(b_sc.t, 0, win_gpu->psc[il], 0, lead * row) != 0
+               : dsv41_gpu_buf_put(&b_kv, kvs, (uint64_t)lead * hd) &&
+                 dsv41_gpu_buf_put(&b_sc, scs, (uint64_t)lead * hd);
+        }
+        if (ok) {
+            ds4_gpu_tensor *vk = ds4_gpu_tensor_view(b_kv.t, lead * row, n_tok * row);
+            ds4_gpu_tensor *vs = ds4_gpu_tensor_view(b_sc.t, lead * row, n_tok * row);
+            ok = vk && vs &&
+                 dsv41_gpu_matvec(m, l->attn_compressor_kv, l->attn_compressor_kv->abs_offset,
+                                  dim, hd, n_tok, x_all, vk) &&
+                 dsv41_gpu_matvec(m, l->attn_compressor_gate,
+                                  l->attn_compressor_gate->abs_offset, dim, hd, n_tok, x_all, vs);
+            ds4_gpu_tensor_free(vk); ds4_gpu_tensor_free(vs);
+        }
+        if (ok && groups) {
+            ok = dsv41_gpu_buf_alloc(&b_lat, (uint64_t)groups * hd) &&
+                 ds4_gpu_dsv41_compress_pool(groups, ratio, hd, DS4_RMS_EPS,
+                                             b_kv.t, b_sc.t, cnorm, b_lat.t);
+        }
+        if (ok && left) {
+            const uint64_t off = (uint64_t)groups * ratio * row;
+            if (win_gpu) {
+                ok = ds4_gpu_tensor_copy(win_gpu->pkv[il], 0, b_kv.t, off, left * row) != 0 &&
+                     ds4_gpu_tensor_copy(win_gpu->psc[il], 0, b_sc.t, off, left * row) != 0;
+            } else {
+                if (ds4_gpu_commands_active()) {
+                    (void)ds4_gpu_end_commands();
+                    (void)ds4_gpu_begin_commands();
+                }
+                ok = ds4_gpu_tensor_read(b_kv.t, off, kvs, left * row) != 0 &&
+                     ds4_gpu_tensor_read(b_sc.t, off, scs, left * row) != 0;
+            }
+        }
+    }
+    if (ok && groups) {
+        if (g_ds4_index_source_layer[il] == il) {
+            ok = dsv41_gpu_buf_alloc(&b_ik, (uint64_t)groups * idim) &&
+                 dsv41_gpu_matvec(m, l->indexer_attn_k, l->indexer_attn_k->abs_offset,
+                                  hd, idim, groups, b_lat.t, b_ik.t) &&
+                 ds4_gpu_rms_norm_weight_rows_tensor(b_ik.t, b_ik.t, m->map, m->size,
+                                                     l->indexer_k_norm->abs_offset, idim,
+                                                     groups, DS4_RMS_EPS) &&
+                 ds4_gpu_dsv41_rope_ex(groups, 1, idim, rd, gpos0, ratio, 0, b_ik.t,
+                                       cos_t, sin_t);
+            if (ok) {
+                ok = win_gpu
+                   ? ds4_gpu_tensor_copy(win_gpu->ikey[il], (uint64_t)g0 * idim * sizeof(float),
+                                         b_ik.t, 0, (uint64_t)groups * idim * sizeof(float)) != 0
+                   : dsv41_gpu_buf_get(&b_ik,
+                                       st->index_k + ((size_t)il * st->max_pos + g0) * idim,
+                                       (uint64_t)groups * idim);
+            }
+        }
+        /* the latent is rotated only after the indexer has taken its unrotated form */
+        ok = ok && ds4_gpu_dsv41_rope_ex(groups, 1, hd, rd, gpos0, ratio, 0, b_lat.t,
+                                         cos_t, sin_t);
+        if (ok) {
+            ok = win_gpu
+               ? ds4_gpu_tensor_copy(win_gpu->ckv[il], (uint64_t)g0 * row, b_lat.t, 0,
+                                     groups * row) != 0
+               : dsv41_gpu_buf_get(&b_lat, st->compress_kv + ((size_t)il * st->max_pos + g0) * hd,
+                                   (uint64_t)groups * hd);
+        }
+        if (ok) st->n_comp[il] = g0 + groups;
+    }
+    ds4_gpu_tensor_free(b_kv.t); ds4_gpu_tensor_free(b_sc.t);
+    ds4_gpu_tensor_free(b_lat.t); ds4_gpu_tensor_free(b_ik.t);
+    return ok;
+}
+
+/* One block over `n_tok` tokens at positions pos0 .. pos0+n_tok-1.  Decode is n_tok = 1.
+ *
+ * `stream_t` is the hc stream in and out, and `mix_t` the mix this block collapses with
+ * on entry and the one its FFN produced on exit.  Both stay on the device: a block that
+ * handed them back to the host cost two round trips per layer, 80 of them per token.
+ *
+ * Everything positionwise runs over the whole chunk -- the mHC ends, the norms, every
+ * projection, the compressor, the indexer's queries, the output LoRA and the MoE.  What
+ * still walks token by token is what each position sees differently: the indexer's scores
+ * over its own reach of the compressed cache, and the attention itself. */
+/* DSV41_BLOCK_FULL runs the block.  DSV41_BLOCK_PUBLISH stops after the compressor, which
+ * is all the boundary layer owes the decoder: the global KV and index keys for every
+ * position.  DSV41_BLOCK_REPLAY runs the block but leaves that publish to the earlier
+ * pass. */
+enum { DSV41_BLOCK_FULL = 0, DSV41_BLOCK_PUBLISH = 1, DSV41_BLOCK_REPLAY = 2 };
+
+static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32_t il,
+                                dsv41_ref_state *st, ds4_gpu_tensor *stream_t,
+                                ds4_gpu_tensor *mix_t, uint32_t pos0, uint32_t n_tok,
+                                const ds4_gpu_tensor *cos_t, const ds4_gpu_tensor *sin_t,
+                                float *out,
+                                const dsv41_ref_engram *eng, const dsv41_gpu_engram *ge,
+                                const dsv41_gpu_window *win_gpu, int mode) {
+    const ds4_layer_weights *l = &w->layer[il];
+    const uint32_t dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM, nh = DS4_N_HEAD, win = DS4_N_SWA;
+    const uint32_t rd = DS4_N_ROT, lq = DS4_N_LORA_Q;
+    const uint32_t groups = DS4_N_OUT_GROUP, lo = DS4_N_LORA_O;
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const uint32_t src = ratio ? g_ds4_kv_source_layer[il] : 0u;
+    const uint32_t isrc = ratio ? g_ds4_index_source_layer[il] : 0u;
+    const uint32_t ih = DS4_N_INDEXER_HEAD, idim = DS4_N_INDEXER_HEAD_DIM;
+    const uint32_t hc = DS4_N_HC, hc_dim = dim * hc;
+    const uint32_t mix_hc = (2u + DS4_N_HC) * DS4_N_HC;
+    const bool attends = mode != DSV41_BLOCK_PUBLISH;
+    const bool publish = ratio != 0 && g_ds4_kv_source_layer[il] == il &&
+                         mode != DSV41_BLOCK_REPLAY;
+    const bool index_here = attends && ratio != 0 && isrc == il;
+    /* selection on the device, and the index lists read where they live: only the
+     * comparison harness (no resident window) and the host-select switch gather a list */
+    const bool gpu_sel = win_gpu && !dsv41_env("DS4_DSV41_HOST_SELECT", &g_dsv41_env_host_select);
+    /* two kernels take a precision flag rather than a type: hc_mixes reads F32 or F16,
+     * output_lora F32 or Q8_0.  Any other type would be read as the flag's other case. */
+    if ((l->hc_attn_fn->type != DS4_TENSOR_F32 && l->hc_attn_fn->type != DS4_TENSOR_F16) ||
+        (l->hc_ffn_fn->type != DS4_TENSOR_F32 && l->hc_ffn_fn->type != DS4_TENSOR_F16) ||
+        (l->attn_output_a->type != DS4_TENSOR_F32 &&
+         l->attn_output_a->type != DS4_TENSOR_Q8_0)) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 GPU step needs F32/F16 mHC and F32/Q8_0 "
+                        "output LoRA (layer %u)\n", il);
+        return false;
+    }
+
+    bool ok = true;
+    dsv41_gpu_buf b_x_all = {0}, b_qa = {0}, b_qr_all = {0}, b_q_all = {0}, b_kv_all = {0};
+    dsv41_gpu_buf b_low = {0}, b_out = {0}, b_stream = { stream_t, 0 }, b_mix = { mix_t, 0 };
+    dsv41_gpu_buf b_post = {0}, b_comb = {0}, b_coll = {0}, b_attnpre = {0}, b_moe = {0};
+    dsv41_gpu_buf b_iq_all = {0}, b_wts_all = {0}, b_join = {0}, b_ikall = {0}, b_sc = {0};
+    ds4_gpu_tensor *t_widx = NULL, *t_idx = NULL;
+    int32_t *widx = NULL;
+    /* the per-layer constants: the session's resident set, or a block's own upload */
+    dsv41_gpu_consts own = {0};
+    const dsv41_gpu_consts *k = win_gpu && win_gpu->consts ? &win_gpu->consts[il] : NULL;
+    if (!k) {
+        const bool pool = ratio > 1u && g_ds4_kv_source_layer[il] == il;
+        ok = dsv41_gpu_const_put(&own.hsc, m, l->hc_attn_scale, 3) &&
+             dsv41_gpu_const_put(&own.hba, m, l->hc_attn_base, mix_hc) &&
+             dsv41_gpu_const_put(&own.fsc, m, l->hc_ffn_scale, 3) &&
+             dsv41_gpu_const_put(&own.fba, m, l->hc_ffn_base, mix_hc) &&
+             dsv41_gpu_const_put(&own.sink, m, l->attn_sinks, nh) &&
+             dsv41_gpu_const_put(&own.cnorm, m, pool ? l->attn_compressor_norm : NULL, hd);
+        k = &own;
+    }
+
+    /* the engram rewrites the stream entering the block, ahead of its mixes.  A replay
+     * inherits a stream the publish pass already rewrote. */
+    if (ok && mode != DSV41_BLOCK_REPLAY) ok = dsv41_gpu_engram_step(eng, ge, il, pos0, n_tok, stream_t);
+    /* This attention's mix is what the FFN's hc_pre reads, and the FFN's is what the next
+     * block reads, so each hc_mixes writes its destination directly.  Routing both through
+     * one scratch cost two blits a block, and a blit ends the compute encoder. */
+    ok = ok && dsv41_gpu_buf_alloc(&b_attnpre, (uint64_t)n_tok * hc);
+    ok = ok && dsv41_gpu_buf_alloc(&b_post, (uint64_t)n_tok * hc);
+    ok = ok && dsv41_gpu_buf_alloc(&b_comb, (uint64_t)n_tok * hc * hc);
+    ok = ok && dsv41_gpu_buf_alloc(&b_coll, (uint64_t)n_tok * dim);
+    ok = ok && dsv41_gpu_buf_alloc(&b_x_all, (uint64_t)n_tok * dim);
+    if (attends) {
+        ok = ok && dsv41_gpu_buf_alloc(&b_qa, (uint64_t)n_tok * lq);
+        ok = ok && dsv41_gpu_buf_alloc(&b_qr_all, (uint64_t)n_tok * lq);
+        ok = ok && dsv41_gpu_buf_alloc(&b_q_all, (uint64_t)n_tok * nh * hd);
+        ok = ok && dsv41_gpu_buf_alloc(&b_kv_all, (uint64_t)n_tok * hd);
+        ok = ok && dsv41_gpu_buf_alloc(&b_low, (uint64_t)n_tok * groups * lo);
+        ok = ok && dsv41_gpu_buf_alloc(&b_out, (uint64_t)n_tok * dim);
+    }
+    if (!ok) goto done;
+
+    /* the mix this attention produces feeds the FFN; hc_pre collapses with the mix the
+     * previous sublayer produced */
+    ok = ok && ds4_gpu_dsv41_hc_mixes(m->map, m->size, l->hc_attn_fn->abs_offset, n_tok, hc_dim,
+                                      hc, DS4_N_HC_SINKHORN_ITER, DS4_RMS_EPS, DS4_HC_EPS,
+                                      l->hc_attn_fn->type != DS4_TENSOR_F32,
+                                      b_stream.t, k->hsc, k->hba,
+                                      b_attnpre.t, b_post.t, b_comb.t);
+    ok = ok && ds4_gpu_dsv41_hc_pre(n_tok, dim, hc, b_stream.t, b_mix.t, b_coll.t);
+    ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(b_x_all.t, b_coll.t, m->map, m->size,
+                                                   l->attn_norm->abs_offset, dim,
+                                                   n_tok, DS4_RMS_EPS);
+    if (!ok) goto done;
+
+    /* --- compressor: only a kv-source layer produces latents, for the whole chunk at once.
+     * Its consumers in this chunk see exactly the groups a token-by-token pass would have
+     * published by their position, because each clips its reach to (pos + 1) / ratio. */
+    if (publish) {
+        ok = dsv41_gpu_compress_chunk(m, l, il, st, win_gpu, ratio, pos0, n_tok, b_x_all.t,
+                                      k->cnorm, cos_t, sin_t);
+    }
+    if (!ok || !attends) goto done;
+
+    /* The window latent goes out with q_a.  A single token can be projected straight into
+     * its ring slot; a chunk's rows are moved in afterwards, in one or two runs. */
+    ds4_gpu_tensor *ring_t = win_gpu ? win_gpu->ring[il] : NULL;
+    const uint32_t rslots = win_gpu ? win_gpu->ring_slots : win;
+    ds4_gpu_tensor *kv_dst = b_kv_all.t;
+    ds4_gpu_tensor *kv_slot = NULL;
+    if (ring_t && n_tok == 1u) {
+        kv_slot = ds4_gpu_tensor_view(ring_t,
+                (uint64_t)(pos0 % rslots) * hd * sizeof(float), (uint64_t)hd * sizeof(float));
+        if (!kv_slot) { ok = false; goto done; }
+        kv_dst = kv_slot;
+    }
+
+    /* q_a and kv read the same attn-normed input, so they go out together */
+    ok = ok && dsv41_gpu_matvec_pair(m, l->attn_q_a, l->attn_kv, dim, lq, hd,
+                                     n_tok, b_x_all.t, b_qa.t, kv_dst);
+    ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(b_qr_all.t, b_qa.t, m->map, m->size,
+                                                   l->attn_q_a_norm->abs_offset, lq,
+                                                   n_tok, DS4_RMS_EPS);
+    ok = ok && dsv41_gpu_matvec(m, l->attn_q_b, l->attn_q_b->abs_offset, lq,
+                                (uint64_t)nh * hd, n_tok, b_qr_all.t, b_q_all.t);
+    ok = ok && ds4_gpu_dsv41_rope(n_tok, nh, hd, rd, pos0, 0, b_q_all.t, cos_t, sin_t);
+    ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(kv_dst, kv_dst, m->map, m->size,
+                                                   l->attn_kv_a_norm->abs_offset, hd,
+                                                   n_tok, DS4_RMS_EPS);
+    ok = ok && ds4_gpu_dsv41_rope(n_tok, 1, hd, rd, pos0, 0, kv_dst, cos_t, sin_t);
+    if (ring_t && !kv_slot) {
+        for (uint32_t done_rows = 0; done_rows < n_tok && ok; ) {
+            const uint32_t slot = (pos0 + done_rows) % rslots;
+            uint32_t run = rslots - slot;
+            if (run > n_tok - done_rows) run = n_tok - done_rows;
+            ok = ds4_gpu_tensor_copy(ring_t, (uint64_t)slot * hd * sizeof(float),
+                                     b_kv_all.t, (uint64_t)done_rows * hd * sizeof(float),
+                                     (uint64_t)run * hd * sizeof(float)) != 0;
+            done_rows += run;
+        }
+    }
+
+    /* the indexer's query and head weights read the same batched rows the attention
+     * projections do; scoring and selection wait for the loop, where each position has
+     * its own reach */
+    if (index_here) {
+        ok = ok && dsv41_gpu_buf_alloc(&b_iq_all, (uint64_t)n_tok * ih * idim);
+        ok = ok && dsv41_gpu_buf_alloc(&b_wts_all, (uint64_t)n_tok * ih);
+        ok = ok && dsv41_gpu_matvec(m, l->indexer_attn_q_b, l->indexer_attn_q_b->abs_offset,
+                                    lq, (uint64_t)ih * idim, n_tok, b_qr_all.t, b_iq_all.t);
+        ok = ok && ds4_gpu_dsv41_rope(n_tok, ih, idim, rd, pos0, 0, b_iq_all.t, cos_t, sin_t);
+        ok = ok && dsv41_gpu_matvec(m, l->indexer_proj, l->indexer_proj->abs_offset,
+                                    dim, ih, n_tok, b_x_all.t, b_wts_all.t);
+    }
+
+    /* Every position's window is the last `win` positions, oldest first, -1 before the
+     * start.  Built for the whole chunk in one write; the loop addresses rows by view. */
+    widx = xmalloc((size_t)n_tok * win * sizeof(int32_t));
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t j = 0; j < win; j++) {
+            const int64_t p = (int64_t)(pos0 + t) - (int64_t)(win - 1u - j);
+            widx[(size_t)t * win + j] = p < 0 ? -1 : (int32_t)((uint64_t)p % rslots);
+        }
+    }
+    t_widx = ds4_gpu_tensor_alloc((uint64_t)n_tok * win * sizeof(int32_t));
+    ok = ok && t_widx && ds4_gpu_tensor_write(t_widx, 0, widx,
+                                              (uint64_t)n_tok * win * sizeof(int32_t)) != 0;
+    if (!ok) goto done;
+
+    /* --- the causal half, token by token: each position scores and attends over its own
+     * reach.  Rows of the batched tensors are addressed through views, not copies. */
+    for (uint32_t t = 0; t < n_tok && ok; t++) {
+    const uint32_t pos = pos0 + t;
+    dsv41_gpu_buf b_q = { ds4_gpu_tensor_view(b_q_all.t,
+            (uint64_t)t * nh * hd * sizeof(float), (uint64_t)nh * hd * sizeof(float)), 0 };
+    dsv41_gpu_buf b_x = { ds4_gpu_tensor_view(b_x_all.t,
+            (uint64_t)t * dim * sizeof(float), (uint64_t)dim * sizeof(float)), 0 };
+    dsv41_gpu_buf b_qr = { ds4_gpu_tensor_view(b_qr_all.t,
+            (uint64_t)t * lq * sizeof(float), (uint64_t)lq * sizeof(float)), 0 };
+    dsv41_gpu_buf b_iq = {0}, b_wts = {0};
+    ds4_gpu_tensor *v_widx = ds4_gpu_tensor_view(t_widx, (uint64_t)t * win * sizeof(int32_t),
+                                                 (uint64_t)win * sizeof(int32_t));
+    ds4_gpu_tensor *v_pick = NULL;
+    ok = b_q.t && b_x.t && b_qr.t && v_widx;
+
+    float *ring = st->window_kv + (size_t)il * win * hd;
+    if (ok && !ring_t) {
+        /* no resident window: the host ring is the cache, so this row goes back to it */
+        dsv41_gpu_buf b_kv = { ds4_gpu_tensor_view(b_kv_all.t,
+                (uint64_t)t * hd * sizeof(float), (uint64_t)hd * sizeof(float)), 0 };
+        ok = b_kv.t && dsv41_gpu_buf_get(&b_kv, ring + (size_t)(pos % win) * hd, hd);
+        ds4_gpu_tensor_free(b_kv.t);
+    }
+
+    uint32_t clen = 0;
+    if (ratio != 0) clen = st->n_comp[src] < (pos + 1u) / ratio
+                         ? st->n_comp[src] : (pos + 1u) / ratio;
+
+    /* --- indexer: an index-source layer scores every published compressed position and
+     * selects; the layers between reuse what their source published.  The scoring is the
+     * O(clen * heads * dim) part; the selection is O(clen) and is shared with the CPU
+     * reference so both produce the identical tie order. */
+    if (ok && index_here && clen > 0) {
+        const uint32_t topk_i = DS4_N_INDEXER_TOP_K < clen ? DS4_N_INDEXER_TOP_K : clen;
+        float *scores = gpu_sel ? NULL : xmalloc((size_t)clen * sizeof(float));
+        b_iq.t = ds4_gpu_tensor_view(b_iq_all.t, (uint64_t)t * ih * idim * sizeof(float),
+                                     (uint64_t)ih * idim * sizeof(float));
+        b_wts.t = ds4_gpu_tensor_view(b_wts_all.t, (uint64_t)t * ih * sizeof(float),
+                                      (uint64_t)ih * sizeof(float));
+        ok = b_iq.t != NULL && b_wts.t != NULL;
+        if (win_gpu) {
+            b_sc = win_gpu->sc;
+            b_ikall.t = win_gpu->ikey[src];     /* already on the device, nothing to copy */
+        } else {
+            ok = ok && dsv41_gpu_buf_alloc(&b_sc, clen);
+            ok = ok && dsv41_gpu_buf_alloc(&b_ikall, (uint64_t)clen * idim);
+            ok = ok && dsv41_gpu_buf_put(&b_ikall,
+                    st->index_k + (size_t)src * st->max_pos * idim, (uint64_t)clen * idim);
+        }
+        ok = ok && ds4_gpu_dsv41_index_score(ih, idim, clen, b_iq.t, b_ikall.t, b_wts.t,
+                                             NULL,
+                                             (1.0f / sqrtf((float)idim)) / sqrtf((float)ih),
+                                             b_sc.t);
+        if (ok && gpu_sel) {
+            /* selection stays on the device: the candidate source publishes its block
+             * decision for the rest of the step, every index layer ranks and compacts
+             * its own picks, and nothing is read back */
+            const uint32_t blk = DS4_N_CANDIDATE_BLOCK_SIZE;
+            if (il == g_ds4_candidate_source_layer) {
+                const uint32_t nb = (clen + blk - 1u) / blk;
+                const uint32_t kb = DS4_N_CANDIDATE_TOP_BLOCKS < nb
+                                  ? DS4_N_CANDIDATE_TOP_BLOCKS : nb;
+                ok = ok && ds4_gpu_dsv41_block_max(clen, blk, nb, clen,
+                                                   b_sc.t, win_gpu->bscore.t) != 0;
+                ok = ok && ds4_gpu_dsv41_topk_select_scratch(
+                        nb, kb, 0, nb, win_gpu->bscore.t, win_gpu->bkeep, win_gpu->bout,
+                        win_gpu->rstate, win_gpu->rhist) != 0;
+            } else if (g_ds4_candidate_source_layer < il) {
+                ok = ok && ds4_gpu_dsv41_block_mask(clen, blk, win_gpu->bkeep, b_sc.t) != 0;
+            }
+            ds4_gpu_tensor *v_own = ds4_gpu_tensor_view(win_gpu->picks[il],
+                    (uint64_t)t * DS4_N_INDEXER_TOP_K * sizeof(int32_t),
+                    (uint64_t)DS4_N_INDEXER_TOP_K * sizeof(int32_t));
+            ok = ok && v_own != NULL &&
+                 ds4_gpu_dsv41_topk_select_scratch(clen, topk_i, rslots, clen, b_sc.t,
+                                                   win_gpu->keep, v_own,
+                                                   win_gpu->rstate, win_gpu->rhist) != 0;
+            ds4_gpu_tensor_free(v_own);
+            st->topk[il] = topk_i;
+        } else if (ok) {
+            ok = dsv41_gpu_buf_get(&b_sc, scores, clen);
+            if (ok) {
+                dsv41_ref_index_select(st, il, g_ds4_candidate_source_layer < DS4_N_LAYER
+                                               ? g_ds4_candidate_source_layer : 0u,
+                                       scores, clen, topk_i, rslots,
+                                       il == g_ds4_candidate_source_layer,
+                                       g_ds4_candidate_source_layer < il);
+            }
+        }
+        free(scores);
+        if (!win_gpu) {
+            ds4_gpu_tensor_free(b_sc.t); b_sc.t = NULL;
+            ds4_gpu_tensor_free(b_ikall.t); b_ikall.t = NULL;
+        }
+    }
+
+    /* within a chunk every position has its own selection and its own count, so neither
+     * can come from the layer-wide scalar a single-token path could use */
+    uint32_t k_comp = 0;
+    if (ok && ratio != 0 && clen > 0) {
+        k_comp = gpu_sel ? (DS4_N_INDEXER_TOP_K < clen ? DS4_N_INDEXER_TOP_K : clen)
+                         : st->topk[isrc];
+    }
+    const uint32_t topk = win + k_comp;
+    const uint32_t n_kv = win + clen;
+    /* the two caches are read where they live; gathering them cost a 256 KB blit per
+     * block plus another for the compressed half, and every blit ends the encoder */
+    ds4_gpu_tensor *kv_win = ring_t;
+    ds4_gpu_tensor *kv_cmp = (win_gpu && clen) ? win_gpu->ckv[src] : NULL;
+    ds4_gpu_tensor *idx0 = v_widx;
+    uint32_t n_idx_win = win;
+    if (ok && gpu_sel) {
+        /* the picks are read out of the source layer's own buffer */
+        if (k_comp) {
+            v_pick = ds4_gpu_tensor_view(win_gpu->picks[isrc],
+                    (uint64_t)t * DS4_N_INDEXER_TOP_K * sizeof(int32_t),
+                    (uint64_t)k_comp * sizeof(int32_t));
+            ok = v_pick != NULL;
+        }
+    } else if (ok) {
+        /* the harness and the host-select switch gather one list per query */
+        int32_t *idxs = xmalloc((size_t)topk * sizeof(int32_t));
+        memcpy(idxs, widx + (size_t)t * win, win * sizeof(int32_t));
+        if (k_comp) {
+            memcpy(idxs + win, st->topk_idxs + (size_t)isrc * DS4_N_INDEXER_TOP_K,
+                   k_comp * sizeof(int32_t));
+        }
+        if (!win_gpu) {
+            ok = dsv41_gpu_buf_alloc(&b_join, (uint64_t)n_kv * hd);
+            ok = ok && dsv41_gpu_buf_put(&b_join, ring, (uint64_t)win * hd);
+            if (ok && clen) {
+                ok = ds4_gpu_tensor_write(b_join.t, (uint64_t)win * hd * sizeof(float),
+                                          st->compress_kv + (size_t)src * st->max_pos * hd,
+                                          (uint64_t)clen * hd * sizeof(float)) != 0;
+            }
+            kv_win = b_join.t;
+            kv_cmp = NULL;      /* one contiguous array, so every id addresses it */
+        }
+        t_idx = ds4_gpu_tensor_alloc((uint64_t)topk * sizeof(int32_t));
+        ok = ok && t_idx != NULL &&
+             ds4_gpu_tensor_write(t_idx, 0, idxs, (uint64_t)topk * sizeof(int32_t)) != 0;
+        free(idxs);
+        idx0 = t_idx;
+        n_idx_win = topk;
+    }
+    ok = ok && ds4_gpu_dsv41_sparse_attn(1, nh, hd, topk, win_gpu ? rslots : n_kv,
+                                         1.0f / sqrtf((float)hd),
+                                         b_q.t, kv_win, kv_cmp, k->sink, idx0, n_idx_win,
+                                         v_pick, b_q.t) != 0;
+    ds4_gpu_tensor_free(b_q.t); ds4_gpu_tensor_free(b_x.t); ds4_gpu_tensor_free(b_qr.t);
+    ds4_gpu_tensor_free(b_iq.t); ds4_gpu_tensor_free(b_wts.t);
+    ds4_gpu_tensor_free(v_widx); ds4_gpu_tensor_free(v_pick);
+    ds4_gpu_tensor_free(t_idx); t_idx = NULL;
+    ds4_gpu_tensor_free(b_join.t); b_join.t = NULL;
+    }
+    if (!ok) goto done;
+
+    /* the queries' rotation comes back off before the grouped projection */
+    ok = ok && ds4_gpu_dsv41_rope(n_tok, nh, hd, rd, pos0, 1, b_q_all.t, cos_t, sin_t);
+    ok = ok && ds4_gpu_dsv41_output_lora(m->map, m->size, l->attn_output_a->abs_offset,
+                                         (uint64_t)hd * nh / groups, lo, groups,
+                                         l->attn_output_a->type != DS4_TENSOR_F32, n_tok,
+                                         b_q_all.t, b_low.t);
+    ok = ok && dsv41_gpu_matvec(m, l->attn_output_b, l->attn_output_b->abs_offset,
+                                (uint64_t)groups * lo, dim, n_tok, b_low.t, b_out.t);
+    /* expand back to the hc copies, folding the residual through comb */
+    ok = ok && ds4_gpu_dsv41_hc_post(n_tok, dim, hc, b_out.t, b_stream.t, b_post.t, b_comb.t,
+                                     b_stream.t);
+
+    if (out && dsv41_env("DS4_DSV41_ATTN_ONLY", &g_dsv41_env_attn_only)) {
+        ok = ok && dsv41_gpu_buf_get(&b_stream, out, (uint64_t)n_tok * hc_dim);
+        goto done;
+    }
+
+    /* --- FFN sublayer: its hc_pre uses the mix THIS attention produced */
+    ok = ok && dsv41_gpu_buf_alloc(&b_moe, (uint64_t)n_tok * dim);
+    ok = ok && ds4_gpu_dsv41_hc_mixes(m->map, m->size, l->hc_ffn_fn->abs_offset, n_tok, hc_dim,
+                                      hc, DS4_N_HC_SINKHORN_ITER, DS4_RMS_EPS, DS4_HC_EPS,
+                                      l->hc_ffn_fn->type != DS4_TENSOR_F32,
+                                      b_stream.t, k->fsc, k->fba,
+                                      b_mix.t, b_post.t, b_comb.t);
+    ok = ok && ds4_gpu_dsv41_hc_pre(n_tok, dim, hc, b_stream.t, b_attnpre.t, b_coll.t);
+    ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(b_x_all.t, b_coll.t, m->map, m->size,
+                                                   l->ffn_norm->abs_offset, dim,
+                                                   n_tok, DS4_RMS_EPS);
+    ok = ok && dsv41_gpu_moe_step(m, w, il, n_tok, b_x_all.t, b_moe.t);
+    if (ok && out && dsv41_env("DS4_DSV41_MOE_ONLY", &g_dsv41_env_moe_only)) {
+        ok = dsv41_gpu_buf_get(&b_moe, out, dim);
+        goto done;
+    }
+    ok = ok && ds4_gpu_dsv41_hc_post(n_tok, dim, hc, b_moe.t, b_stream.t, b_post.t, b_comb.t,
+                                     b_stream.t);
+    if (ok && out) ok = dsv41_gpu_buf_get(&b_stream, out, (uint64_t)n_tok * hc_dim);
+
+done:
+    ds4_gpu_tensor_free(b_x_all.t); ds4_gpu_tensor_free(b_qa.t);
+    ds4_gpu_tensor_free(b_qr_all.t);
+    ds4_gpu_tensor_free(b_q_all.t); ds4_gpu_tensor_free(b_kv_all.t);
+    ds4_gpu_tensor_free(b_low.t); ds4_gpu_tensor_free(b_out.t);
+    if (!win_gpu) { ds4_gpu_tensor_free(b_join.t); ds4_gpu_tensor_free(b_ikall.t);
+                    ds4_gpu_tensor_free(b_sc.t); }
+    ds4_gpu_tensor_free(b_post.t); ds4_gpu_tensor_free(b_comb.t); ds4_gpu_tensor_free(b_coll.t);
+    ds4_gpu_tensor_free(b_iq_all.t); ds4_gpu_tensor_free(b_wts_all.t);
+    ds4_gpu_tensor_free(b_moe.t); ds4_gpu_tensor_free(b_attnpre.t);
+    ds4_gpu_tensor_free(t_widx); ds4_gpu_tensor_free(t_idx);
+    free(widx);
+    if (k == &own) {
+        ds4_gpu_tensor_free(own.hsc); ds4_gpu_tensor_free(own.hba);
+        ds4_gpu_tensor_free(own.fsc); ds4_gpu_tensor_free(own.fba);
+        ds4_gpu_tensor_free(own.sink); ds4_gpu_tensor_free(own.cnorm);
+    }
+    return ok;
+}
+/* The rope tables are the same for every block of a frequency set and every token, so
+ * they are uploaded once instead of 8 MB per block per token. */
+typedef struct {
+    ds4_gpu_tensor *cos, *sin;
+} dsv41_gpu_rope;
+
+static void dsv41_gpu_rope_close(dsv41_gpu_rope *r) {
+    ds4_gpu_tensor_free(r->cos); ds4_gpu_tensor_free(r->sin);
+    r->cos = r->sin = NULL;
+}
+
+static bool dsv41_gpu_rope_open(dsv41_gpu_rope *r, const dsv41_ref_freqs *f) {
+    const uint64_t n = (uint64_t)f->n_pos * f->half;
+    r->cos = ds4_gpu_tensor_alloc(n * sizeof(float));
+    r->sin = ds4_gpu_tensor_alloc(n * sizeof(float));
+    const bool ok = r->cos && r->sin &&
+                    ds4_gpu_tensor_write(r->cos, 0, f->cos, n * sizeof(float)) != 0 &&
+                    ds4_gpu_tensor_write(r->sin, 0, f->sin, n * sizeof(float)) != 0;
+    if (!ok) dsv41_gpu_rope_close(r);
+    return ok;
+}
+
+/* --- CED: the trunk splits into an encoder and a decoder.  Every layer from some
+ * boundary on draws its compressed KV from that boundary, so the decoder half needs
+ * nothing from the encoder but the boundary's published caches -- which the encoder can
+ * publish for every position without running a single decoder block.  What the decoder
+ * still owns is its sliding window, one wkv projection per layer of that layer's own
+ * hidden state, so those positions have to be replayed.
+ *
+ * The replay is bounded, and the bound is exact rather than the window: a decoder layer's
+ * output at p needs its window back to p-(win-1), which needs the layer below back to
+ * p-2(win-1), so replaying (win-1)*n_decoder+1 positions reproduces the last position
+ * bit for bit.  Below that length the split would replay the whole prompt and is skipped.
+ */
+static uint32_t dsv41_ced_boundary(void) {
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    if (n_trunk < 2u || ds4_layer_compress_ratio(n_trunk - 1u) == 0) return 0;
+    const uint32_t b = g_ds4_kv_source_layer[n_trunk - 1u];
+    if (b == 0u || b + 1u >= n_trunk) return 0;
+    for (uint32_t il = b; il < n_trunk; il++) {
+        if (ds4_layer_compress_ratio(il) == 0 || g_ds4_kv_source_layer[il] != b) return 0;
+    }
+    return b;
+}
+
+static uint32_t dsv41_ced_replay(void) {
+    const uint32_t b = dsv41_ced_boundary();
+    if (!b) return 0;
+    const char *e = getenv("DS4_DSV41_CED_REPLAY");
+    if (e) return (uint32_t)strtoul(e, NULL, 10);
+    return (DS4_N_SWA - 1u) * (DS4_N_LAYER - DS4_N_NEXTN_PREDICT - b) + 1u;
+}
+
+/* The boundary's input for the last `cap` positions, held as a ring so each encoder chunk
+ * appends and the decoder reads back whatever window it needs. */
+typedef struct {
+    ds4_gpu_tensor *stream;
+    ds4_gpu_tensor *mix;
+    uint32_t cap;
+} dsv41_gpu_ced;
+
+static void dsv41_gpu_ced_close(dsv41_gpu_ced *c) {
+    if (!c) return;
+    ds4_gpu_tensor_free(c->stream);
+    ds4_gpu_tensor_free(c->mix);
+    memset(c, 0, sizeof(*c));
+}
+
+static bool dsv41_gpu_ced_open(dsv41_gpu_ced *c, uint32_t cap) {
+    const uint32_t hc = DS4_N_HC, hc_dim = DS4_N_EMBD * hc;
+    memset(c, 0, sizeof(*c));
+    c->stream = ds4_gpu_tensor_alloc((uint64_t)cap * hc_dim * sizeof(float));
+    c->mix = ds4_gpu_tensor_alloc((uint64_t)cap * hc * sizeof(float));
+    c->cap = cap;
+    if (!c->stream || !c->mix) { dsv41_gpu_ced_close(c); return false; }
+    return true;
+}
+
+/* One ring move, split at the wrap.  `to_ring` appends a chunk, the other direction
+ * gathers a position range back into a flat tensor. */
+static bool dsv41_gpu_ced_move(dsv41_gpu_ced *c, ds4_gpu_tensor *flat, uint32_t pos0,
+                               uint32_t n, uint32_t width, bool to_ring, bool is_mix) {
+    ds4_gpu_tensor *ring = is_mix ? c->mix : c->stream;
+    const uint64_t w = (uint64_t)width * sizeof(float);
+    uint32_t skip = 0;
+    if (n > c->cap) { skip = n - c->cap; pos0 += skip; n = c->cap; }
+    for (uint32_t done = 0; done < n; ) {
+        const uint32_t slot = (pos0 + done) % c->cap;
+        uint32_t run = c->cap - slot;
+        if (run > n - done) run = n - done;
+        ds4_gpu_tensor *a = to_ring ? ring : flat, *b = to_ring ? flat : ring;
+        const uint64_t off_a = (uint64_t)(to_ring ? slot : done + skip) * w;
+        const uint64_t off_b = (uint64_t)(to_ring ? done + skip : slot) * w;
+        if (!ds4_gpu_tensor_copy(a, off_a, b, off_b, (uint64_t)run * w)) return false;
+        done += run;
+    }
+    return true;
+}
+
+enum { DSV41_PHASE_ALL = 0, DSV41_PHASE_ENCODE = 1, DSV41_PHASE_DECODE = 2 };
+
+/* One whole token through the V4.1 trunk on the GPU: embed into the hc copies, run every
+ * block, then collapse with the mix the last FFN produced and take the head.  Prefill and
+ * decode are the same call -- attention is causal and the compressor's partial group is
+ * carried in the state, so stepping the prompt one position at a time leaves exactly the
+ * caches a batched prefill would. */
+static bool dsv41_gpu_forward_token(const ds4_model *m, const ds4_weights *w,
+                                    dsv41_ref_state *st, const int *tokens,
+                                    uint32_t n_tok, uint32_t pos0,
+                                    const dsv41_ref_engram *eng,
+                                    const dsv41_gpu_engram *ge,
+                                    const dsv41_gpu_rope *rope0,
+                                    const dsv41_gpu_rope *ropec,
+                                    const dsv41_gpu_window *win_gpu, float *logits,
+                                    dsv41_gpu_ced *ced, int phase) {
+    const uint32_t dim = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = dim * hc;
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const uint32_t bnd = phase == DSV41_PHASE_ALL ? 0u : dsv41_ced_boundary();
+    const uint32_t l0 = phase == DSV41_PHASE_DECODE ? bnd : 0u;
+    const uint32_t l1 = phase == DSV41_PHASE_ENCODE ? bnd + 1u : n_trunk;
+    bool ok = true;
+    float *stream = NULL, *pre_mix = NULL;
+    dsv41_gpu_buf b_st = {0}, b_mix = {0};
+
+    ok = dsv41_gpu_buf_alloc(&b_st, (uint64_t)n_tok * hc_dim) &&
+         dsv41_gpu_buf_alloc(&b_mix, (uint64_t)n_tok * hc);
+    if (phase != DSV41_PHASE_DECODE) {
+        stream = xmalloc((size_t)n_tok * hc_dim * sizeof(float));
+        pre_mix = xmalloc((size_t)n_tok * hc * sizeof(float));
+        for (uint32_t t = 0; t < n_tok; t++) {
+            float *row = stream + (size_t)t * hc_dim;
+            qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], row);
+            for (uint32_t c = 1; c < hc; c++) memcpy(row + c * dim, row, dim * sizeof(float));
+            /* make_identity_pre_mix: the mix restarts at the identity for every token */
+            for (uint32_t c = 0; c < hc; c++) pre_mix[(size_t)t * hc + c] = c == 0 ? 1.0f : 0.0f;
+        }
+        ok = ok && dsv41_gpu_buf_put(&b_st, stream, (uint64_t)n_tok * hc_dim) &&
+                   dsv41_gpu_buf_put(&b_mix, pre_mix, (uint64_t)n_tok * hc);
+    }
+
+    /* one command batch for the whole call: a dispatch per command buffer spends more
+     * time committing and waiting than computing */
+    const bool batched = ds4_gpu_begin_commands() != 0;
+    if (phase == DSV41_PHASE_DECODE) {
+        /* the boundary's input was kept when the encoder passed over these positions */
+        ok = ok && dsv41_gpu_ced_move(ced, b_st.t, pos0, n_tok, hc_dim, false, false);
+        ok = ok && dsv41_gpu_ced_move(ced, b_mix.t, pos0, n_tok, hc, false, true);
+    }
+    for (uint32_t il = l0; il < l1 && ok; il++) {
+        const dsv41_gpu_rope *r = ds4_layer_compress_ratio(il) ? ropec : rope0;
+        dsv41_ref_engram gc;
+        if (eng && eng->m) { gc = *eng; gc.pos0 = pos0; }
+        int mode = DSV41_BLOCK_FULL;
+        if (il == bnd && phase == DSV41_PHASE_ENCODE) mode = DSV41_BLOCK_PUBLISH;
+        else if (il == bnd && phase == DSV41_PHASE_DECODE) mode = DSV41_BLOCK_REPLAY;
+        ok = ok && dsv41_gpu_attn_step(m, w, il, st, b_st.t, b_mix.t, pos0, n_tok,
+                                       r->cos, r->sin, NULL,
+                                       (eng && eng->m) ? &gc : NULL, ge, win_gpu, mode);
+    }
+    if (phase == DSV41_PHASE_ENCODE) {
+        ok = ok && dsv41_gpu_ced_move(ced, b_st.t, pos0, n_tok, hc_dim, true, false);
+        ok = ok && dsv41_gpu_ced_move(ced, b_mix.t, pos0, n_tok, hc, true, true);
+    }
+
+    /* only the last position's logits are ever wanted */
+    if (ok && logits) {
+        dsv41_gpu_buf b_coll = {0}, b_x = {0}, b_lg = {0};
+        const uint64_t last = (uint64_t)(n_tok - 1u);
+        ds4_gpu_tensor *v_st = ds4_gpu_tensor_view(b_st.t, last * hc_dim * sizeof(float),
+                                                   (uint64_t)hc_dim * sizeof(float));
+        ds4_gpu_tensor *v_mx = ds4_gpu_tensor_view(b_mix.t, last * hc * sizeof(float),
+                                                   (uint64_t)hc * sizeof(float));
+        ok = v_st && v_mx &&
+             dsv41_gpu_buf_alloc(&b_coll, dim) && dsv41_gpu_buf_alloc(&b_x, dim) &&
+             dsv41_gpu_buf_alloc(&b_lg, DS4_N_VOCAB);
+        ok = ok && ds4_gpu_dsv41_hc_pre(1, dim, hc, v_st, v_mx, b_coll.t);
+        ds4_gpu_tensor_free(v_st); ds4_gpu_tensor_free(v_mx);
+        ok = ok && ds4_gpu_rms_norm_weight_tensor(b_x.t, b_coll.t, m->map, m->size,
+                                                  w->output_norm->abs_offset, dim, DS4_RMS_EPS);
+        ok = ok && dsv41_gpu_matvec(m, w->output, w->output->abs_offset, dim, DS4_N_VOCAB,
+                                    1, b_x.t, b_lg.t);
+        ok = ok && dsv41_gpu_buf_get(&b_lg, logits, DS4_N_VOCAB);
+        ds4_gpu_tensor_free(b_coll.t); ds4_gpu_tensor_free(b_x.t); ds4_gpu_tensor_free(b_lg.t);
+    }
+    if (batched) (void)ds4_gpu_end_commands();
+    ds4_gpu_tensor_free(b_st.t); ds4_gpu_tensor_free(b_mix.t);
+    free(stream);
+    free(pre_mix);
+    return ok;
+}
+
+/* Prefill a run of positions and return the last one's logits.  Past the replay bound the
+ * trunk splits: every chunk runs the encoder and publishes the boundary's caches for all
+ * of its positions, then only the tail is carried through the decoder.  The bound puts
+ * the decoder's whole receptive field inside this call, so the result is the same as the
+ * undivided pass and the caches it leaves are the same caches.
+ *
+ * `tick` sees each chunk go by and stops the prefill when it returns non-zero; `settled`
+ * tells it whether the caches are consistent up to that point, which on a split prompt is
+ * true only once the decoder half has run. */
+typedef int (*dsv41_prefill_tick)(void *ud, uint32_t pos_end, uint32_t total, bool settled);
+
+enum { DSV41_PREFILL_OK = 0, DSV41_PREFILL_FAIL = 1, DSV41_PREFILL_STOPPED = 2 };
+
+static int dsv41_gpu_prefill(const ds4_model *m, const ds4_weights *w,
+                             dsv41_ref_state *st, const int *tokens, uint32_t n,
+                             uint32_t pos0, const dsv41_ref_engram *eng,
+                             const dsv41_gpu_engram *ge, const dsv41_gpu_rope *rope0,
+                             const dsv41_gpu_rope *ropec, const dsv41_gpu_window *win_gpu,
+                             uint32_t chunk, float *logits, dsv41_gpu_ced *keep,
+                             dsv41_prefill_tick tick, void *ud) {
+    const uint32_t replay = dsv41_ced_replay();
+    const uint32_t total = pos0 + n;
+    /* the boundary's history: a session keeps its 200 MB across prompts, a one-off
+     * caller gets one for the call */
+    dsv41_gpu_ced local = {0};
+    dsv41_gpu_ced *ced = keep ? keep : &local;
+    bool split = replay != 0 && n > replay;
+    int status = DSV41_PREFILL_OK;
+    if (n == 0) return status;
+    if (chunk == 0 || chunk > n) chunk = n;
+    if (split && ced->cap != replay) {
+        dsv41_gpu_ced_close(ced);
+        if (!dsv41_gpu_ced_open(ced, replay)) split = false;
+    }
+
+    for (uint32_t i = 0; i < n && status == DSV41_PREFILL_OK; i += chunk) {
+        const uint32_t k = n - i < chunk ? n - i : chunk;
+        const bool last = i + k == n;
+        if (!dsv41_gpu_forward_token(m, w, st, tokens + i, k, pos0 + i, eng, ge,
+                                     rope0, ropec, win_gpu,
+                                     (last && !split) ? logits : NULL,
+                                     split ? ced : NULL,
+                                     split ? DSV41_PHASE_ENCODE : DSV41_PHASE_ALL)) {
+            status = DSV41_PREFILL_FAIL;
+        } else if (tick && tick(ud, pos0 + i + k, total, !split)) {
+            status = DSV41_PREFILL_STOPPED;
+        }
+    }
+    if (split) {
+        for (uint32_t i = n - replay; i < n && status == DSV41_PREFILL_OK; i += chunk) {
+            const uint32_t k = n - i < chunk ? n - i : chunk;
+            const bool last = i + k == n;
+            if (!dsv41_gpu_forward_token(m, w, st, NULL, k, pos0 + i, eng, ge,
+                                         rope0, ropec, win_gpu, last ? logits : NULL,
+                                         ced, DSV41_PHASE_DECODE)) {
+                status = DSV41_PREFILL_FAIL;
+            } else if (tick && tick(ud, pos0 + i + k, total, last)) {
+                status = DSV41_PREFILL_STOPPED;
+            }
+        }
+    }
+    dsv41_gpu_ced_close(&local);
+    return status;
+}
+
+/* Everything a V4.1 session carries between tokens: the decode caches the reference
+ * defines, the compressed id history the n-gram hash looks back through, and the
+ * sidecar's dense projection held on the GPU. */
+struct dsv41_session_state {
+    dsv41_ref_state st;
+    dsv41_ref_engram ctx;
+    dsv41_gpu_engram ge;
+    dsv41_gpu_rope rope0, ropec;
+    dsv41_gpu_window win;
+    dsv41_gpu_ced ced;
+    int32_t *ids;
+    int32_t *dead;
+    uint32_t cap;
+    uint32_t chunk;             /* prefill tokens per call */
+    bool has_engram;
+};
+
+static void dsv41_session_state_free(dsv41_session_state *ss) {
+    if (!ss) return;
+    dsv41_gpu_rope_close(&ss->rope0);
+    dsv41_gpu_rope_close(&ss->ropec);
+    dsv41_gpu_window_close(&ss->win);
+    dsv41_gpu_ced_close(&ss->ced);
+    dsv41_gpu_engram_close(&ss->ge);
+    dsv41_ref_state_free(&ss->st);
+    free(ss->ids);
+    free(ss->dead);
+    free(ss);
+}
+
+static dsv41_session_state *dsv41_session_state_alloc(ds4_engine *e, uint32_t ctx) {
+    dsv41_session_state *ss = xcalloc(1, sizeof(*ss));
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    ss->cap = ctx + 1u;
+    ss->chunk = e->prefill_chunk ? e->prefill_chunk : 64u;
+    if (ss->chunk > ctx) ss->chunk = ctx;
+    dsv41_ref_state_init(&ss->st, n_trunk, ss->cap);
+    ss->ids = xcalloc(ss->cap, sizeof(int32_t));
+    ss->dead = xcalloc(ss->cap, sizeof(int32_t));
+    ss->has_engram = e->engram_model.map != NULL;
+    if (!ss->has_engram && DS4_N_ENGRAM_LAYER != 0) {
+        /* without the tables those layers just lose a term, which reads as plausible
+         * output rather than as a failure */
+        fprintf(stderr, "ds4: this model has engram layers: pass --engram FILE\n");
+        dsv41_session_state_free(ss);
+        return NULL;
+    }
+    if (ss->has_engram) {
+        ss->ctx.m = &e->engram_model;
+        ss->ctx.w = &e->engram_weights;
+        ss->ctx.h = &g_ds4_engram;
+        ss->ctx.ids = ss->ids;
+        ss->ctx.dead = ss->dead;
+    }
+    if (!dsv41_gpu_engram_open(&ss->ge, ss->has_engram ? &ss->ctx : NULL) ||
+        !dsv41_gpu_rope_open(&ss->rope0, &ss->st.f0) ||
+        !dsv41_gpu_rope_open(&ss->ropec, &ss->st.fc) ||
+        !dsv41_gpu_window_open(&ss->win, n_trunk, ss->cap, ss->chunk) ||
+        !(ss->win.consts = dsv41_gpu_consts_open(&e->model, &e->weights, n_trunk))) {
+        dsv41_session_state_free(ss);
+        return NULL;
+    }
+    return ss;
+}
+
+static void dsv41_session_state_reset(dsv41_session_state *ss) {
+    const uint32_t n_trunk = ss->st.n_layer;
+    const uint32_t cap = ss->st.max_pos;
+    dsv41_ref_state_free(&ss->st);
+    dsv41_ref_state_init(&ss->st, n_trunk, cap);
+    memset(ss->ids, 0, ss->cap * sizeof(int32_t));
+    memset(ss->dead, 0, ss->cap * sizeof(int32_t));
+    for (uint32_t i = 0; i < ss->win.n_layer; i++) {
+        (void)ds4_gpu_tensor_fill_f32(ss->win.ring[i], 0.0f,
+                                      (uint64_t)ss->win.ring_slots * DS4_N_HEAD_DIM);
+    }
+}
+
+/* The compressed id of every position goes in first, so the hash at this and the next few
+ * positions can look back through it. */
+static void dsv41_session_note(dsv41_session_state *ss, const int *tokens, uint32_t n,
+                               uint32_t pos0) {
+    if (!ss->has_engram) return;
+    for (uint32_t t = 0; t < n; t++) {
+        ss->ids[pos0 + t] = engram_compress_token(ss->ctx.h, tokens[t]);
+        ss->dead[pos0 + t] = 0;
+    }
+}
+
+static bool dsv41_session_step(dsv41_session_state *ss, const ds4_model *m,
+                               const ds4_weights *w, const int *tokens, uint32_t n,
+                               uint32_t pos0, float *logits) {
+    if (pos0 + n > ss->cap) return false;
+    dsv41_session_note(ss, tokens, n, pos0);
+    return dsv41_gpu_forward_token(m, w, &ss->st, tokens, n, pos0,
+                                   ss->has_engram ? &ss->ctx : NULL, &ss->ge,
+                                   &ss->rope0, &ss->ropec, &ss->win, logits, NULL,
+                                   DSV41_PHASE_ALL);
+}
+
+/* A whole prompt, chunked and split by dsv41_gpu_prefill; the tick keeps the session's
+ * checkpoint and progress in step with it. */
+static bool ds4_session_cancelled(ds4_session *s);
+
+struct dsv41_sync_tick_ud {
+    ds4_session *s;
+    const token_vec *prompt;
+    uint32_t seen;
+    bool dirty;         /* the caches have moved past the checkpoint */
+};
+
+static int dsv41_sync_tick(void *ud, uint32_t pos_end, uint32_t total, bool settled) {
+    struct dsv41_sync_tick_ud *c = ud;
+    if (settled) {
+        while (c->s->checkpoint.len < (int)pos_end)
+            token_vec_push(&c->s->checkpoint, c->prompt->v[c->s->checkpoint.len]);
+        c->dirty = false;
+    } else {
+        c->dirty = true;
+    }
+    if (pos_end > c->seen) c->seen = pos_end;
+    if (c->s->progress)
+        c->s->progress(c->s->progress_ud, "prefill_chunk", (int)c->seen, (int)total);
+    return ds4_session_cancelled(c->s) ? 1 : 0;
+}
+
+/* `dirty` reports an interrupted split prompt: the encoder half has published past the
+ * checkpoint, so the state cannot be resumed from it and has to be rebuilt. */
+static bool dsv41_session_prefill(dsv41_session_state *ss, ds4_session *s,
+                                  const ds4_model *m, const ds4_weights *w,
+                                  const token_vec *prompt, uint32_t start, float *logits,
+                                  int *status, bool *dirty) {
+    const uint32_t n = (uint32_t)prompt->len - start;
+    *dirty = false;
+    if (start + n > ss->cap) { *status = DSV41_PREFILL_FAIL; return false; }
+    dsv41_session_note(ss, prompt->v + start, n, start);
+    struct dsv41_sync_tick_ud ud = { s, prompt, start, false };
+    *status = dsv41_gpu_prefill(m, w, &ss->st, prompt->v + start, n, start,
+                                ss->has_engram ? &ss->ctx : NULL, &ss->ge,
+                                &ss->rope0, &ss->ropec, &ss->win, ss->chunk, logits,
+                                &ss->ced, dsv41_sync_tick, &ud);
+    *dirty = ud.dirty;
+    return *status == DSV41_PREFILL_OK;
+}
+
+#endif /* !DS4_NO_GPU */
+
 static uint32_t qwen4_parse_token_list(const char *p, int *seq, uint32_t max) {
     uint32_t n = 0;
     while (*p && n < max) {
@@ -68451,6 +69915,363 @@ int ds4_test_engram_open(const char *path, const int *tokens, unsigned n_tokens,
     return n_bucket;
 }
 
+#ifndef DS4_NO_GPU
+/* Both paths advance the same caches, so the state has to be rewound between them or the
+ * second run would see a compressor group and an index cache the first already filled. */
+typedef struct {
+    float *window_kv, *compress_kv, *index_k, *kv_state, *score_state;
+    uint32_t *n_comp, *topk;
+    int32_t *topk_idxs, *candidates;
+} dsv41_state_snapshot;
+
+static void dsv41_state_save(const dsv41_ref_state *st, dsv41_state_snapshot *sn) {
+    const size_t f = sizeof(float), i32 = sizeof(int32_t), u32 = sizeof(uint32_t);
+    const size_t n = st->n_layer;
+#define SNAP(field_, bytes_) \
+    sn->field_ = xmalloc(bytes_); memcpy(sn->field_, st->field_, bytes_)
+    SNAP(window_kv,   n * st->win * st->hd * f);
+    SNAP(compress_kv, n * st->max_pos * st->hd * f);
+    SNAP(index_k,     n * st->max_pos * st->idim * f);
+    SNAP(kv_state,    n * st->win * st->hd * f);
+    SNAP(score_state, n * st->win * st->hd * f);
+    SNAP(n_comp,      n * u32);
+    SNAP(topk,        n * u32);
+    SNAP(topk_idxs,   n * DS4_N_INDEXER_TOP_K * i32);
+    SNAP(candidates,  n * st->max_pos * i32);
+#undef SNAP
+}
+
+static void dsv41_state_restore(dsv41_ref_state *st, dsv41_state_snapshot *sn, bool free_it) {
+    const size_t f = sizeof(float), i32 = sizeof(int32_t), u32 = sizeof(uint32_t);
+    const size_t n = st->n_layer;
+#define REST(field_, bytes_) \
+    memcpy(st->field_, sn->field_, bytes_); if (free_it) free(sn->field_)
+    REST(window_kv,   n * st->win * st->hd * f);
+    REST(compress_kv, n * st->max_pos * st->hd * f);
+    REST(index_k,     n * st->max_pos * st->idim * f);
+    REST(kv_state,    n * st->win * st->hd * f);
+    REST(score_state, n * st->win * st->hd * f);
+    REST(n_comp,      n * u32);
+    REST(topk,        n * u32);
+    REST(topk_idxs,   n * DS4_N_INDEXER_TOP_K * i32);
+    REST(candidates,  n * st->max_pos * i32);
+#undef REST
+}
+
+/* Prefills on the CPU, then runs ONE decode step's attention twice for layer `il`: once
+ * through dsv41_ref_attn_step and once through the composed Metal kernels, on identical
+ * inputs.  `cpu` and `gpu` each receive n_embd floats. */
+/* Every layer is done under ONE model_open: re-mapping per call left the GPU holding
+ * views onto the previous mapping, so a later kernel could read through a stale view and
+ * the result depended on how much of the map earlier calls had touched. */
+int ds4_test_dsv41_attn_gpu(const char *path, const int *tokens, unsigned n_tokens,
+                            const unsigned *ils, unsigned n_il,
+                            float *cpu_all, float *gpu_all, double *state_err,
+                            const char *engram_path) {
+    ds4_model m;
+    ds4_weights w;
+    model_open(&m, path, true, false);
+    config_validate_model(&m);
+    weights_bind(&w, &m, false, 0, UINT32_MAX, true, false);
+    if (!ds4_gpu_init() || !ds4_gpu_set_model_map(m.map, m.size)) {
+        model_close(&m);
+        return 0;
+    }
+    /* one prefill for every layer case: at released precision the CPU reference costs
+     * seconds per token, and each case only needs the state it leaves behind */
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const uint32_t max_pos = n_tokens + 2u;
+    dsv41_ref_state st;
+    dsv41_state_snapshot base;
+    dsv41_ref_state_init(&st, n_trunk, max_pos);
+    /* the step under test re-runs the last prefill token at position n_tokens, so the
+     * compressed id history has to cover that position too */
+    int *hist = xmalloc((n_tokens + 1u) * sizeof(int));
+    memcpy(hist, tokens, n_tokens * sizeof(int));
+    hist[n_tokens] = tokens[n_tokens - 1u];
+    dsv41_ref_engram_run eng;
+    dsv41_ref_engram_open(&eng, engram_path, hist, n_tokens + 1u);
+    free(hist);
+    const dsv41_ref_engram *ec = eng.open ? &eng.ctx : NULL;
+    dsv41_ref_prefill(&m, &w, tokens, n_tokens, n_trunk, NULL, NULL, NULL, NULL, NULL, NULL,
+                      &st, ec);
+    dsv41_state_save(&st, &base);
+    dsv41_gpu_engram ge;
+    if (!dsv41_gpu_engram_open(&ge, ec)) {
+        dsv41_ref_engram_close(&eng);
+        model_close(&m);
+        return 0;
+    }
+
+    int all_ok = 1;
+    for (unsigned c = 0; c < n_il; c++) {
+    const unsigned il = ils[c];
+    float *cpu = cpu_all + (size_t)c * DS4_N_EMBD * DS4_N_HC;
+    float *gpu = gpu_all + (size_t)c * DS4_N_EMBD * DS4_N_HC;
+    if (il >= n_trunk) { all_ok = 0; continue; }
+
+    const uint32_t dim = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = dim * hc;
+    dsv41_state_restore(&st, &base, false);
+
+    /* build this layer's attention input exactly as the decode path does */
+    const uint32_t pos = n_tokens;
+    float *stream = xmalloc(hc_dim * sizeof(float));
+    float *pre_mix = xmalloc(hc * sizeof(float));
+    float *post = xmalloc(hc * sizeof(float));
+    float *comb = xmalloc((size_t)hc * hc * sizeof(float));
+    float *collapsed = xmalloc(dim * sizeof(float));
+    float *normed = xmalloc(dim * sizeof(float));
+    float *qr = xmalloc(DS4_N_LORA_Q * sizeof(float));
+    qwen4_ref_row(&m, w.token_embd, (uint64_t)tokens[n_tokens - 1u], stream);
+    for (uint32_t c = 1; c < hc; c++) memcpy(stream + c * dim, stream, dim * sizeof(float));
+    for (uint32_t c = 0; c < hc; c++) pre_mix[c] = c == 0 ? 1.0f : 0.0f;
+    /* the mix this attention produces is for the FFN; hc_pre collapses with the INCOMING
+     * one, which at the top of a forward is the identity */
+    float *attn_pre = xmalloc(hc * sizeof(float));
+    /* the GPU runs its own engram, so it is handed the block's input before the CPU's */
+    float *gpu_in = xmalloc(hc_dim * sizeof(float));
+    memcpy(gpu_in, stream, hc_dim * sizeof(float));
+    if (ec) {
+        dsv41_ref_engram ic = *ec;
+        ic.pos0 = pos;
+        dsv41_ref_engram_inject(&ic, il, stream, 1);
+    }
+    dsv41_ref_hc_mixes(&m, w.layer[il].hc_attn_fn, w.layer[il].hc_attn_scale,
+                       w.layer[il].hc_attn_base, stream, hc_dim, hc,
+                       DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, attn_pre, post, comb);
+    for (uint32_t d = 0; d < dim; d++) {
+        float acc = 0.0f;
+        for (uint32_t c = 0; c < hc; c++) acc += pre_mix[c] * stream[c * dim + d];
+        collapsed[d] = acc;
+    }
+    qwen4_ref_rms(normed, collapsed, qwen4_ref_f32(&m, w.layer[il].attn_norm), dim, DS4_RMS_EPS);
+
+    dsv41_state_snapshot snap, after_cpu;
+    dsv41_state_save(&st, &snap);
+
+    /* CPU: attention, then hc_post back into the stream -- the same sublayer the GPU runs */
+    float *sub = xmalloc(dim * sizeof(float));
+    float *residual = xmalloc(hc_dim * sizeof(float));
+    float *ffn_res = xmalloc(hc_dim * sizeof(float));
+    memcpy(residual, stream, hc_dim * sizeof(float));
+    dsv41_ref_attn_step(&m, &w, il, &st, normed, pos, qr, sub);
+    for (uint32_t c = 0; c < hc; c++) {
+        for (uint32_t d = 0; d < dim; d++) {
+            float acc = post[c] * sub[d];
+            for (uint32_t k = 0; k < hc; k++) acc += comb[k * hc + c] * residual[k * dim + d];
+            cpu[c * dim + d] = acc;
+        }
+    }
+    /* FFN sublayer: hc_pre uses the mix this attention produced */
+    float *ffn_pre = xmalloc(hc * sizeof(float));
+    if (dsv41_env("DS4_DSV41_ATTN_ONLY", &g_dsv41_env_attn_only)) goto skip_ffn;
+    /* the attention's residual is what the GPU run is handed below, so the FFN's keeps
+     * its own copy */
+    memcpy(ffn_res, cpu, hc_dim * sizeof(float));
+    dsv41_ref_hc_mixes(&m, w.layer[il].hc_ffn_fn, w.layer[il].hc_ffn_scale,
+                       w.layer[il].hc_ffn_base, cpu, hc_dim, hc,
+                       DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, ffn_pre, post, comb);
+    for (uint32_t d = 0; d < dim; d++) {
+        float acc = 0.0f;
+        for (uint32_t c = 0; c < hc; c++) acc += attn_pre[c] * cpu[c * dim + d];
+        collapsed[d] = acc;
+    }
+    qwen4_ref_rms(normed, collapsed, qwen4_ref_f32(&m, w.layer[il].ffn_norm), dim, DS4_RMS_EPS);
+    dsv41_ref_moe(&m, &w.layer[il], normed, dim, DS4_N_FF_EXP, ds4_layer_expert_count(il),
+                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, DS4_EXPERT_WEIGHT_SCALE, sub);
+    if (dsv41_env("DS4_DSV41_MOE_ONLY", &g_dsv41_env_moe_only)) {
+        memcpy(cpu, sub, dim * sizeof(float));
+        free(ffn_pre);
+        goto after_cpu_done;
+    }
+    for (uint32_t c = 0; c < hc; c++) {
+        for (uint32_t d = 0; d < dim; d++) {
+            float acc = post[c] * sub[d];
+            for (uint32_t k = 0; k < hc; k++) acc += comb[k * hc + c] * ffn_res[k * dim + d];
+            cpu[c * dim + d] = acc;
+        }
+    }
+skip_ffn:
+    free(ffn_pre);
+after_cpu_done:;
+
+    const dsv41_ref_freqs *f = ds4_layer_compress_ratio(il) ? &st.fc : &st.f0;
+    int ok = 0;
+    {
+        /* what the CPU path published, so the GPU run can be held to the same caches */
+        dsv41_state_save(&st, &after_cpu);
+        dsv41_state_restore(&st, &snap, false);
+        float *identity = xmalloc(hc * sizeof(float));
+        for (uint32_t c = 0; c < hc; c++) identity[c] = c == 0 ? 1.0f : 0.0f;
+        dsv41_ref_engram gc;
+        if (ec) { gc = *ec; gc.pos0 = pos; }
+        dsv41_gpu_rope rope = {0};
+        dsv41_gpu_buf b_st = {0}, b_mx = {0};
+        ok = dsv41_gpu_rope_open(&rope, f) &&
+             dsv41_gpu_buf_alloc(&b_st, hc_dim) && dsv41_gpu_buf_put(&b_st, gpu_in, hc_dim) &&
+             dsv41_gpu_buf_alloc(&b_mx, hc) && dsv41_gpu_buf_put(&b_mx, identity, hc) &&
+             dsv41_gpu_attn_step(&m, &w, il, &st, b_st.t, b_mx.t, pos, 1u,
+                                 rope.cos, rope.sin, gpu,
+                                 ec ? &gc : NULL, &ge, NULL, DSV41_BLOCK_FULL) ? 1 : 0;
+        ds4_gpu_tensor_free(b_st.t); ds4_gpu_tensor_free(b_mx.t);
+        dsv41_gpu_rope_close(&rope);
+        free(identity);
+        if (ok && state_err) {
+            double *slot = &state_err[c];
+            /* the GPU path must advance compress_kv / index_k / n_comp / topk_idxs to
+             * exactly what the CPU published -- otherwise it could match the output while
+             * quietly leaving the caches stale */
+            double worst = 0.0;
+            if (getenv("DS4_DSV41_DUMP_IDX")) {
+                for (uint32_t L = 0; L < st.n_layer; L++) {
+                    if (!st.topk[L]) continue;
+                    fprintf(stderr, "ds4: il=%u L=%u gpu=[", il, L);
+                    for (uint32_t i = 0; i < st.topk[L]; i++)
+                        fprintf(stderr, "%d ", st.topk_idxs[(size_t)L * DS4_N_INDEXER_TOP_K + i]);
+                    fprintf(stderr, "] cpu=[");
+                    for (uint32_t i = 0; i < after_cpu.topk[L]; i++)
+                        fprintf(stderr, "%d ", after_cpu.topk_idxs[(size_t)L * DS4_N_INDEXER_TOP_K + i]);
+                    fprintf(stderr, "]\n");
+                }
+            }
+            for (uint32_t L = 0; L < st.n_layer; L++) {
+                if (st.n_comp[L] != after_cpu.n_comp[L]) {
+                    worst = 1.0e30;
+                    fprintf(stderr, "ds4: layer %u n_comp gpu=%u cpu=%u\n",
+                            L, st.n_comp[L], after_cpu.n_comp[L]);
+                }
+                if (st.topk[L] != after_cpu.topk[L]) {
+                    worst = 1.0e30;
+                    fprintf(stderr, "ds4: layer %u topk gpu=%u cpu=%u\n",
+                            L, st.topk[L], after_cpu.topk[L]);
+                }
+                for (uint32_t i = 0; i < DS4_N_INDEXER_TOP_K; i++) {
+                    const size_t o = (size_t)L * DS4_N_INDEXER_TOP_K + i;
+                    if (st.topk_idxs[o] != after_cpu.topk_idxs[o]) {
+                        if (worst < 1.0e29) {
+                            fprintf(stderr, "ds4: layer %u topk_idxs[%u] gpu=%d cpu=%d\n",
+                                    L, i, st.topk_idxs[o], after_cpu.topk_idxs[o]);
+                        }
+                        worst = 1.0e30;
+                    }
+                }
+                for (uint32_t i = 0; i < st.n_comp[L] * st.hd; i++) {
+                    const size_t o = (size_t)L * st.max_pos * st.hd + i;
+                    const double d = fabs((double)st.compress_kv[o] - after_cpu.compress_kv[o]);
+                    if (d > worst) worst = d;
+                }
+                for (uint32_t i = 0; i < st.n_comp[L] * st.idim; i++) {
+                    const size_t o = (size_t)L * st.max_pos * st.idim + i;
+                    const double d = fabs((double)st.index_k[o] - after_cpu.index_k[o]);
+                    if (d > worst) worst = d;
+                }
+            }
+            *slot = worst;
+        }
+        dsv41_state_restore(&st, &after_cpu, true);
+    }
+    free(stream); free(pre_mix); free(post); free(comb);
+    dsv41_state_restore(&st, &snap, true);
+    free(collapsed); free(normed); free(qr); free(sub); free(residual); free(ffn_res);
+    free(attn_pre); free(gpu_in);
+    if (!ok) all_ok = 0;
+    }
+    dsv41_state_restore(&st, &base, true);
+    dsv41_ref_state_free(&st);
+    dsv41_gpu_engram_close(&ge);
+    dsv41_ref_engram_close(&eng);
+    model_close(&m);
+    return all_ok;
+}
+/* Greedy generation straight off the GPU trunk, so the forward can be scored end to end
+ * before it is wired into a session. */
+int ds4_test_dsv41_gpu_generate(const char *path, const char *engram_path,
+                                const int *tokens, unsigned n_tokens,
+                                unsigned n_predict, unsigned chunk,
+                                int *out_tokens, float *logits) {
+    ds4_model m;
+    ds4_weights w;
+    model_open(&m, path, true, false);
+    config_validate_model(&m);
+    weights_bind(&w, &m, false, 0, UINT32_MAX, true, false);
+    if (!ds4_gpu_init() || !ds4_gpu_set_model_map(m.map, m.size)) {
+        model_close(&m);
+        return -1;
+    }
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const uint32_t total = n_tokens + n_predict;
+    dsv41_ref_state st;
+    dsv41_ref_state_init(&st, n_trunk, total + 1u);
+
+    int *hist = xmalloc(total * sizeof(int));
+    memcpy(hist, tokens, n_tokens * sizeof(int));
+    for (unsigned i = n_tokens; i < total; i++) hist[i] = tokens[n_tokens - 1u];
+    dsv41_ref_engram_run eng;
+    dsv41_ref_engram_open(&eng, engram_path, hist, total);
+    const dsv41_ref_engram *ec = eng.open ? &eng.ctx : NULL;
+    dsv41_gpu_engram ge;
+    dsv41_gpu_rope rope0 = {0}, ropec = {0};
+    dsv41_gpu_window win = {0};
+    int made = 0;
+    if (chunk == 0u) chunk = 1u;
+    if (!dsv41_gpu_engram_open(&ge, ec) ||
+        !dsv41_gpu_rope_open(&rope0, &st.f0) || !dsv41_gpu_rope_open(&ropec, &st.fc) ||
+        !dsv41_gpu_window_open(&win, n_trunk, total + 1u, chunk) ||
+        !(win.consts = dsv41_gpu_consts_open(&m, &w, n_trunk))) {
+        made = -1;
+        goto done;
+    }
+
+    float *lg = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    for (unsigned i = 0; i < total; i++) {
+        /* the prompt goes through in chunks; generation is one token at a time */
+        unsigned n = 1u;
+        if (i < n_tokens) {
+            n = n_tokens - i < chunk ? n_tokens - i : chunk;
+        }
+        const bool last_prompt = (i + n == n_tokens);
+        const bool generating = i >= n_tokens;
+        float *want = (last_prompt || generating) ? lg : NULL;
+        if (i == 0 && n_tokens > 0) { n = n_tokens; want = lg; }   /* prefill chunks itself */
+        if (i == 0 && n_tokens > 0
+                ? dsv41_gpu_prefill(&m, &w, &st, hist, n, 0, ec, &ge, &rope0, &ropec,
+                                    &win, chunk, lg, NULL, NULL, NULL) != DSV41_PREFILL_OK
+                : !dsv41_gpu_forward_token(&m, &w, &st, &hist[i], n, i, ec, &ge,
+                                           &rope0, &ropec, &win, want, NULL,
+                                           DSV41_PHASE_ALL)) {
+            made = -1;
+            break;
+        }
+        i += n - 1u;
+        if (!want) continue;
+        int best = 0;
+        for (uint32_t v = 1; v < DS4_N_VOCAB; v++) if (lg[v] > lg[best]) best = (int)v;
+        if (i + 1u < total) {
+            hist[i + 1u] = best;
+            /* the engram hashes the compressed id of every position, this one included */
+            if (eng.open) {
+                eng.ids[i + 1u] = engram_compress_token(&g_ds4_engram, best);
+                eng.dead[i + 1u] = 0;
+            }
+        }
+        if (out_tokens && made < (int)n_predict) out_tokens[made] = best;
+        made++;
+        if (logits && made == 1) memcpy(logits, lg, (size_t)DS4_N_VOCAB * sizeof(float));
+    }
+    free(lg);
+done:
+    dsv41_gpu_window_close(&win);
+    dsv41_gpu_rope_close(&rope0);
+    dsv41_gpu_rope_close(&ropec);
+    dsv41_gpu_engram_close(&ge);
+    dsv41_ref_engram_close(&eng);
+    free(hist);
+    dsv41_ref_state_free(&st);
+    model_close(&m);
+    return made;
+}
+
+#endif /* !DS4_NO_GPU */
 
 /* Runs one engram block from a sidecar against the supplied stream, again without the
  * engine.  `x` and `out` are [hc, n_embd]; `gate_out` is one gate per hc copy. */
@@ -70729,6 +72550,27 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         *out = s;
         return 0;
     }
+    if (ds4_model_is_dsv41()) {
+        if (e->backend != DS4_BACKEND_METAL || e->distributed.role != DS4_DISTRIBUTED_NONE) {
+            fprintf(stderr, "ds4: DeepSeek V4.1 sessions are Metal-only, single node for now\n");
+            free(s);
+            return 1;
+        }
+        s->dsv41 = dsv41_session_state_alloc(e, (uint32_t)ctx_size);
+        if (!s->dsv41) {
+            free(s);
+            return 1;
+        }
+        s->prefill_cap = (uint32_t)ctx_size;
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+        if (!ds4_session_tp_register(s)) {
+            ds4_session_free(s);
+            return 1;
+        }
+        *out = s;
+        return 0;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         const uint32_t normal_layers = glm_graph_normal_layer_count();
         uint32_t layer_start = 0;
@@ -71059,6 +72901,10 @@ void ds4_session_free(ds4_session *s) {
     ds4_session_print_dspark_stats(s);
 #endif
     ds4_dist_session_free(s->distributed);
+#ifndef DS4_NO_GPU
+    dsv41_session_state_free(s->dsv41);
+    s->dsv41 = NULL;
+#endif
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
@@ -72748,6 +74594,43 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                      errlen);
     }
 #ifndef DS4_NO_GPU
+    if (ds4_session_is_dsv41(s)) {
+        ds4_engine *e = s->engine;
+        int start = 0;
+        /* a matching prefix is extended in place; anything else starts from token zero */
+        if (s->checkpoint_valid &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            start = s->checkpoint.len;
+        } else {
+            dsv41_session_state_reset(s->dsv41);
+            s->checkpoint.len = 0;
+            s->checkpoint_valid = false;
+        }
+        for (int i = start; i < prompt->len; i++) {
+            if (prompt->v[i] < 0 || prompt->v[i] >= (int)DS4_N_VOCAB) {
+                snprintf(err, errlen, "token id %d at position %d is outside the vocabulary",
+                         prompt->v[i], i);
+                return 1;
+            }
+        }
+        int status = DSV41_PREFILL_OK;
+        bool dirty = false;
+        if (!dsv41_session_prefill(s->dsv41, s, &e->model, &e->weights, prompt,
+                                   (uint32_t)start, s->logits, &status, &dirty)) {
+            if (status == DSV41_PREFILL_STOPPED) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = s->checkpoint.len > 0 && !dirty;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            snprintf(err, errlen, "DeepSeek V4.1 prefill failed");
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
     if (ds4_session_is_qwen4(s)) {
         ds4_engine *e = s->engine;
         int start = 0;
@@ -74682,6 +76565,23 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     return 1;
 #else
     ds4_engine *e = s->engine;
+    if (ds4_session_is_dsv41(s)) {
+        const uint32_t pos = (uint32_t)s->checkpoint.len;
+        if (pos + 1u >= s->dsv41->cap) {
+            if (errlen) snprintf(err, errlen, "context is full");
+            return 1;
+        }
+        if (!dsv41_session_step(s->dsv41, &e->model, &e->weights, &token, 1u, pos,
+                                s->logits)) {
+            if (errlen) snprintf(err, errlen, "DeepSeek V4.1 decode failed");
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        (void)probe_mtp;
+        return 0;
+    }
     if (ds4_session_is_qwen4(s)) {
         if (!s->qwen4_graph_ready) {
             if (errlen) snprintf(err, errlen, "Qwen3.8 graph is not initialized");

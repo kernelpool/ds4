@@ -153,6 +153,18 @@ tests/test_dsv41_metal.o: tests/test_dsv41_metal.c ds4_gpu.h
 tests/test_dsv41_metal: tests/test_dsv41_metal.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+# ds4.c with the test hooks AND the GPU backend, so the composed layer can be scored
+# against the same CPU reference the oracle validates.
+ds4_gpu_test_hooks.o: ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_TEST_HOOKS -c -o $@ $<
+
+tests/test_dsv41_layer.o: tests/test_dsv41_layer.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_dsv41_layer: tests/test_dsv41_layer.o ds4_gpu_test_hooks.o ds4_metal.o \
+		ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
 check-mxfp4-half-lut:
 	python3 metal/generate_mxfp4_half_lut.py --check
 
