@@ -38,7 +38,11 @@ QTYPE_Q4_K = 12
 QTYPE_Q8_K = 15
 QTYPE_IQ2_XXS = 16
 QTYPE_I8 = 24
+QTYPE_I32 = 26
+QTYPE_I64 = 27
 QTYPE_BF16 = 30
+# Private to DS4: 64 sits above every type number GGML has assigned.
+QTYPE_F8_E4M3 = 64
 
 QTYPE_NAMES = {
     QTYPE_F32: "F32",
@@ -49,7 +53,10 @@ QTYPE_NAMES = {
     QTYPE_Q8_K: "Q8_K",
     QTYPE_IQ2_XXS: "IQ2_XXS",
     QTYPE_I8: "I8",
+    QTYPE_I32: "I32",
+    QTYPE_I64: "I64",
     QTYPE_BF16: "BF16",
+    QTYPE_F8_E4M3: "F8_E4M3",
 }
 
 QTYPE_LAYOUT = {
@@ -61,7 +68,10 @@ QTYPE_LAYOUT = {
     QTYPE_Q8_K: (256, 292),
     QTYPE_IQ2_XXS: (256, 66),
     QTYPE_I8: (1, 1),
+    QTYPE_I32: (1, 4),
+    QTYPE_I64: (1, 8),
     QTYPE_BF16: (1, 2),
+    QTYPE_F8_E4M3: (32, 33),
 }
 
 LAYER_PREFIX = "model.language_model.layers"

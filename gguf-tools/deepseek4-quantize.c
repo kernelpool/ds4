@@ -385,6 +385,10 @@ typedef struct {
     char *source_revision;
 } hf_model_metadata;
 
+/* Layers at or past this index are the MTP draft stages, which the checkpoint stores
+ * under mtp.N.* rather than layers.N.*.  Zero leaves the mapping untouched. */
+static int g_backbone_layers = 0;
+
 static hf_model_metadata load_hf_model_metadata(const char *hf_dir,
                                                 const char *source_revision) {
     hf_model_metadata m = {0};
@@ -392,7 +396,10 @@ static hf_model_metadata load_hf_model_metadata(const char *hf_dir,
     size_t len = 0;
     char *text = read_file(path, &len);
     json_doc d = json_parse_text(text, len);
-    int ratios = json_obj_get(&d, 0, "compress_ratios");
+    /* V4 keeps these at the top level; V4.1 nests the language model under text_config. */
+    int root = json_obj_get(&d, 0, "text_config");
+    if (root < 0 || d.v[root].type != JT_OBJECT) root = 0;
+    int ratios = json_obj_get(&d, root, "compress_ratios");
     if (ratios < 0 || d.v[ratios].type != JT_ARRAY) {
         fprintf(stderr, "error: missing compress_ratios array in %s\n", path);
         exit(1);
@@ -416,7 +423,12 @@ static hf_model_metadata load_hf_model_metadata(const char *hf_dir,
         m.compress_ratios[j++] = (uint32_t)value;
     }
 
-    int rms_eps = json_obj_get(&d, 0, "rms_norm_eps");
+    int backbone = json_obj_get(&d, root, "num_hidden_layers");
+    if (backbone >= 0 && d.v[backbone].type == JT_PRIMITIVE) {
+        const double v = json_f64(&d, backbone);
+        if (v > 0 && v < 4096) g_backbone_layers = (int)v;
+    }
+    int rms_eps = json_obj_get(&d, root, "rms_norm_eps");
     if (rms_eps < 0) {
         fprintf(stderr, "error: missing rms_norm_eps in %s\n", path);
         exit(1);
@@ -846,12 +858,16 @@ static float *dequant_fp8_weight(const st_value *w, const st_value *scale, int64
     if (w->n_dims != 2 || scale->n_dims != 2) die("FP8 tensor must be 2D");
     const int64_t out_dim = w->shape[0];
     const int64_t in_dim = w->shape[1];
-    const int64_t block_out = 128;
-    const int64_t block_in = 128;
-    if (out_dim % block_out || in_dim % block_in) die("FP8 dims are not divisible by 128");
-    const int64_t scale_rows = out_dim / block_out;
-    const int64_t scale_cols = in_dim / block_in;
-    if (scale->shape[0] != scale_rows || scale->shape[1] != scale_cols) die("FP8 scale shape mismatch");
+    /* V4 Flash blocks 128x128, V4.1 blocks 32x32, so take the block size from the
+     * scale grid rather than assuming one. */
+    const int64_t scale_rows = scale->shape[0];
+    const int64_t scale_cols = scale->shape[1];
+    if (scale_rows <= 0 || scale_cols <= 0) die("FP8 scale shape mismatch");
+    if (out_dim % scale_rows || in_dim % scale_cols) die("FP8 dims are not a multiple of the scale grid");
+    const int64_t block_out = out_dim / scale_rows;
+    const int64_t block_in = in_dim / scale_cols;
+    if (block_out != 32 && block_out != 128) die("unsupported FP8 output block size");
+    if (block_in != 32 && block_in != 128) die("unsupported FP8 input block size");
     /* shape and data_offsets are independent header fields; cross-check that the
      * on-disk buffers (sized from data_offsets by db_read) are actually large
      * enough for the shape-driven indexing below. Without this, a weight that
@@ -1204,6 +1220,8 @@ static const name_map layer_map[] = {
     { "attn_compressor_norm.weight",      "attn.compressor.norm.weight" },
     { "indexer.attn_q_b.weight",          "attn.indexer.wq_b.weight" },
     { "indexer.proj.weight",              "attn.indexer.weights_proj.weight" },
+    { "indexer.attn_k.weight",            "attn.indexer.wk.weight" },
+    { "indexer.k_norm.weight",            "attn.indexer.k_norm.weight" },
     { "indexer_compressor_ape.weight",    "attn.indexer.compressor.ape" },
     { "indexer_compressor_kv.weight",     "attn.indexer.compressor.wkv.weight" },
     { "indexer_compressor_gate.weight",   "attn.indexer.compressor.wgate.weight" },
@@ -1234,7 +1252,12 @@ static char *hf_name_for_regular(const char *gguf_name) {
     for (size_t i = 0; i < sizeof(layer_map) / sizeof(layer_map[0]); i++) {
         if (strcmp(rest, layer_map[i].gguf) == 0) {
             char buf[512];
-            snprintf(buf, sizeof(buf), "layers.%d.%s", layer, layer_map[i].hf);
+            if (g_backbone_layers > 0 && layer >= g_backbone_layers) {
+                snprintf(buf, sizeof(buf), "mtp.%d.%s", layer - g_backbone_layers,
+                         layer_map[i].hf);
+            } else {
+                snprintf(buf, sizeof(buf), "layers.%d.%s", layer, layer_map[i].hf);
+            }
             return xstrdup(buf);
         }
     }
@@ -1515,6 +1538,9 @@ static void generate_one_expert(expert_job *j, int xid) {
     char prefix[256];
     if (j->expert.scope == EXP_SCOPE_MTP) {
         snprintf(prefix, sizeof(prefix), "mtp.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
+    } else if (g_backbone_layers > 0 && j->expert.layer >= g_backbone_layers) {
+        snprintf(prefix, sizeof(prefix), "mtp.%d.ffn.experts.%d.%s",
+                 j->expert.layer - g_backbone_layers, xid, j->wid);
     } else {
         snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
     }
@@ -1592,6 +1618,11 @@ static byte_buf generate_expert(st_db *db, const char *gguf_name, const tensor_m
     const char *wid = expert_part_name(e.part);
     const int64_t ncols = tmpl->ne[0];
     const int64_t nrows = tmpl->ne[1];
+    /* The DSpark draft stages carry a smaller routed pool than the backbone, so the
+     * tensor's own third dimension is the authority, not the model-wide expert count. */
+    if (tensor_n_dims(tmpl) >= 3 && tmpl->ne[2] > 0 && tmpl->ne[2] != n_experts) {
+        n_experts = (int)tmpl->ne[2];
+    }
     const size_t per_expert = (size_t)nrows * ds4q_row_size(target, ncols);
     byte_buf out = { .size = per_expert * (size_t)n_experts, .data = xmalloc(per_expert * (size_t)n_experts) };
     ds4q_quantize_init(target);
