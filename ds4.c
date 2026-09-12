@@ -66396,8 +66396,9 @@ typedef struct {
     ds4_gpu_tensor *dring;      /* [n_stage][win, hd] */
     ds4_gpu_tensor *conf_proj;  /* [dim + rank] F32 */
     uint32_t mh_pos0, mh_rows;  /* the positions the last pass captured */
-    /* the compressor inputs of the last pass per pooled kv-source layer, from the open
-     * group's first position, so a rejected tail can be rolled back to any row */
+    /* per pooled kv-source layer, the compressor inputs of the last pass from its open
+     * group's first position: the next pass finds its open group there by position, which
+     * is also how a rejected tail rolls back */
     ds4_gpu_tensor **pass_kv, **pass_sc;
     uint32_t *pass_pos0, *pass_rows;
     /* the expert-major MoE's counting sort of a chunk's (token, slot) pairs */
@@ -66412,8 +66413,6 @@ typedef struct {
     ds4_gpu_tensor **ikey;      /* [n_layer] of [max_pos, index_head_dim] or NULL */
     /* the compressor group a chunk boundary cut through, [ratio, head_dim] each; only a
      * kv-source layer above ratio 1 has one */
-    ds4_gpu_tensor **pkv;
-    ds4_gpu_tensor **psc;
     dsv41_gpu_consts *consts;   /* [n_layer] once bound, else NULL */
 } dsv41_gpu_window;
 
@@ -66445,14 +66444,6 @@ static void dsv41_gpu_window_close(dsv41_gpu_window *g) {
     if (g->ikey) {
         for (uint32_t i = 0; i < g->n_layer; i++) ds4_gpu_tensor_free(g->ikey[i]);
         free(g->ikey);
-    }
-    if (g->pkv) {
-        for (uint32_t i = 0; i < g->n_layer; i++) ds4_gpu_tensor_free(g->pkv[i]);
-        free(g->pkv);
-    }
-    if (g->psc) {
-        for (uint32_t i = 0; i < g->n_layer; i++) ds4_gpu_tensor_free(g->psc[i]);
-        free(g->psc);
     }
     dsv41_gpu_consts_free(g->consts, g->n_layer);
     memset(g, 0, sizeof(*g));
@@ -66505,8 +66496,6 @@ static bool dsv41_gpu_window_open(dsv41_gpu_window *g, uint32_t n_layer, uint32_
     }
     g->ckv = xcalloc(n_layer, sizeof(*g->ckv));
     g->ikey = xcalloc(n_layer, sizeof(*g->ikey));
-    g->pkv = xcalloc(n_layer, sizeof(*g->pkv));
-    g->psc = xcalloc(n_layer, sizeof(*g->psc));
     for (uint32_t i = 0; i < n_layer; i++) {
         const uint32_t ratio = ds4_layer_compress_ratio(i);
         if (ratio == 0 || g_ds4_kv_source_layer[i] != i) continue;
@@ -66514,12 +66503,6 @@ static bool dsv41_gpu_window_open(dsv41_gpu_window *g, uint32_t n_layer, uint32_
         g->ikey[i] = ds4_gpu_tensor_alloc((uint64_t)max_pos * DS4_N_INDEXER_HEAD_DIM *
                                           sizeof(float));
         if (!g->ckv[i] || !g->ikey[i]) { dsv41_gpu_window_close(g); return false; }
-        if (ratio > 1u) {
-            const uint64_t n = (uint64_t)ratio * DS4_N_HEAD_DIM;
-            g->pkv[i] = ds4_gpu_tensor_alloc(n * sizeof(float));
-            g->psc[i] = ds4_gpu_tensor_alloc(n * sizeof(float));
-            if (!g->pkv[i] || !g->psc[i]) { dsv41_gpu_window_close(g); return false; }
-        }
     }
     if (!dsv41_gpu_buf_alloc(&g->join, ((uint64_t)DS4_N_SWA + max_pos) * DS4_N_HEAD_DIM) ||
         !dsv41_gpu_buf_alloc(&g->sc, max_pos) ||
@@ -66533,7 +66516,7 @@ static bool dsv41_gpu_window_open(dsv41_gpu_window *g, uint32_t n_layer, uint32_
     g->pass_pos0 = xcalloc(n_layer, sizeof(*g->pass_pos0));
     g->pass_rows = xcalloc(n_layer, sizeof(*g->pass_rows));
     for (uint32_t i = 0; i < n_layer; i++) {
-        if (!g->pkv[i]) continue;
+        if (ds4_layer_compress_ratio(i) < 2u || g_ds4_kv_source_layer[i] != i) continue;
         const uint64_t rows = (uint64_t)ds4_layer_compress_ratio(i) + pass_max;
         g->pass_kv[i] = ds4_gpu_tensor_alloc(rows * DS4_N_HEAD_DIM * sizeof(float));
         g->pass_sc[i] = ds4_gpu_tensor_alloc(rows * DS4_N_HEAD_DIM * sizeof(float));
@@ -66617,27 +66600,57 @@ static bool dsv41_gpu_compress_chunk(const ds4_model *m, const ds4_layer_weights
     const uint32_t g0 = st->n_comp[il];
     const uint32_t gpos0 = pos0 - lead;         /* a latent stands for its group's first token */
     const uint64_t row = (uint64_t)hd * sizeof(float);
+    const uint32_t n_lat = ratio == 1u ? n_tok : groups;
     bool ok = true;
     dsv41_gpu_buf b_kv = {0}, b_sc = {0}, b_lat = {0}, b_ik = {0};
+    /* on the device the latents and index keys land in their caches directly, and the
+     * pooled rows live in the window's pass buffer; a blit ends the compute encoder, and
+     * this used to take a dozen of them per token */
+    ds4_gpu_tensor *lat = NULL, *ik = NULL;
+    if (win_gpu) {
+        lat = ds4_gpu_tensor_view(win_gpu->ckv[il], (uint64_t)g0 * row, (uint64_t)(n_lat ? n_lat : 1u) * row);
+        if (g_ds4_index_source_layer[il] == il) {
+            ik = ds4_gpu_tensor_view(win_gpu->ikey[il], (uint64_t)g0 * idim * sizeof(float),
+                                     (uint64_t)(n_lat ? n_lat : 1u) * idim * sizeof(float));
+        }
+        ok = lat && (ik || g_ds4_index_source_layer[il] != il);
+    } else if (n_lat) {
+        ok = dsv41_gpu_buf_alloc(&b_lat, (uint64_t)n_lat * hd) &&
+             (g_ds4_index_source_layer[il] != il || dsv41_gpu_buf_alloc(&b_ik, (uint64_t)n_lat * idim));
+        lat = b_lat.t; ik = b_ik.t;
+    }
 
     if (ratio == 1u) {
-        ok = dsv41_gpu_buf_alloc(&b_lat, (uint64_t)n_tok * hd) &&
-             dsv41_gpu_matvec(m, l->attn_compressor_kv, l->attn_compressor_kv->abs_offset,
-                              dim, hd, n_tok, x_all, b_lat.t) &&
-             ds4_gpu_rms_norm_weight_rows_tensor(b_lat.t, b_lat.t, m->map, m->size,
+        ok = ok && dsv41_gpu_matvec(m, l->attn_compressor_kv, l->attn_compressor_kv->abs_offset,
+                                    dim, hd, n_tok, x_all, lat) &&
+             ds4_gpu_rms_norm_weight_rows_tensor(lat, lat, m->map, m->size,
                                                  l->attn_compressor_norm->abs_offset, hd,
                                                  n_tok, DS4_RMS_EPS);
     } else {
         float *kvs = st->kv_state + (size_t)il * st->win * hd;
         float *scs = st->score_state + (size_t)il * st->win * hd;
-        ok = dsv41_gpu_buf_alloc(&b_kv, (uint64_t)total * hd) &&
-             dsv41_gpu_buf_alloc(&b_sc, (uint64_t)total * hd);
-        if (ok && lead) {
-            ok = win_gpu
-               ? ds4_gpu_tensor_copy(b_kv.t, 0, win_gpu->pkv[il], 0, lead * row) != 0 &&
-                 ds4_gpu_tensor_copy(b_sc.t, 0, win_gpu->psc[il], 0, lead * row) != 0
-               : dsv41_gpu_buf_put(&b_kv, kvs, (uint64_t)lead * hd) &&
-                 dsv41_gpu_buf_put(&b_sc, scs, (uint64_t)lead * hd);
+        if (win_gpu) {
+            /* the open group's rows are somewhere in the last pass's rows: bring them to
+             * the front unless they already are (a rollback moves the frontier back, so
+             * the position tells, not the last pass's end) */
+            b_kv.t = win_gpu->pass_kv[il]; b_sc.t = win_gpu->pass_sc[il];
+            if (ok && lead) {
+                const uint32_t k = gpos0 - win_gpu->pass_pos0[il];
+                ok = gpos0 >= win_gpu->pass_pos0[il] && k + lead <= win_gpu->pass_rows[il];
+                if (ok && k != 0) {
+                    /* one blit within the buffer; the ranges never overlap at ratio 2 */
+                    ok = k >= lead &&
+                         ds4_gpu_tensor_copy(b_kv.t, 0, b_kv.t, (uint64_t)k * row, lead * row) != 0 &&
+                         ds4_gpu_tensor_copy(b_sc.t, 0, b_sc.t, (uint64_t)k * row, lead * row) != 0;
+                }
+            }
+        } else {
+            ok = ok && dsv41_gpu_buf_alloc(&b_kv, (uint64_t)total * hd) &&
+                 dsv41_gpu_buf_alloc(&b_sc, (uint64_t)total * hd);
+            if (ok && lead) {
+                ok = dsv41_gpu_buf_put(&b_kv, kvs, (uint64_t)lead * hd) &&
+                     dsv41_gpu_buf_put(&b_sc, scs, (uint64_t)lead * hd);
+            }
         }
         if (ok) {
             ds4_gpu_tensor *vk = ds4_gpu_tensor_view(b_kv.t, lead * row, n_tok * row);
@@ -66649,63 +66662,47 @@ static bool dsv41_gpu_compress_chunk(const ds4_model *m, const ds4_layer_weights
                                   l->attn_compressor_gate->abs_offset, dim, hd, n_tok, x_all, vs);
             ds4_gpu_tensor_free(vk); ds4_gpu_tensor_free(vs);
         }
-        if (ok && win_gpu && win_gpu->pass_kv[il]) {
-            ok = ds4_gpu_tensor_copy(win_gpu->pass_kv[il], 0, b_kv.t, 0, total * row) != 0 &&
-                 ds4_gpu_tensor_copy(win_gpu->pass_sc[il], 0, b_sc.t, 0, total * row) != 0;
+        if (ok && win_gpu) {
             win_gpu->pass_pos0[il] = gpos0;
             win_gpu->pass_rows[il] = total;
         }
         if (ok && groups) {
-            ok = dsv41_gpu_buf_alloc(&b_lat, (uint64_t)groups * hd) &&
-                 ds4_gpu_dsv41_compress_pool(groups, ratio, hd, DS4_RMS_EPS,
-                                             b_kv.t, b_sc.t, cnorm, b_lat.t);
+            ok = ds4_gpu_dsv41_compress_pool(groups, ratio, hd, DS4_RMS_EPS,
+                                             b_kv.t, b_sc.t, cnorm, lat);
         }
-        if (ok && left) {
+        if (ok && left && !win_gpu) {
             const uint64_t off = (uint64_t)groups * ratio * row;
-            if (win_gpu) {
-                ok = ds4_gpu_tensor_copy(win_gpu->pkv[il], 0, b_kv.t, off, left * row) != 0 &&
-                     ds4_gpu_tensor_copy(win_gpu->psc[il], 0, b_sc.t, off, left * row) != 0;
-            } else {
-                if (ds4_gpu_commands_active()) {
-                    (void)ds4_gpu_end_commands();
-                    (void)ds4_gpu_begin_commands();
-                }
-                ok = ds4_gpu_tensor_read(b_kv.t, off, kvs, left * row) != 0 &&
-                     ds4_gpu_tensor_read(b_sc.t, off, scs, left * row) != 0;
+            if (ds4_gpu_commands_active()) {
+                (void)ds4_gpu_end_commands();
+                (void)ds4_gpu_begin_commands();
             }
+            ok = ds4_gpu_tensor_read(b_kv.t, off, kvs, left * row) != 0 &&
+                 ds4_gpu_tensor_read(b_sc.t, off, scs, left * row) != 0;
         }
+        if (win_gpu) { b_kv.t = NULL; b_sc.t = NULL; }     /* the window's, not ours */
     }
-    if (ok && groups) {
+    if (ok && n_lat) {
         if (g_ds4_index_source_layer[il] == il) {
-            ok = dsv41_gpu_buf_alloc(&b_ik, (uint64_t)groups * idim) &&
-                 dsv41_gpu_matvec(m, l->indexer_attn_k, l->indexer_attn_k->abs_offset,
-                                  hd, idim, groups, b_lat.t, b_ik.t) &&
-                 ds4_gpu_rms_norm_weight_rows_tensor(b_ik.t, b_ik.t, m->map, m->size,
+            ok = dsv41_gpu_matvec(m, l->indexer_attn_k, l->indexer_attn_k->abs_offset,
+                                  hd, idim, n_lat, lat, ik) &&
+                 ds4_gpu_rms_norm_weight_rows_tensor(ik, ik, m->map, m->size,
                                                      l->indexer_k_norm->abs_offset, idim,
-                                                     groups, DS4_RMS_EPS) &&
-                 ds4_gpu_dsv41_rope_ex(groups, 1, idim, rd, gpos0, ratio, 0, b_ik.t,
-                                       cos_t, sin_t);
-            if (ok) {
-                ok = win_gpu
-                   ? ds4_gpu_tensor_copy(win_gpu->ikey[il], (uint64_t)g0 * idim * sizeof(float),
-                                         b_ik.t, 0, (uint64_t)groups * idim * sizeof(float)) != 0
-                   : dsv41_gpu_buf_get(&b_ik,
-                                       st->index_k + ((size_t)il * st->max_pos + g0) * idim,
-                                       (uint64_t)groups * idim);
+                                                     n_lat, DS4_RMS_EPS) &&
+                 ds4_gpu_dsv41_rope_ex(n_lat, 1, idim, rd, gpos0, ratio, 0, ik, cos_t, sin_t);
+            if (ok && !win_gpu) {
+                ok = dsv41_gpu_buf_get(&b_ik, st->index_k + ((size_t)il * st->max_pos + g0) * idim,
+                                       (uint64_t)n_lat * idim);
             }
         }
         /* the latent is rotated only after the indexer has taken its unrotated form */
-        ok = ok && ds4_gpu_dsv41_rope_ex(groups, 1, hd, rd, gpos0, ratio, 0, b_lat.t,
-                                         cos_t, sin_t);
-        if (ok) {
-            ok = win_gpu
-               ? ds4_gpu_tensor_copy(win_gpu->ckv[il], (uint64_t)g0 * row, b_lat.t, 0,
-                                     groups * row) != 0
-               : dsv41_gpu_buf_get(&b_lat, st->compress_kv + ((size_t)il * st->max_pos + g0) * hd,
-                                   (uint64_t)groups * hd);
+        ok = ok && ds4_gpu_dsv41_rope_ex(n_lat, 1, hd, rd, gpos0, ratio, 0, lat, cos_t, sin_t);
+        if (ok && !win_gpu) {
+            ok = dsv41_gpu_buf_get(&b_lat, st->compress_kv + ((size_t)il * st->max_pos + g0) * hd,
+                                   (uint64_t)n_lat * hd);
         }
-        if (ok) st->n_comp[il] = g0 + groups;
+        if (ok) st->n_comp[il] = g0 + n_lat;
     }
+    if (win_gpu) { ds4_gpu_tensor_free(lat); ds4_gpu_tensor_free(ik); }
     ds4_gpu_tensor_free(b_kv.t); ds4_gpu_tensor_free(b_sc.t);
     ds4_gpu_tensor_free(b_lat.t); ds4_gpu_tensor_free(b_ik.t);
     return ok;
@@ -66766,7 +66763,7 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
     bool ok = true;
     dsv41_gpu_buf b_x_all = {0}, b_qa = {0}, b_qr_all = {0}, b_q_all = {0}, b_kv_all = {0};
     dsv41_gpu_buf b_low = {0}, b_out = {0}, b_stream = { stream_t, 0 }, b_mix = { mix_t, 0 };
-    dsv41_gpu_buf b_post = {0}, b_comb = {0}, b_coll = {0}, b_attnpre = {0}, b_moe = {0};
+    dsv41_gpu_buf b_post = {0}, b_comb = {0}, b_attnpre = {0}, b_moe = {0};
     dsv41_gpu_buf b_iq_all = {0}, b_wts_all = {0}, b_join = {0}, b_ikall = {0}, b_sc = {0};
     ds4_gpu_tensor *t_widx = NULL, *t_idx = NULL;
     int32_t *widx = NULL;
@@ -66803,7 +66800,6 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
     ok = ok && dsv41_gpu_buf_alloc(&b_attnpre, (uint64_t)n_tok * hc);
     ok = ok && dsv41_gpu_buf_alloc(&b_post, (uint64_t)n_tok * hc);
     ok = ok && dsv41_gpu_buf_alloc(&b_comb, (uint64_t)n_tok * hc * hc);
-    ok = ok && dsv41_gpu_buf_alloc(&b_coll, (uint64_t)n_tok * dim);
     ok = ok && dsv41_gpu_buf_alloc(&b_x_all, (uint64_t)n_tok * dim);
     if (attends) {
         ok = ok && dsv41_gpu_buf_alloc(&b_qa, (uint64_t)n_tok * lq);
@@ -66822,10 +66818,8 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
                                       l->hc_attn_fn->type != DS4_TENSOR_F32,
                                       b_stream.t, k->hsc, k->hba,
                                       b_attnpre.t, b_post.t, b_comb.t);
-    ok = ok && ds4_gpu_dsv41_hc_pre(n_tok, dim, hc, b_stream.t, b_mix.t, b_coll.t);
-    ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(b_x_all.t, b_coll.t, m->map, m->size,
-                                                   l->attn_norm->abs_offset, dim,
-                                                   n_tok, DS4_RMS_EPS);
+    ok = ok && ds4_gpu_dsv41_hc_pre_norm(n_tok, dim, hc, b_stream.t, b_mix.t, m->map, m->size,
+                                         l->attn_norm->abs_offset, DS4_RMS_EPS, b_x_all.t);
     if (!ok) goto done;
 
     /* --- compressor: only a kv-source layer produces latents, for the whole chunk at once.
@@ -67116,10 +67110,8 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
                                       l->hc_ffn_fn->type != DS4_TENSOR_F32,
                                       b_stream.t, k->fsc, k->fba,
                                       b_mix.t, b_post.t, b_comb.t);
-    ok = ok && ds4_gpu_dsv41_hc_pre(n_tok, dim, hc, b_stream.t, b_attnpre.t, b_coll.t);
-    ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(b_x_all.t, b_coll.t, m->map, m->size,
-                                                   l->ffn_norm->abs_offset, dim,
-                                                   n_tok, DS4_RMS_EPS);
+    ok = ok && ds4_gpu_dsv41_hc_pre_norm(n_tok, dim, hc, b_stream.t, b_attnpre.t, m->map, m->size,
+                                         l->ffn_norm->abs_offset, DS4_RMS_EPS, b_x_all.t);
     /* the expert-major MoE's sort scratch: counts, cursor, groups, sorted */
     ds4_gpu_tensor *moe_sort[4] = {
         win_gpu ? win_gpu->moe_counts : NULL, win_gpu ? win_gpu->moe_cursor : NULL,
@@ -67141,7 +67133,7 @@ done:
     ds4_gpu_tensor_free(b_low.t); ds4_gpu_tensor_free(b_out.t);
     if (!win_gpu) { ds4_gpu_tensor_free(b_join.t); ds4_gpu_tensor_free(b_ikall.t);
                     ds4_gpu_tensor_free(b_sc.t); }
-    ds4_gpu_tensor_free(b_post.t); ds4_gpu_tensor_free(b_comb.t); ds4_gpu_tensor_free(b_coll.t);
+    ds4_gpu_tensor_free(b_post.t); ds4_gpu_tensor_free(b_comb.t);
     ds4_gpu_tensor_free(b_iq_all.t); ds4_gpu_tensor_free(b_wts_all.t);
     ds4_gpu_tensor_free(b_moe.t); ds4_gpu_tensor_free(b_attnpre.t);
     ds4_gpu_tensor_free(t_widx); ds4_gpu_tensor_free(t_idx);
@@ -67318,23 +67310,15 @@ static bool dsv41_gpu_draft_commit(dsv41_gpu_window *g, uint32_t pos0, uint32_t 
 }
 
 /* Roll the compressed caches back to frontier F, the last accepted position: the
- * published count is what positions <= F complete, and the open group's rows come back
- * from the last pass's inputs.  Nothing else needs undoing -- the window rings hold a pass
- * past the window, so a rejected row there is never addressed again, and every other
- * per-position array is rewritten when the position runs again.  Needs an open batch. */
+ * published count is what positions <= F complete; the open group's rows the next pass
+ * locates in the last pass's inputs by position.  Nothing else needs undoing -- the window
+ * rings hold a pass past the window, so a rejected row there is never addressed again,
+ * and every other per-position array is rewritten when the position runs again. */
 static bool dsv41_gpu_window_rollback(dsv41_gpu_window *g, dsv41_ref_state *st, uint32_t F) {
-    const uint64_t row = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
     for (uint32_t i = 0; i < g->n_layer; i++) {
         const uint32_t ratio = ds4_layer_compress_ratio(i);
         if (ratio == 0 || g_ds4_kv_source_layer[i] != i) continue;
         st->n_comp[i] = (F + 1u) / ratio;
-        const uint32_t lead = (F + 1u) % ratio;
-        if (lead == 0) continue;
-        const uint32_t G = F + 1u - lead;
-        if (!g->pass_kv[i] || G < g->pass_pos0[i] || F >= g->pass_pos0[i] + g->pass_rows[i]) return false;
-        const uint64_t off = (uint64_t)(G - g->pass_pos0[i]) * row;
-        if (!ds4_gpu_tensor_copy(g->pkv[i], 0, g->pass_kv[i], off, lead * row) ||
-            !ds4_gpu_tensor_copy(g->psc[i], 0, g->pass_sc[i], off, lead * row)) return false;
     }
     return true;
 }
@@ -67433,11 +67417,23 @@ static bool dsv41_gpu_forward_rows(const ds4_model *m, const ds4_weights *w,
 
     /* one command batch for the whole call: a dispatch per command buffer spends more
      * time committing and waiting than computing */
+    static int trace = -1;
+    if (trace < 0) trace = getenv("DS4_DSV41_TRACE") != NULL;
+    const double tr0 = trace ? now_sec() : 0.0;
+    const uint64_t al0 = trace ? ds4_gpu_tensor_alloc_count() : 0;
     const bool batched = ds4_gpu_begin_commands() != 0;
     if (phase == DSV41_PHASE_DECODE) {
         /* the boundary's input was kept when the encoder passed over these positions */
         ok = ok && dsv41_gpu_ced_move(ced, b_st.t, pos0, n_tok, hc_dim, false, false);
         ok = ok && dsv41_gpu_ced_move(ced, b_mix.t, pos0, n_tok, hc, false, true);
+    }
+    /* every few blocks the batch so far is committed without waiting, so the GPU runs
+     * them while the host encodes the rest; nothing here writes a buffer a committed
+     * block still reads, every block's scratch being its own */
+    static int flush_every = -1;
+    if (flush_every < 0) {
+        const char *env = getenv("DS4_DSV41_FLUSH_LAYERS");
+        flush_every = env && env[0] ? atoi(env) : 8;
     }
     for (uint32_t il = l0; il < l1 && ok; il++) {
         const dsv41_gpu_rope *r = ds4_layer_compress_ratio(il) ? ropec : rope0;
@@ -67449,6 +67445,8 @@ static bool dsv41_gpu_forward_rows(const ds4_model *m, const ds4_weights *w,
         ok = ok && dsv41_gpu_attn_step(m, w, il, st, b_st.t, b_mix.t, pos0, n_tok,
                                        r->cos, r->sin, NULL,
                                        (eng && eng->m) ? &gc : NULL, ge, win_gpu, mode);
+        if (ok && batched && flush_every > 0 && (il - l0 + 1u) % (uint32_t)flush_every == 0)
+            (void)ds4_gpu_flush_commands();
     }
     if (phase == DSV41_PHASE_ENCODE) {
         ok = ok && dsv41_gpu_ced_move(ced, b_st.t, pos0, n_tok, hc_dim, true, false);
@@ -67460,30 +67458,40 @@ static bool dsv41_gpu_forward_rows(const ds4_model *m, const ds4_weights *w,
              (!commit_draft || dsv41_gpu_draft_commit(win_gpu, pos0, n_tok));
     }
 
+    const double tr_head = trace ? now_sec() : 0.0;
     /* the last rows' logits: one for decode and prefill, a verify pass wants them all */
+    dsv41_gpu_buf b_lg = {0};
+    uint32_t n_logit_rows_done = 0;
     if (ok && logits && n_logit_rows) {
-        dsv41_gpu_buf b_coll = {0}, b_x = {0}, b_lg = {0};
+        dsv41_gpu_buf b_x = {0};
         const uint32_t rows = n_logit_rows < n_tok ? n_logit_rows : n_tok;
+        n_logit_rows_done = rows;
         const uint64_t first = (uint64_t)(n_tok - rows);
         ds4_gpu_tensor *v_st = ds4_gpu_tensor_view(b_st.t, first * hc_dim * sizeof(float),
                                                    (uint64_t)rows * hc_dim * sizeof(float));
         ds4_gpu_tensor *v_mx = ds4_gpu_tensor_view(b_mix.t, first * hc * sizeof(float),
                                                    (uint64_t)rows * hc * sizeof(float));
         ok = v_st && v_mx &&
-             dsv41_gpu_buf_alloc(&b_coll, (uint64_t)rows * dim) &&
              dsv41_gpu_buf_alloc(&b_x, (uint64_t)rows * dim) &&
              dsv41_gpu_buf_alloc(&b_lg, (uint64_t)rows * DS4_N_VOCAB);
-        ok = ok && ds4_gpu_dsv41_hc_pre(rows, dim, hc, v_st, v_mx, b_coll.t);
+        ok = ok && ds4_gpu_dsv41_hc_pre_norm(rows, dim, hc, v_st, v_mx, m->map, m->size,
+                                             w->output_norm->abs_offset, DS4_RMS_EPS, b_x.t);
         ds4_gpu_tensor_free(v_st); ds4_gpu_tensor_free(v_mx);
-        ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(b_x.t, b_coll.t, m->map, m->size,
-                                                       w->output_norm->abs_offset, dim, rows,
-                                                       DS4_RMS_EPS);
         ok = ok && dsv41_gpu_matvec(m, w->output, w->output->abs_offset, dim, DS4_N_VOCAB,
                                     rows, b_x.t, b_lg.t);
-        ok = ok && dsv41_gpu_buf_get(&b_lg, logits, (uint64_t)rows * DS4_N_VOCAB);
-        ds4_gpu_tensor_free(b_coll.t); ds4_gpu_tensor_free(b_x.t); ds4_gpu_tensor_free(b_lg.t);
+        ds4_gpu_tensor_free(b_x.t);
     }
-    if (batched) (void)ds4_gpu_end_commands();
+    const double tr1 = trace ? now_sec() : 0.0;
+    /* the batch ends once, and the logits are read after it rather than by draining and
+     * reopening it, which committed an empty batch on top */
+    if (batched) ok = ds4_gpu_end_commands() != 0 && ok;
+    if (ok && b_lg.t) ok = ds4_gpu_tensor_read(b_lg.t, 0, logits, (uint64_t)n_logit_rows_done * DS4_N_VOCAB * sizeof(float)) != 0;
+    ds4_gpu_tensor_free(b_lg.t);
+    if (trace) {
+        fprintf(stderr, "ds4: V4.1 pass rows=%u encode %.1f ms head %.1f ms wait %.1f ms allocs %llu\n",
+                n_tok, (tr_head - tr0) * 1000.0, (tr1 - tr_head) * 1000.0, (now_sec() - tr1) * 1000.0,
+                (unsigned long long)(ds4_gpu_tensor_alloc_count() - al0));
+    }
     ds4_gpu_tensor_free(b_st.t); ds4_gpu_tensor_free(b_mix.t);
     free(stream);
     free(pre_mix);

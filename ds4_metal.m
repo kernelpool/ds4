@@ -9158,7 +9158,11 @@ void ds4_gpu_test_set_flags(uint32_t flags) {
     g_test_flags = flags;
 }
 
+static uint64_t g_tensor_alloc_count;
+uint64_t ds4_gpu_tensor_alloc_count(void) { return g_tensor_alloc_count; }
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
+    g_tensor_alloc_count++;
     if (!g_initialized && !ds4_gpu_init()) return NULL;
     if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;
 
@@ -46252,6 +46256,49 @@ int ds4_gpu_dsv41_hc_pre(uint32_t rows, uint32_t dim, uint32_t hc,
                                      stream, mix, NULL, NULL, out, 2);
 }
 
+typedef struct {
+    uint32_t dim, hc;
+    float eps;
+} dsv41_gpu_hc_pre_norm_args;
+
+int ds4_gpu_dsv41_hc_pre_norm(uint32_t rows, uint32_t dim, uint32_t hc,
+                              const ds4_gpu_tensor *stream, const ds4_gpu_tensor *mix,
+                              const void *model_map, uint64_t model_size, uint64_t weight_offset,
+                              float eps, ds4_gpu_tensor *out) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (dim == 0 || hc == 0 || rows == 0 ||
+        !glm53_gpu_tensor_has(stream, (uint64_t)rows * hc * dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(mix, (uint64_t)rows * hc, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out, (uint64_t)rows * dim, sizeof(float))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 hc_pre_norm received invalid buffers\n");
+        return 0;
+    }
+    @autoreleasepool {
+        uint64_t inner = 0;
+        id<MTLBuffer> wbuf = glm53_gpu_weight_buffer(model_map, model_size, weight_offset,
+                                                     (uint64_t)dim * sizeof(float), &inner, "norm weight");
+        id<MTLComputePipelineState> p = ds4_gpu_get_pipeline("kernel_dsv41_hc_pre_norm");
+        if (!wbuf || !p) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        dsv41_gpu_hc_pre_norm_args a = { dim, hc, eps };
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:p];
+        [enc setBytes:&a length:sizeof(a) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(stream) offset:ds4_gpu_tensor_offset(stream) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(mix) offset:ds4_gpu_tensor_offset(mix) atIndex:2];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        /* one threadgroup per token, so it is as wide as it can be */
+        const NSUInteger tpt = p.maxTotalThreadsPerThreadgroup < 1024 ? p.maxTotalThreadsPerThreadgroup : 1024;
+        [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 hc_pre_norm");
+    }
+}
+
 int ds4_gpu_dsv41_hc_post(uint32_t rows, uint32_t dim, uint32_t hc,
                           const ds4_gpu_tensor *sub,
                           const ds4_gpu_tensor *residual,
@@ -46386,6 +46433,7 @@ typedef struct {
     float    norm_eps;
     float    hc_eps;
     uint32_t f16_weights;
+    uint32_t slices;
 } dsv41_gpu_hc_mixes_args;
 
 int ds4_gpu_dsv41_hc_mixes(const void *model_map,
@@ -46429,9 +46477,9 @@ int ds4_gpu_dsv41_hc_mixes(const void *model_map,
         id<MTLComputePipelineState> p_split =
             ds4_gpu_get_pipeline("kernel_dsv41_hc_mix_split");
         if (!p_proj || !p_split) return 0;
-        /* one row per threadgroup, so the grid is mix_hc * n_tokens rather than the single
-         * threadgroup the fused kernel ran at decode */
-        const uint64_t mix_bytes = (uint64_t)n_tokens * mix_hc * sizeof(float);
+        /* partial sums per slice of hc_dim, summed by the split kernel */
+        const uint32_t slices = (hc_dim + 1023u) / 1024u;
+        const uint64_t mix_bytes = (uint64_t)n_tokens * slices * (mix_hc + 1u) * sizeof(float);
         if (!ds4_gpu_ensure_scratch_buffer(&g_dsv41_hc_mix_buffer, &g_dsv41_hc_mix_bytes,
                                            (NSUInteger)mix_bytes, "ds4_dsv41_hc_mixes")) {
             return 0;
@@ -46443,7 +46491,7 @@ int ds4_gpu_dsv41_hc_mixes(const void *model_map,
         dsv41_gpu_hc_mixes_args args = {
             .n_tokens = n_tokens, .hc_dim = hc_dim, .mix_hc = mix_hc, .hc = hc, .iters = iters,
             .norm_eps = norm_eps, .hc_eps = hc_eps,
-            .f16_weights = f16_weights ? 1u : 0u,
+            .f16_weights = f16_weights ? 1u : 0u, .slices = slices,
         };
         const uint32_t nsg = 8u;
         [enc setComputePipelineState:p_proj];
@@ -46452,7 +46500,7 @@ int ds4_gpu_dsv41_hc_mixes(const void *model_map,
         [enc setBuffer:weightbuf offset:(NSUInteger)inner atIndex:2];
         [enc setBuffer:g_dsv41_hc_mix_buffer offset:0 atIndex:3];
         [enc setThreadgroupMemoryLength:2u * nsg * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(mix_hc, n_tokens, 1)
+        [enc dispatchThreadgroups:MTLSizeMake(slices, mix_hc, n_tokens)
             threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 

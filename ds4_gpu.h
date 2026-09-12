@@ -51,6 +51,7 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
+uint64_t ds4_gpu_tensor_alloc_count(void);   /* allocations so far, for profiling */
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
@@ -499,6 +500,11 @@ int ds4_gpu_dsv41_markov_chain(uint32_t block, uint32_t vocab, uint32_t rank, ui
 /* Map a second GGUF (a sidecar) for the map-addressed kernels, alongside the model. */
 int ds4_gpu_add_model_map(const void *model_map, uint64_t model_size, uint64_t max_tensor_bytes);
 
+/* hc_pre and the following RMSNorm (weight in the model map) in one dispatch */
+int ds4_gpu_dsv41_hc_pre_norm(uint32_t rows, uint32_t dim, uint32_t hc,
+                              const ds4_gpu_tensor *stream, const ds4_gpu_tensor *mix,
+                              const void *model_map, uint64_t model_size, uint64_t weight_offset,
+                              float eps, ds4_gpu_tensor *out);
 int ds4_gpu_dsv41_hc_post(uint32_t rows, uint32_t dim, uint32_t hc,
                           const ds4_gpu_tensor *sub,
                           const ds4_gpu_tensor *residual,

@@ -1396,7 +1396,10 @@ struct dsv41_hc_mixes_args {
     float norm_eps;     // the RMS epsilon, not hc_eps
     float hc_eps;
     uint f16_weights;   // 0 = f32 hc_fn, 1 = f16
+    uint slices;        // hc_dim slices of the projection, DSV41_HC_SLICE elements each
 };
+
+#define DSV41_HC_SLICE 1024u     // 256 threads x float4
 
 static inline float dsv41_sigmoid(float x) {
     // matches sigmoid_stable: never exponentiate a positive argument
@@ -1405,62 +1408,53 @@ static inline float dsv41_sigmoid(float x) {
     return e / (1.0f + e);
 }
 
-// The mHC projection used to be one threadgroup per token: at decode that is a single
-// threadgroup for the whole GPU, 256 threads walking 24 rows of 20480 for 797 us a call
-// -- over half the decode step.  Splitting it gives every row its own threadgroup, so the
-// grid carries mix_hc * n_tokens of them and each thread walks hc_dim/256 elements.
-//
-// `ss` is the same sum of squares in every row's threadgroup.  Recomputing it there is
-// free: the pass already has x in hand, and it saves a second kernel and a round trip.
+// The mHC projection, as partial sums: a threadgroup is one mix row over one 1024-wide
+// slice of hc_dim for one token, four elements a thread, so the grid is rows x slices x
+// tokens of tiny threadgroups rather than one long threadgroup per row -- which walked
+// 20480 elements 24 times over at decode and cost 35 us a call.  Partials are laid out
+// [token][row][slice] so the split kernel sums each row from one contiguous run; the
+// row-0 threadgroups also leave the slice's sum of squares.
 kernel void kernel_dsv41_hc_mix_proj(
         constant dsv41_hc_mixes_args &args,
         device const float           *stream,   // [n_tokens, hc_dim]
         device const void            *hc_fn,    // [mix_hc, hc_dim]
-        device float                 *mixes,    // [n_tokens, mix_hc]
-        threadgroup float            *red [[threadgroup(0)]],
-        uint2  tgpig [[threadgroup_position_in_grid]],
-        uint2  tpitg [[thread_position_in_threadgroup]],
-        uint2  ntg   [[threads_per_threadgroup]],
+        device float                 *partials, // [n_tokens, mix_hc + 1, slices]
+        threadgroup float            *red [[threadgroup(0)]],  // [2 * nsg]
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
         ushort lane  [[thread_index_in_simdgroup]],
         ushort sg    [[simdgroup_index_in_threadgroup]],
         ushort nsg   [[simdgroups_per_threadgroup]]) {
-    const uint m = tgpig.x;
-    const uint tok = tgpig.y;
-    if (m >= args.mix_hc || tok >= args.n_tokens) return;
-
-    device const float *x = stream + (ulong)tok * args.hc_dim;
-    float dot = 0.0f, ss = 0.0f;
-    if (args.f16_weights) {
-        device const half *w = (device const half *)hc_fn + (ulong)m * args.hc_dim;
-        for (uint i = tpitg.x; i < args.hc_dim; i += ntg.x) {
-            const float v = x[i];
-            dot = fma((float)w[i], v, dot);
-            ss = fma(v, v, ss);
-        }
-    } else {
-        device const float *w = (device const float *)hc_fn + (ulong)m * args.hc_dim;
-        for (uint i = tpitg.x; i < args.hc_dim; i += ntg.x) {
-            const float v = x[i];
-            dot = fma(w[i], v, dot);
-            ss = fma(v, v, ss);
-        }
+    const uint slice = tgpig.x, r = tgpig.y, tok = tgpig.z;
+    const uint i = slice * DSV41_HC_SLICE + (uint)tid * 4u;
+    const bool live = i + 4u <= args.hc_dim;
+    float d = 0.0f, ss = 0.0f;
+    if (live) {
+        const float4 xv = *(device const float4 *)(stream + (ulong)tok * args.hc_dim + i);
+        const ulong o = (ulong)r * args.hc_dim + i;
+        const float4 w = args.f16_weights
+            ? float4(*(device const half4 *)((device const half *)hc_fn + o))
+            : *(device const float4 *)((device const float *)hc_fn + o);
+        d = dot(w, xv);
+        ss = dot(xv, xv);
     }
-    dot = simd_sum(dot);
+    d = simd_sum(d);
     ss = simd_sum(ss);
-    if (lane == 0u) { red[sg] = dot; red[nsg + sg] = ss; }
+    if (lane == 0u) { red[sg] = d; red[nsg + sg] = ss; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tpitg.x != 0u) return;
-    float d = 0.0f, s2 = 0.0f;
-    for (ushort i = 0; i < nsg; i++) { d += red[i]; s2 += red[nsg + i]; }
-    const float rstd = 1.0f / sqrt(s2 / (float)args.hc_dim + args.norm_eps);
-    mixes[(ulong)tok * args.mix_hc + m] = d * rstd;
+    if (tid != 0u) return;
+    float td = 0.0f, ts = 0.0f;
+    for (ushort g = 0; g < nsg; g++) { td += red[g]; ts += red[nsg + g]; }
+    device float *out = partials + (ulong)tok * (args.mix_hc + 1u) * args.slices;
+    out[(ulong)r * args.slices + slice] = td;
+    if (r == 0u) out[(ulong)args.mix_hc * args.slices + slice] = ts;
 }
 
 // The split / sigmoid / Sinkhorn tail, one threadgroup per token.  hc is 4, so this is
 // tens of operations; it never wanted the 20480-wide projection in front of it.
 kernel void kernel_dsv41_hc_mix_split(
         constant dsv41_hc_mixes_args &args,
-        device const float           *mixes,   // [n_tokens, mix_hc]
+        device const float           *partials, // [n_tokens, slices, mix_hc + 1]
         device const float           *hc_scale,
         device const float           *hc_base,
         device float                 *pre,
@@ -1470,7 +1464,20 @@ kernel void kernel_dsv41_hc_mix_split(
         ushort lane  [[thread_index_in_simdgroup]]) {
     const uint tok = tgpig;
     if (tok >= args.n_tokens) return;
-    device const float *mx = mixes + (ulong)tok * args.mix_hc;
+    /* the projection's slices summed in order, then the whole-vector RMS applied */
+    threadgroup float mx[DSV41_MIX_MAX];
+    {
+        device const float *pp = partials + (ulong)tok * (args.mix_hc + 1u) * args.slices;
+        float ss = 0.0f;
+        for (uint sl = 0; sl < args.slices; sl++) ss += pp[(ulong)args.mix_hc * args.slices + sl];
+        const float rstd = 1.0f / sqrt(ss / (float)args.hc_dim + args.norm_eps);
+        for (uint m = lane; m < args.mix_hc; m += 32u) {
+            float d = 0.0f;
+            for (uint sl = 0; sl < args.slices; sl++) d += pp[(ulong)m * args.slices + sl];
+            mx[m] = d * rstd;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     device float *pre_t = pre + (ulong)tok * args.hc;
     device float *post_t = post + (ulong)tok * args.hc;
     device float *comb_t = comb + (ulong)tok * args.hc * args.hc;
@@ -1579,6 +1586,48 @@ kernel void kernel_dsv41_hc_pre(
     out[(ulong)t * args.dim + j] = acc;
 }
 
+// hc_pre followed by the sublayer's RMSNorm in one pass: one threadgroup per token
+// collapses the copies, keeps the sum of squares, and scales.  Each was its own dispatch
+// twice a block, 160 launches a token for a few microseconds of work each.
+struct dsv41_hc_pre_norm_args {
+    uint dim;
+    uint hc;
+    float eps;
+};
+
+kernel void kernel_dsv41_hc_pre_norm(
+        constant dsv41_hc_pre_norm_args &args,
+        device const float             *stream,  // [rows, hc, dim]
+        device const float             *mix,     // [rows, hc]
+        device const float             *weight,  // [dim]
+        device float                   *out,     // [rows, dim]
+        threadgroup float              *red [[threadgroup(0)]],
+        uint   tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort ntg   [[threads_per_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]],
+        ushort nsg   [[simdgroups_per_threadgroup]]) {
+    const uint t = tgpig;
+    device const float *st = stream + (ulong)t * args.hc * args.dim;
+    device const float *mx = mix + (ulong)t * args.hc;
+    device float *o = out + (ulong)t * args.dim;
+    float ss = 0.0f;
+    for (uint j = tid; j < args.dim; j += ntg) {
+        float acc = 0.0f;
+        for (uint c = 0; c < args.hc; c++) acc = fma(mx[c], st[c * args.dim + j], acc);
+        o[j] = acc;
+        ss = fma(acc, acc, ss);
+    }
+    ss = simd_sum(ss);
+    if (lane == 0u) red[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (ushort g = 0; g < nsg; g++) tot += red[g];
+    const float rstd = 1.0f / sqrt(tot / (float)args.dim + args.eps);
+    for (uint j = tid; j < args.dim; j += ntg) o[j] = o[j] * rstd * weight[j];
+}
+
 kernel void kernel_dsv41_hc_post(
         constant dsv41_hc_mix_args &args,
         device const float         *sub,      // [rows, dim], the sublayer output
@@ -1652,21 +1701,39 @@ kernel void kernel_dsv41_route(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // the tie rule is the OPPOSITE of the indexer's: a strict `>` means equals resolve to
-    // the LOWER index, so a lower-indexed equal counts as beating a higher-indexed one
-    for (uint i = tpitg.x; i < args.n_expert; i += ntg.x) {
-        const float v = scores[i] + bias[i];
-        uint beats = 0u;
-        for (uint j = 0; j < args.n_expert; j++) {
-            const float o = scores[j] + bias[j];
-            beats += (o > v || (o == v && j < i)) ? 1u : 0u;
+    // topk rounds of one parallel argmax each; the tie rule is the OPPOSITE of the
+    // indexer's: equals resolve to the LOWER index.  The rank formulation before this
+    // walked all n_expert keys per expert, 55 us a call at 384 experts.
+    threadgroup float bv_sg[32];
+    threadgroup int bi_sg[32];
+    const ushort lane = tpitg.x & 31u, sg = tpitg.x >> 5, nsg = (ntg.x + 31u) >> 5;
+    for (uint s = 0; s < args.topk; s++) {
+        float bv = -INFINITY;
+        int bi = -1;
+        for (uint i = tpitg.x; i < args.n_expert; i += ntg.x) {
+            const float sc = scores[i];
+            if (sc == -INFINITY) continue;              // taken in an earlier round
+            const float v = sc + bias[i];
+            if (v > bv || (v == bv && (int)i < bi)) { bv = v; bi = (int)i; }
         }
-        if (beats < args.topk) {
-            idx_out[beats] = (int)i;
-            w_out[beats] = scores[i];
+        for (uint o = 16; o > 0; o >>= 1) {
+            const float ov = simd_shuffle_down(bv, o);
+            const int oi = simd_shuffle_down(bi, o);
+            if (oi >= 0 && (ov > bv || (ov == bv && oi < bi))) { bv = ov; bi = oi; }
         }
+        if (lane == 0u) { bv_sg[sg] = bv; bi_sg[sg] = bi; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tpitg.x == 0u) {
+            for (ushort g = 1; g < nsg; g++) {
+                if (bi_sg[g] >= 0 && (bv_sg[g] > bv || (bv_sg[g] == bv && bi_sg[g] < bi))) { bv = bv_sg[g]; bi = bi_sg[g]; }
+            }
+            if (bi < 0) bi = 0;
+            idx_out[s] = bi;
+            w_out[s] = scores[bi];
+            scores[bi] = -INFINITY;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tpitg.x != 0u) return;
     if (args.norm_topk && args.topk > 1u) {
