@@ -46977,6 +46977,50 @@ int ds4_gpu_dsv41_output_lora(const void *model_map,
             .in_per_group = in_per_group, .o_lora = o_lora,
             .o_groups = o_groups, .quantized = quantized ? 1u : 0u,
         };
+        /* a chunk of rows: the groups are small matmuls for the tiled kernel, batched over
+         * (group, K split) in one dispatch -- the splits give it enough threadgroups --
+         * and summed into their columns after */
+        static int64_t lora_rows = -1;
+        if (lora_rows < 0) lora_rows = (int64_t)ds4_gpu_env_u64("DS4_DSV41_LORA_MM_ROWS", 32u, 1u, UINT32_MAX);
+        const uint32_t splits = rows < 128u ? 16u : 8u;
+        if (quantized && rows >= (uint32_t)lora_rows && (o_lora % 64u) == 0u &&
+            (in_per_group % (32u * splits)) == 0u) {
+            const bool bc_out = (rows % 32u) != 0u;
+            id<MTLComputePipelineState> mm =
+                ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_q8_0_f32_exact", false, bc_out);
+            id<MTLComputePipelineState> sum = ds4_gpu_get_pipeline("kernel_dsv41_sum_splits");
+            ds4_gpu_tensor *parts = ds4_gpu_tensor_alloc((uint64_t)splits * rows * out_rows * sizeof(float));
+            if (!mm || !sum || !parts) { ds4_gpu_tensor_free(parts); return 0; }
+            const uint64_t row_bytes = ((uint64_t)in_per_group / 32u) * 34u;
+            const uint32_t kc = in_per_group / splits;
+            ds4_gpu_mul_mm_args margs = ds4_gpu_make_mm_args(kc, o_lora, rows, row_bytes);
+            margs.ne02 = (int32_t)splits;
+            margs.nb02 = ((uint64_t)kc / 32u) * 34u;
+            margs.nb03 = (uint64_t)o_lora * row_bytes;
+            margs.ne12 = (int32_t)splits;
+            margs.nb11 = (uint64_t)o_groups * in_per_group * sizeof(float);
+            margs.nb12 = (uint64_t)kc * sizeof(float);
+            margs.nb13 = (uint64_t)in_per_group * sizeof(float);
+            [enc setComputePipelineState:mm];
+            [enc setBytes:&margs length:sizeof(margs) atIndex:0];
+            [enc setBuffer:weightbuf offset:(NSUInteger)inner atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(in) offset:ds4_gpu_tensor_offset(in) atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(parts) offset:ds4_gpu_tensor_offset(parts) atIndex:3];
+            [enc setThreadgroupMemoryLength:12288u atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((rows + 31u) / 32u, o_lora / 64u, (NSUInteger)o_groups * splits)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            const uint32_t sargs[4] = { rows, o_lora, o_groups, splits };
+            [enc setComputePipelineState:sum];
+            [enc setBytes:sargs length:sizeof(sargs) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(parts) offset:ds4_gpu_tensor_offset(parts) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)rows * out_rows / 4u, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            const int fin = ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 output LoRA");
+            ds4_gpu_tensor_free(parts);
+            return fin;
+        }
         const uint32_t nsg = 8u;
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];

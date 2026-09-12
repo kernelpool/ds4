@@ -1867,6 +1867,8 @@ int main(void) {
     fail |= run_lora("batch", 128u, 32u, 4u, 0, 5u);
     fail |= run_lora("released", 4096u, 1024u, 8u, 1, 1u);
     fail |= run_lora("batch", 4096u, 1024u, 8u, 1, 32u);
+    fail |= run_lora("chunk", 4096u, 1024u, 8u, 1, 65u);
+    fail |= run_lora("chunk", 4096u, 1024u, 8u, 1, 160u);
     fail |= run_select("mini", 24u, 8u, 2u, 20u, 0.0f);
     fail |= run_select("ties", 4096u, 512u, 8u, 4000u, 0.40f);
     fail |= run_select("released", 16384u, 512u, 8u, 16000u, 0.20f);

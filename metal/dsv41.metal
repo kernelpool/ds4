@@ -474,6 +474,24 @@ kernel void kernel_dsv41_output_lora(
     if (lane == 0u) out[r] = sum;
 }
 
+// The output LoRA's split-K partials, laid out [group * splits + split][rows][o_lora],
+// summed into out[row][group * o_lora + col].
+kernel void kernel_dsv41_sum_splits(
+        constant uint4       &a,       // rows, o_lora, o_groups, splits
+        device const float4  *parts,
+        device float4        *out,
+        uint gid [[thread_position_in_grid]]) {
+    const uint cols4 = a.y * a.z / 4u;          // float4 columns of an output row
+    const uint t = gid / cols4, col4 = gid % cols4;
+    if (t >= a.x) return;
+    const uint g = col4 / (a.y / 4u), c4 = col4 % (a.y / 4u);
+    const ulong base = ((ulong)g * a.w * a.x + t) * (a.y / 4u) + c4;
+    const ulong step = (ulong)a.x * (a.y / 4u);
+    float4 acc = parts[base];
+    for (uint s = 1; s < a.w; s++) acc += parts[base + s * step];
+    out[gid] = acc;
+}
+
 // Level one of the two-level indexer: score each block by its best position.  The block
 // holding the newest position is pinned with +inf because it is only partly filled and
 // would otherwise be outscored by an older, full block.  Positions the query cannot
