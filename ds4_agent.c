@@ -800,6 +800,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--vision")) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--engram")) {
+            c.engine.engram_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.glm_mtp = true;
         } else if (!strcmp(arg, "--mtp-model")) {
