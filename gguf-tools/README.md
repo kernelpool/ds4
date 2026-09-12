@@ -154,6 +154,18 @@ defaults match the published Flash DSpark config: block size 5, target layers
 `--dspark-block-size`, `--dspark-target-layers`, `--dspark-markov-rank`, and
 `--dspark-noise-token-id` if converting a different checkpoint.
 
+For DeepSeek V4.1 Flash the draft blocks are already `blk.40`–`blk.42` of the backbone
+GGUF, so the support file carries only the heads (`main_proj`/`main_norm`, the final
+`norm`, the Markov `embed`/`head` tables and the confidence projection, 216 MB); the
+DSpark metadata comes from `config.json`:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --hf ../DeepSeek-V4.1-Flash \
+  --dspark-support --dspark-heads-only \
+  --out DeepSeek-V4.1-Flash-dspark.gguf
+```
+
 Before a full write, regenerate one support tensor and record its checksum:
 
 ```sh

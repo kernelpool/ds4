@@ -2145,7 +2145,13 @@ typedef struct {
     uint32_t noise_token_id;
     uint32_t target_layers[DSPARK_MAX_TARGET_LAYERS];
     uint32_t target_layer_count;
+    /* V4.1: the draft blocks are blk.N of the backbone GGUF, so the support file carries
+     * only the heads (main_proj/main_norm, norm, markov_head, confidence_head) */
+    bool heads_only;
+    bool block_size_set, markov_rank_set, noise_token_id_set, target_layers_set;
 } dspark_support_options;
+
+static bool g_dspark_heads_only;
 
 static void dspark_support_defaults(dspark_support_options *o) {
     memset(o, 0, sizeof(*o));
@@ -2286,8 +2292,19 @@ static const dspark_name_rule dspark_stage_rules[] = {
     {"norm.weight", "norm.weight", "emit"},
     {"markov_head.markov_w1.weight", "markov_head.markov_w1.weight", "emit"},
     {"markov_head.markov_w2.weight", "markov_head.markov_w2.weight", "emit"},
+    {"markov_head.embed.weight", "markov_head.embed.weight", "emit"},   /* V4.1 */
+    {"markov_head.head.weight", "markov_head.head.weight", "emit"},
     {"confidence_head.proj.weight", "confidence_head.proj.weight", "emit"},
 };
+
+/* the head tensors a V4.1 support file carries; everything else is in the backbone */
+static bool dspark_is_head_tensor(const char *gguf_suffix) {
+    return strcmp(gguf_suffix, "main_proj.weight") == 0 ||
+           strcmp(gguf_suffix, "main_norm.weight") == 0 ||
+           strcmp(gguf_suffix, "norm.weight") == 0 ||
+           str_starts(gguf_suffix, "markov_head.") ||
+           str_starts(gguf_suffix, "confidence_head.");
+}
 
 static char *map_dspark_hf_name(const char *hf_name, const char **action_out) {
     int stage = 0;
@@ -2455,10 +2472,15 @@ static bool name_has_any(const char *name, const char *const *needles, size_t n)
 
 static dspark_tensor_role dspark_tensor_role_for_name(const char *name) {
     if (parse_expert_tensor(name).is_expert) return DSPARK_ROLE_ROUTED;
+    /* V4.1 heads: the Markov tables are read as rows and as a rank-256 matvec, the
+     * confidence projection is applied in fp32, so neither is quantized */
+    if (g_dspark_heads_only && strstr(name, "confidence_head.")) return DSPARK_ROLE_F32;
     static const char *const plain[] = {
         "hc_attn_fn.weight",
         "hc_ffn_fn.weight",
         "hc_head_fn.weight",
+        "markov_head.embed.weight",
+        "markov_head.head.weight",
     };
     if (name_has_any(name, plain, sizeof(plain) / sizeof(plain[0]))) {
         return DSPARK_ROLE_PLAIN;
@@ -2655,14 +2677,47 @@ static void write_gguf_kv_u32_array(FILE *fp, const char *key, const uint32_t *v
     for (uint32_t i = 0; i < n; i++) write_u32(fp, values[i]);
 }
 
+static const char *dspark_support_name(const hf_model_metadata *metadata,
+                                       const dspark_support_options *opt) {
+    if (opt->heads_only) return "DeepSeek V4.1 Flash DSpark heads";
+    return metadata->vision_exp ? "DeepSeek V4 Flash Vision Experimental DSpark support"
+                                : "DeepSeek V4 Flash DSpark support";
+}
+
+/* config.json's DSpark fields stand in for the defaults where the command line was silent;
+ * V4 checkpoints predate them and keep the built-in Flash defaults */
+static void dspark_options_from_config(const char *hf_dir, dspark_support_options *o) {
+    char *path = path_join(hf_dir, "config.json");
+    size_t len = 0;
+    char *text = read_file(path, &len);
+    json_doc d = json_parse_text(text, len);
+    /* V4.1 nests the language model under text_config */
+    int root = json_obj_get(&d, 0, "text_config");
+    if (root < 0 || d.v[root].type != JT_OBJECT) root = 0;
+    int tok;
+    if (!o->block_size_set && (tok = json_obj_get(&d, root, "dspark_block_size")) >= 0)
+        o->block_size = (uint32_t)json_i64(&d, tok);
+    if (!o->markov_rank_set && (tok = json_obj_get(&d, root, "dspark_markov_rank")) >= 0)
+        o->markov_rank = (uint32_t)json_i64(&d, tok);
+    if (!o->noise_token_id_set && (tok = json_obj_get(&d, root, "dspark_noise_token_id")) >= 0)
+        o->noise_token_id = (uint32_t)json_i64(&d, tok);
+    if (!o->target_layers_set && (tok = json_obj_get(&d, root, "dspark_target_layer_ids")) >= 0 &&
+        d.v[tok].type == JT_ARRAY) {
+        o->target_layer_count = 0;
+        for (int i = tok + 1; i < d.len && d.v[i].parent == tok; i = json_skip(&d, i)) {
+            if (o->target_layer_count == DSPARK_MAX_TARGET_LAYERS) die("too many DSpark target layers");
+            o->target_layers[o->target_layer_count++] = (uint32_t)json_i64(&d, i);
+        }
+    }
+    free(path); free(text); free(d.v);
+}
+
 static void dspark_plan_finalize(dspark_support_plan *plan,
                                  const dspark_support_options *opt,
                                  const hf_model_metadata *metadata) {
     qsort(plan->tensors, (size_t)plan->len, sizeof(plan->tensors[0]), dspark_plan_cmp);
     plan->alignment = DS4_GGUF_DEFAULT_ALIGNMENT;
-    const char *name = metadata->vision_exp ?
-        "DeepSeek V4 Flash Vision Experimental DSpark support" :
-        "DeepSeek V4 Flash DSpark support";
+    const char *name = dspark_support_name(metadata, opt);
     plan->n_kv = 9 + (metadata->vision_exp ? 3 : 0);
     plan->kv_bytes =
         gguf_kv_size_string("general.architecture", "deepseek4-dspark") +
@@ -2702,12 +2757,17 @@ static void dspark_plan_finalize(dspark_support_plan *plan,
     plan->data_offset = ds4q_pad(plan->meta_size, plan->alignment);
 }
 
+static const char *fmt_stage_prefix(int stage) {
+    static char buf[32];
+    snprintf(buf, sizeof(buf), "mtp.%d.", stage);
+    return buf;
+}
+
 static dspark_support_plan build_dspark_support_plan(st_db *db,
                                                      const quant_policy *policy,
                                                      const dspark_support_options *opt,
                                                      int requested_n_experts,
                                                      const hf_model_metadata *metadata) {
-    (void)opt;
     dspark_support_plan plan = {0};
     str_list names = load_index_weight_names(db->hf_dir);
     uint64_t unknown = 0;
@@ -2721,7 +2781,9 @@ static dspark_support_plan build_dspark_support_plan(st_db *db,
 
         const char *action = NULL;
         char *gguf = map_dspark_hf_name(hf, &action);
-        if (strcmp(action, "emit") == 0) {
+        if (opt->heads_only && !(gguf && dspark_is_head_tensor(gguf + strlen(fmt_stage_prefix(stage))))) {
+            /* block weights live in the backbone GGUF */
+        } else if (strcmp(action, "emit") == 0) {
             dspark_plan_add_regular(&plan, db, policy, hf, gguf, stage);
         } else if (strcmp(action, "pack_expert") == 0) {
             int expert = -1;
@@ -2825,11 +2887,7 @@ static void write_dspark_support_gguf(st_db *db,
     write_u64(fp, (uint64_t)plan->len);
     write_u64(fp, plan->n_kv);
     write_gguf_kv_string(fp, "general.architecture", "deepseek4-dspark");
-    write_gguf_kv_string(
-        fp, "general.name",
-        metadata->vision_exp ?
-            "DeepSeek V4 Flash Vision Experimental DSpark support" :
-            "DeepSeek V4 Flash DSpark support");
+    write_gguf_kv_string(fp, "general.name", dspark_support_name(metadata, opt));
     write_gguf_kv_u32(fp, "general.alignment", (uint32_t)plan->alignment);
     write_gguf_kv_u32(fp, "dspark.block_size", opt->block_size);
     write_gguf_kv_u32(fp, "dspark.markov_rank", opt->markov_rank);
@@ -2906,6 +2964,7 @@ static void usage(const char *argv0) {
     printf("  --dry-run              print output plan; DSpark support mode reads shard headers only\n");
     printf("  --dspark-manifest      print DSpark HF->GGUF tensor-name manifest and exit\n");
     printf("  --dspark-support       write a standalone DSpark support GGUF from mtp.* tensors\n");
+    printf("  --dspark-heads-only    V4.1: only the DSpark heads; the draft blocks are in the backbone\n");
     printf("  --dspark-block-size N  DSpark draft block size metadata, default 5\n");
     printf("  --dspark-markov-rank N DSpark Markov rank metadata, default 256\n");
     printf("  --dspark-noise-token-id N  DSpark noise token id metadata, default 128799\n");
@@ -3013,14 +3072,21 @@ static params parse_args(int argc, char **argv) {
             p.dspark_manifest = true;
         } else if (strcmp(arg, "--dspark-support") == 0) {
             p.dspark_support = true;
+        } else if (strcmp(arg, "--dspark-heads-only") == 0) {
+            p.dspark.heads_only = true;
+            g_dspark_heads_only = true;
         } else if (strcmp(arg, "--dspark-block-size") == 0) {
             p.dspark.block_size = parse_u32_arg(need_value(argc, argv, &i, arg), arg);
+            p.dspark.block_size_set = true;
         } else if (strcmp(arg, "--dspark-markov-rank") == 0) {
             p.dspark.markov_rank = parse_u32_arg(need_value(argc, argv, &i, arg), arg);
+            p.dspark.markov_rank_set = true;
         } else if (strcmp(arg, "--dspark-noise-token-id") == 0) {
             p.dspark.noise_token_id = parse_u32_arg(need_value(argc, argv, &i, arg), arg);
+            p.dspark.noise_token_id_set = true;
         } else if (strcmp(arg, "--dspark-target-layers") == 0) {
             parse_dspark_target_layers_arg(&p.dspark, need_value(argc, argv, &i, arg), arg);
+            p.dspark.target_layers_set = true;
         } else if (strcmp(arg, "--imatrix") == 0) {
             p.imatrix_file = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--imatrix-strict") == 0) {
@@ -3199,6 +3265,7 @@ int main(int argc, char **argv) {
     if (p.dspark_support) {
         hf_model_metadata metadata = load_hf_model_metadata(p.hf_dir,
                                                             p.source_revision);
+        dspark_options_from_config(p.hf_dir, &p.dspark);
         st_db db;
         db_open(&db, p.hf_dir);
         dspark_support_plan plan =
