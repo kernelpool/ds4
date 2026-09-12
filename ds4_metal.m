@@ -682,6 +682,8 @@ static id<MTLBuffer> g_indexed_topk_buffer;
 static id<MTLBuffer> g_f16_round_scratch_buffer;
 static id<MTLBuffer> g_raw_store_round_buffer;
 static id<MTLBuffer> g_moe_gate_scratch_buffer;
+static id<MTLBuffer> g_dsv41_hc_mix_buffer;
+static NSUInteger g_dsv41_hc_mix_bytes;
 static id<MTLBuffer> g_moe_down_scratch_buffer;
 static id<MTLBuffer> g_moe_id_map_buffer;
 static id<MTLBuffer> g_moe_packed_rhs_buffer;
@@ -4773,6 +4775,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
         @[@"DS4_METAL_QWEN4_SOURCE",      @"metal/qwen4.metal"],
         @[@"DS4_METAL_QWEN4_VISION_SOURCE", @"metal/qwen4_vision.metal"],
+        @[@"DS4_METAL_DSV41_SOURCE",       @"metal/dsv41.metal"],
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
@@ -40128,39 +40131,37 @@ int ds4_gpu_routed_moe_one_tensor(
             !g_quality_mode &&
             !write_clamped_moe &&
             (force_resident || !g_ssd_streaming_mode);
+        /* The fixed-route pair kernel reads every shape from args and differs from the
+         * generic one only in dropping the per-row indirection, which is exact when
+         * there is one token (nei1 1, ne11 1) and no expert split.  It was gated on the
+         * gpt-oss geometry as well, which kept every other MoE off it for no reason. */
         const bool use_mxfp4_moe_decode_fixed_route_pair =
             use_mxfp4_moe_decode_tg_multiple &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_FIXED_ROUTE_PAIR") == NULL &&
-            expert_in_dim == 4096 &&
-            expert_mid_dim == 2048 &&
-            n_total_expert == 256 &&
-            gate_row_bytes == 2176 &&
-            gate_args.nei0 == 6 &&
             gate_args.nei1 == 1 &&
             gate_args.ne11 == 1 &&
             gate_args.tp_world == 1 &&
             gate_args.tp_expert_base == 0 &&
             g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_pipeline_nsg1 != nil;
+        /* Same for the sum6 down projection: it walks `nei0` slots of `src1` at stride
+         * nb11 and already folds `add_in`, so the addend exclusion was unnecessary too. */
         const bool use_mxfp4_moe_decode_fixed_route_sum6 =
             use_mxfp4_moe_decode_fixed_route_pair &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_FIXED_ROUTE_SUM6") == NULL &&
-            out_dim == 4096 &&
-            down_row_bytes == 1088 &&
-            down_expert_bytes == 4456448 &&
-            down_args.nei0 == 6 &&
             down_args.nei1 == 1 &&
-            down_args.ne11 == 6 &&
+            down_args.ne11 == down_args.nei0 &&
             down_args.tp_world == 1 &&
             down_args.tp_expert_base == 0 &&
-            !down_args.tp_addend &&
             g_moe_mul_mv_id_mxfp4_sum6_fixed_route_pipeline_nsg1 != nil;
+        /* full_rows drops the per-row bound check, which is only safe when the output
+         * divides exactly into whole dispatches -- that, not the gpt-oss shape, is the
+         * real precondition. */
         const bool use_mxfp4_moe_decode_sum6_full_rows =
             use_mxfp4_moe_decode_fixed_route_sum6 &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_SUM6_FULL_ROWS") == NULL &&
-            down_args.ne00 == 2048 &&
-            down_args.ne01 == 4096 &&
-            down_args.ne0 == 4096 &&
-            down_args.nr0 == 2 &&
+            down_args.nr0 != 0 &&
+            (down_args.ne0 % (int32_t)down_args.nr0) == 0 &&
+            down_args.ne01 == down_args.ne0 &&
             g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_pipeline_nsg1 != nil;
         /* Compile-time trip counts for the one-token fixed-route decode MoE
          * kernels.  Every shape the specialized kernels assume is proven above
@@ -46037,6 +46038,911 @@ int ds4_gpu_glm53_matmul_bf16(
         }
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 BF16 matmul");
+    }
+}
+
+typedef struct {
+    uint32_t n_expert;
+    uint32_t topk;
+    float    route_scale;
+    uint32_t norm_topk;
+} dsv41_gpu_route_args;
+
+int ds4_gpu_dsv41_route(uint32_t rows, uint32_t n_expert, uint32_t topk,
+                        float route_scale, int norm_topk,
+                        const ds4_gpu_tensor *logits,
+                        const ds4_gpu_tensor *bias,
+                        ds4_gpu_tensor *idx_out,
+                        ds4_gpu_tensor *w_out) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (n_expert == 0 || topk == 0 || topk > n_expert || n_expert > 4096u || rows == 0 ||
+        !glm53_gpu_tensor_has(logits, (uint64_t)rows * n_expert, sizeof(float)) ||
+        !glm53_gpu_tensor_has(bias, n_expert, sizeof(float)) ||
+        !glm53_gpu_tensor_has(idx_out, (uint64_t)rows * topk, sizeof(int32_t)) ||
+        !glm53_gpu_tensor_has(w_out, (uint64_t)rows * topk, sizeof(float))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 routing received invalid buffers\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_route");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        dsv41_gpu_route_args args = {
+            .n_expert = n_expert, .topk = topk,
+            .route_scale = route_scale, .norm_topk = norm_topk ? 1u : 0u,
+        };
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(logits) offset:ds4_gpu_tensor_offset(logits) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(bias) offset:ds4_gpu_tensor_offset(bias) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(idx_out) offset:ds4_gpu_tensor_offset(idx_out) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(w_out) offset:ds4_gpu_tensor_offset(w_out) atIndex:4];
+        [enc setThreadgroupMemoryLength:n_expert * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 routing");
+    }
+}
+
+typedef struct {
+    uint32_t dim;
+    uint32_t hc;
+    float    norm_eps;
+} dsv41_gpu_hc_mix_args;
+
+static int dsv41_gpu_hc_mix_dispatch(const char *name, uint32_t rows, uint32_t dim, uint32_t hc,
+                                     const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
+                                     const ds4_gpu_tensor *c, const ds4_gpu_tensor *d,
+                                     ds4_gpu_tensor *out, int n_in) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(name);
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        dsv41_gpu_hc_mix_args args = { .dim = dim, .hc = hc };
+        const uint32_t threads = dim < 256u ? dim : 256u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        const ds4_gpu_tensor *ins[4] = { a, b, c, d };
+        for (int i = 0; i < n_in; i++) {
+            [enc setBuffer:ds4_gpu_tensor_buffer(ins[i])
+                    offset:ds4_gpu_tensor_offset(ins[i]) atIndex:(NSUInteger)(1 + i)];
+        }
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:(NSUInteger)(1 + n_in)];
+        [enc dispatchThreadgroups:MTLSizeMake((dim + threads - 1u) / threads, rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, name);
+    }
+}
+
+int ds4_gpu_dsv41_hc_pre(uint32_t rows, uint32_t dim, uint32_t hc,
+                         const ds4_gpu_tensor *stream,
+                         const ds4_gpu_tensor *mix,
+                         ds4_gpu_tensor *out) {
+    if (dim == 0 || hc == 0 || rows == 0 ||
+        !glm53_gpu_tensor_has(stream, (uint64_t)rows * hc * dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(mix, (uint64_t)rows * hc, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out, (uint64_t)rows * dim, sizeof(float))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 hc_pre received invalid buffers\n");
+        return 0;
+    }
+    return dsv41_gpu_hc_mix_dispatch("kernel_dsv41_hc_pre", rows, dim, hc,
+                                     stream, mix, NULL, NULL, out, 2);
+}
+
+int ds4_gpu_dsv41_hc_post(uint32_t rows, uint32_t dim, uint32_t hc,
+                          const ds4_gpu_tensor *sub,
+                          const ds4_gpu_tensor *residual,
+                          const ds4_gpu_tensor *post,
+                          const ds4_gpu_tensor *comb,
+                          ds4_gpu_tensor *out) {
+    if (dim == 0 || hc == 0 || rows == 0 ||
+        !glm53_gpu_tensor_has(sub, (uint64_t)rows * dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(residual, (uint64_t)rows * hc * dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(post, (uint64_t)rows * hc, sizeof(float)) ||
+        !glm53_gpu_tensor_has(comb, (uint64_t)rows * hc * hc, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out, (uint64_t)rows * hc * dim, sizeof(float))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 hc_post received invalid buffers\n");
+        return 0;
+    }
+    return dsv41_gpu_hc_mix_dispatch("kernel_dsv41_hc_post", rows, dim, hc,
+                                     sub, residual, post, comb, out, 4);
+}
+
+typedef struct {
+    uint32_t n_tokens;
+    uint32_t hc_dim;
+    uint32_t mix_hc;
+    uint32_t hc;
+    uint32_t iters;
+    float    norm_eps;
+    float    hc_eps;
+    uint32_t f16_weights;
+} dsv41_gpu_hc_mixes_args;
+
+int ds4_gpu_dsv41_hc_mixes(const void *model_map,
+                           uint64_t model_size,
+                           uint64_t hc_fn_offset,
+                           uint32_t n_tokens,
+                           uint32_t hc_dim,
+                           uint32_t hc,
+                           uint32_t iters,
+                           float norm_eps,
+                           float hc_eps,
+                           int f16_weights,
+                           const ds4_gpu_tensor *stream,
+                           const ds4_gpu_tensor *hc_scale,
+                           const ds4_gpu_tensor *hc_base,
+                           ds4_gpu_tensor *pre,
+                           ds4_gpu_tensor *post,
+                           ds4_gpu_tensor *comb) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint32_t mix_hc = (2u + hc) * hc;
+    uint64_t elems = 0;
+    if (hc == 0 || hc > 8u || hc_dim == 0 || iters == 0 || n_tokens == 0 ||
+        !glm53_gpu_mul_u64(mix_hc, hc_dim, &elems) ||
+        !glm53_gpu_tensor_has(stream, (uint64_t)n_tokens * hc_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(hc_scale, 3, sizeof(float)) ||
+        !glm53_gpu_tensor_has(hc_base, mix_hc, sizeof(float)) ||
+        !glm53_gpu_tensor_has(pre, (uint64_t)n_tokens * hc, sizeof(float)) ||
+        !glm53_gpu_tensor_has(post, (uint64_t)n_tokens * hc, sizeof(float)) ||
+        !glm53_gpu_tensor_has(comb, (uint64_t)n_tokens * hc * hc, sizeof(float))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 mHC mixes received invalid buffers\n");
+        return 0;
+    }
+    const uint64_t weight_bytes = elems * (f16_weights ? sizeof(uint16_t) : sizeof(float));
+    @autoreleasepool {
+        uint64_t inner = 0;
+        id<MTLBuffer> weightbuf = glm53_gpu_weight_buffer(
+            model_map, model_size, hc_fn_offset, weight_bytes, &inner, "hc_fn");
+        if (!weightbuf) return 0;
+        id<MTLComputePipelineState> p_proj =
+            ds4_gpu_get_pipeline("kernel_dsv41_hc_mix_proj");
+        id<MTLComputePipelineState> p_split =
+            ds4_gpu_get_pipeline("kernel_dsv41_hc_mix_split");
+        if (!p_proj || !p_split) return 0;
+        /* one row per threadgroup, so the grid is mix_hc * n_tokens rather than the single
+         * threadgroup the fused kernel ran at decode */
+        const uint64_t mix_bytes = (uint64_t)n_tokens * mix_hc * sizeof(float);
+        if (!ds4_gpu_ensure_scratch_buffer(&g_dsv41_hc_mix_buffer, &g_dsv41_hc_mix_bytes,
+                                           (NSUInteger)mix_bytes, "ds4_dsv41_hc_mixes")) {
+            return 0;
+        }
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        dsv41_gpu_hc_mixes_args args = {
+            .n_tokens = n_tokens, .hc_dim = hc_dim, .mix_hc = mix_hc, .hc = hc, .iters = iters,
+            .norm_eps = norm_eps, .hc_eps = hc_eps,
+            .f16_weights = f16_weights ? 1u : 0u,
+        };
+        const uint32_t nsg = 8u;
+        [enc setComputePipelineState:p_proj];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(stream) offset:ds4_gpu_tensor_offset(stream) atIndex:1];
+        [enc setBuffer:weightbuf offset:(NSUInteger)inner atIndex:2];
+        [enc setBuffer:g_dsv41_hc_mix_buffer offset:0 atIndex:3];
+        [enc setThreadgroupMemoryLength:2u * nsg * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(mix_hc, n_tokens, 1)
+            threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:p_split];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:g_dsv41_hc_mix_buffer offset:0 atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(hc_scale) offset:ds4_gpu_tensor_offset(hc_scale) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(hc_base) offset:ds4_gpu_tensor_offset(hc_base) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(pre) offset:ds4_gpu_tensor_offset(pre) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(post) offset:ds4_gpu_tensor_offset(post) atIndex:5];
+        [enc setBuffer:ds4_gpu_tensor_buffer(comb) offset:ds4_gpu_tensor_offset(comb) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 mHC mixes");
+    }
+}
+
+typedef struct {
+    uint32_t width;
+    uint32_t block;
+    uint32_t n_blocks;
+    uint32_t compress_len;
+} dsv41_gpu_block_max_args;
+
+typedef struct {
+    uint32_t n;
+    uint32_t k;
+} dsv41_gpu_rank_select_args;
+
+typedef struct {
+    uint32_t n;
+    uint32_t k;
+    uint32_t offset;
+    uint32_t reach;
+} dsv41_gpu_compact_args;
+
+int ds4_gpu_dsv41_block_max(uint32_t width,
+                            uint32_t block,
+                            uint32_t n_blocks,
+                            uint32_t compress_len,
+                            const ds4_gpu_tensor *scores,
+                            ds4_gpu_tensor *block_score) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (width == 0 || block == 0 || n_blocks == 0 ||
+        n_blocks != (width + block - 1u) / block ||
+        !glm53_gpu_tensor_has(scores, width, sizeof(float)) ||
+        !glm53_gpu_tensor_has(block_score, n_blocks, sizeof(float))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 block max received invalid buffers\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_block_max");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        dsv41_gpu_block_max_args args = {
+            .width = width, .block = block,
+            .n_blocks = n_blocks, .compress_len = compress_len,
+        };
+        const uint32_t nsg = 8u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(scores) offset:ds4_gpu_tensor_offset(scores) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(block_score)
+                offset:ds4_gpu_tensor_offset(block_score) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake((n_blocks + nsg - 1u) / nsg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 block max");
+    }
+}
+
+typedef struct {
+    uint32_t n;
+    uint32_t mode;
+    uint32_t k;
+} dsv41_gpu_radix_args;
+
+static int dsv41_gpu_force_radix(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_DSV41_FORCE_RADIX") != NULL;
+    return cached;
+}
+
+/* Exact top-k for candidate sets past the O(n^2) rank pass's reach.  Four 8-bit passes
+ * settle the score, four more settle the index among the elements that tie with it, and
+ * the refinement stays in a device buffer so none of it comes back to the host. */
+static int ds4_gpu_dsv41_radix_select(uint32_t n,
+                                      uint32_t k,
+                                      const ds4_gpu_tensor *scores,
+                                      ds4_gpu_tensor *keep,
+                                      ds4_gpu_tensor *state,
+                                      ds4_gpu_tensor *hist) {
+    @autoreleasepool {
+        id<MTLComputePipelineState> p_init = ds4_gpu_get_pipeline("kernel_dsv41_radix_init");
+        id<MTLComputePipelineState> p_hist = ds4_gpu_get_pipeline("kernel_dsv41_radix_hist");
+        id<MTLComputePipelineState> p_scan = ds4_gpu_get_pipeline("kernel_dsv41_radix_scan");
+        id<MTLComputePipelineState> p_keep = ds4_gpu_get_pipeline("kernel_dsv41_radix_keep");
+        if (!p_init || !p_hist || !p_scan || !p_keep) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        /* the scratch is shared by every select in the batch, so it is reset in order on
+         * the device rather than from the host, where the write would land ahead of the
+         * select still queued before this one */
+        {
+            dsv41_gpu_radix_args args = { .n = n, .mode = 0u, .k = k };
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:p_init];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(state)
+                    offset:ds4_gpu_tensor_offset(state) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(hist)
+                    offset:ds4_gpu_tensor_offset(hist) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
+        for (uint32_t mode = 0; mode < 2u; mode++) {
+            dsv41_gpu_radix_args args = { .n = n, .mode = mode, .k = k };
+            for (uint32_t pass = 0; pass < 4u; pass++) {
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:p_hist];
+                [enc setBytes:&args length:sizeof(args) atIndex:0];
+                [enc setBuffer:ds4_gpu_tensor_buffer(scores)
+                        offset:ds4_gpu_tensor_offset(scores) atIndex:1];
+                [enc setBuffer:ds4_gpu_tensor_buffer(state)
+                        offset:ds4_gpu_tensor_offset(state) atIndex:2];
+                [enc setBuffer:ds4_gpu_tensor_buffer(hist)
+                        offset:ds4_gpu_tensor_offset(hist) atIndex:3];
+                [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+
+                enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:p_scan];
+                [enc setBytes:&args length:sizeof(args) atIndex:0];
+                [enc setBuffer:ds4_gpu_tensor_buffer(state)
+                        offset:ds4_gpu_tensor_offset(state) atIndex:1];
+                [enc setBuffer:ds4_gpu_tensor_buffer(hist)
+                        offset:ds4_gpu_tensor_offset(hist) atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+            }
+        }
+        dsv41_gpu_radix_args args = { .n = n, .mode = 0u, .k = k };
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:p_keep];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(scores)
+                offset:ds4_gpu_tensor_offset(scores) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(state)
+                offset:ds4_gpu_tensor_offset(state) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(keep)
+                offset:ds4_gpu_tensor_offset(keep) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 radix select");
+    }
+}
+
+typedef struct {
+    uint32_t n;
+    uint32_t block;
+} dsv41_gpu_block_mask_args;
+
+int ds4_gpu_dsv41_block_mask(uint32_t n,
+                             uint32_t block,
+                             const ds4_gpu_tensor *block_keep,
+                             ds4_gpu_tensor *scores) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint32_t n_blocks = block ? (n + block - 1u) / block : 0u;
+    if (n == 0 || block == 0 ||
+        !glm53_gpu_tensor_has(block_keep, n_blocks, sizeof(int32_t)) ||
+        !glm53_gpu_tensor_has(scores, n, sizeof(float))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 block mask received invalid buffers\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_block_mask");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        dsv41_gpu_block_mask_args args = { .n = n, .block = block };
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(block_keep)
+                offset:ds4_gpu_tensor_offset(block_keep) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(scores)
+                offset:ds4_gpu_tensor_offset(scores) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 block mask");
+    }
+}
+
+int ds4_gpu_dsv41_topk_select(uint32_t n,
+                              uint32_t k,
+                              uint32_t offset,
+                              uint32_t reach,
+                              const ds4_gpu_tensor *scores,
+                              ds4_gpu_tensor *keep,
+                              ds4_gpu_tensor *out) {
+    return ds4_gpu_dsv41_topk_select_scratch(n, k, offset, reach, scores, keep, out,
+                                             NULL, NULL);
+}
+
+/* `state` and `hist` are the radix select's scratch: 5 and 256 uint32.  Without them the
+ * O(n^2) rank pass is the only option and n is capped. */
+int ds4_gpu_dsv41_topk_select_scratch(uint32_t n,
+                                      uint32_t k,
+                                      uint32_t offset,
+                                      uint32_t reach,
+                                      const ds4_gpu_tensor *scores,
+                                      ds4_gpu_tensor *keep,
+                                      ds4_gpu_tensor *out,
+                                      ds4_gpu_tensor *state,
+                                      ds4_gpu_tensor *hist) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const int radix = state != NULL && hist != NULL &&
+                      (n > DS4_GPU_DSV41_RANK_SELECT_MAX || dsv41_gpu_force_radix());
+    if (n == 0 || k == 0 || k > n ||
+        (!radix && n > DS4_GPU_DSV41_RANK_SELECT_MAX) ||
+        !glm53_gpu_tensor_has(scores, n, sizeof(float)) ||
+        !glm53_gpu_tensor_has(keep, n, sizeof(int32_t)) ||
+        !glm53_gpu_tensor_has(out, k, sizeof(int32_t))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 top-k select received invalid buffers"
+                        " (n=%u k=%u, n must be <= %u without radix scratch)\n",
+                n, k, DS4_GPU_DSV41_RANK_SELECT_MAX);
+        return 0;
+    }
+    if (radix && !ds4_gpu_dsv41_radix_select(n, k, scores, keep, state, hist)) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> rank = ds4_gpu_get_pipeline("kernel_dsv41_rank_select");
+        id<MTLComputePipelineState> compact = ds4_gpu_get_pipeline("kernel_dsv41_compact");
+        if (!rank || !compact) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+
+        if (!radix) {
+            dsv41_gpu_rank_select_args ra = { .n = n, .k = k };
+            const uint32_t nsg = 8u;
+            [enc setComputePipelineState:rank];
+            [enc setBytes:&ra length:sizeof(ra) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(scores) offset:ds4_gpu_tensor_offset(scores) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(keep) offset:ds4_gpu_tensor_offset(keep) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake((n + nsg - 1u) / nsg, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+        }
+
+        dsv41_gpu_compact_args ca = { .n = n, .k = k, .offset = offset, .reach = reach };
+        [enc setComputePipelineState:compact];
+        [enc setBytes:&ca length:sizeof(ca) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(keep) offset:ds4_gpu_tensor_offset(keep) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:2];
+        const uint32_t ct = 256u;
+        [enc setThreadgroupMemoryLength:(ct + 1u) * sizeof(uint32_t) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(ct, 1, 1)];
+
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 top-k select");
+    }
+}
+
+typedef struct {
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t rope_dim;
+    uint32_t pos_base;
+    uint32_t pos_stride;
+    uint32_t inverse;
+} dsv41_gpu_rope_args;
+
+typedef struct {
+    uint32_t in_per_group;
+    uint32_t o_lora;
+    uint32_t o_groups;
+    uint32_t quantized;
+} dsv41_gpu_output_lora_args;
+
+int ds4_gpu_dsv41_rope(uint32_t rows,
+                       uint32_t n_head,
+                       uint32_t head_dim,
+                       uint32_t rope_dim,
+                       uint32_t pos_base,
+                       int inverse,
+                       ds4_gpu_tensor *x,
+                       const ds4_gpu_tensor *cosv,
+                       const ds4_gpu_tensor *sinv) {
+    return ds4_gpu_dsv41_rope_ex(rows, n_head, head_dim, rope_dim, pos_base, 1u, inverse,
+                                 x, cosv, sinv);
+}
+
+int ds4_gpu_dsv41_rope_ex(uint32_t rows,
+                          uint32_t n_head,
+                          uint32_t head_dim,
+                          uint32_t rope_dim,
+                          uint32_t pos_base,
+                          uint32_t pos_stride,
+                          int inverse,
+                          ds4_gpu_tensor *x,
+                          const ds4_gpu_tensor *cosv,
+                          const ds4_gpu_tensor *sinv) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint64_t last_pos = (uint64_t)pos_base + (uint64_t)(rows ? rows - 1u : 0u) * pos_stride;
+    if (rows == 0 || n_head == 0 || head_dim == 0 || rope_dim == 0 || pos_stride == 0 ||
+        rope_dim > head_dim || (rope_dim % 2u) != 0u ||
+        !glm53_gpu_tensor_has(x, (uint64_t)rows * n_head * head_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(cosv, (last_pos + 1u) * (rope_dim / 2u), sizeof(float)) ||
+        !glm53_gpu_tensor_has(sinv, (last_pos + 1u) * (rope_dim / 2u), sizeof(float))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 RoPE received invalid buffers\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_rope");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        dsv41_gpu_rope_args args = {
+            .n_head = n_head, .head_dim = head_dim, .rope_dim = rope_dim,
+            .pos_base = pos_base, .pos_stride = pos_stride, .inverse = inverse ? 1u : 0u,
+        };
+        uint32_t threads = rope_dim / 2u;
+        if (threads > 256u) threads = 256u;
+        if (threads == 0u) threads = 1u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(cosv) offset:ds4_gpu_tensor_offset(cosv) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(sinv) offset:ds4_gpu_tensor_offset(sinv) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(n_head, rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 RoPE");
+    }
+}
+
+int ds4_gpu_dsv41_output_lora(const void *model_map,
+                              uint64_t model_size,
+                              uint64_t wo_a_offset,
+                              uint32_t in_per_group,
+                              uint32_t o_lora,
+                              uint32_t o_groups,
+                              int quantized,
+                              uint32_t rows,
+                              const ds4_gpu_tensor *in,
+                              ds4_gpu_tensor *out) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint32_t out_rows = o_groups * o_lora;
+    uint64_t elems = 0;
+    if (in_per_group == 0 || o_lora == 0 || o_groups == 0 || rows == 0 ||
+        (quantized && (in_per_group % 32u) != 0u) ||
+        !glm53_gpu_mul_u64(out_rows, in_per_group, &elems) ||
+        !glm53_gpu_tensor_has(in, (uint64_t)rows * o_groups * in_per_group, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out, (uint64_t)rows * out_rows, sizeof(float))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 output LoRA received invalid buffers\n");
+        return 0;
+    }
+    /* q8_0 stores 32 values in a 34-byte block */
+    const uint64_t weight_bytes = quantized ? (elems / 32u) * 34u : elems * sizeof(float);
+    @autoreleasepool {
+        uint64_t inner = 0;
+        id<MTLBuffer> weightbuf = glm53_gpu_weight_buffer(
+            model_map, model_size, wo_a_offset, weight_bytes, &inner, "output LoRA");
+        if (!weightbuf) return 0;
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv41_output_lora");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        dsv41_gpu_output_lora_args args = {
+            .in_per_group = in_per_group, .o_lora = o_lora,
+            .o_groups = o_groups, .quantized = quantized ? 1u : 0u,
+        };
+        const uint32_t nsg = 8u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weightbuf offset:(NSUInteger)inner atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(in) offset:ds4_gpu_tensor_offset(in) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((out_rows + nsg - 1u) / nsg, rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 output LoRA");
+    }
+}
+
+typedef struct {
+    uint32_t groups;
+    uint32_t ratio;
+    uint32_t dim;
+    float    eps;
+} dsv41_gpu_compress_pool_args;
+
+typedef struct {
+    uint32_t n_index_head;
+    uint32_t index_dim;
+    uint32_t n_scan;
+    uint32_t use_positions;
+    float    scale;
+} dsv41_gpu_index_score_args;
+
+int ds4_gpu_dsv41_compress_pool(uint32_t groups,
+                                uint32_t ratio,
+                                uint32_t dim,
+                                float eps,
+                                const ds4_gpu_tensor *kv,
+                                const ds4_gpu_tensor *score,
+                                const ds4_gpu_tensor *norm_w,
+                                ds4_gpu_tensor *out) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (groups == 0 || ratio < 2u || dim == 0 || dim > 4096u ||
+        !glm53_gpu_tensor_has(kv, (uint64_t)groups * ratio * dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(score, (uint64_t)groups * ratio * dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(norm_w, dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out, (uint64_t)groups * dim, sizeof(float))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 compressor received invalid buffers\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv41_compress_pool");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        dsv41_gpu_compress_pool_args args = {
+            .groups = groups, .ratio = ratio, .dim = dim, .eps = eps,
+        };
+        const uint32_t nsg = 8u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(kv) offset:ds4_gpu_tensor_offset(kv) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(score) offset:ds4_gpu_tensor_offset(score) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(norm_w) offset:ds4_gpu_tensor_offset(norm_w) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        /* the pooled row plus one slot per simdgroup for the RMS reduction */
+        [enc setThreadgroupMemoryLength:(dim + nsg) * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 compressor");
+    }
+}
+
+int ds4_gpu_dsv41_index_score(uint32_t n_index_head,
+                              uint32_t index_dim,
+                              uint32_t n_scan,
+                              const ds4_gpu_tensor *q,
+                              const ds4_gpu_tensor *index_k,
+                              const ds4_gpu_tensor *weights,
+                              const ds4_gpu_tensor *positions,
+                              float scale,
+                              ds4_gpu_tensor *scores) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (n_index_head == 0 || n_index_head > 32u || index_dim == 0 || n_scan == 0 ||
+        !glm53_gpu_tensor_has(q, (uint64_t)n_index_head * index_dim, sizeof(float)) ||
+        !index_k ||
+        (positions && !glm53_gpu_tensor_has(positions, n_scan, sizeof(int32_t))) ||
+        !glm53_gpu_tensor_has(weights, n_index_head, sizeof(float)) ||
+        !glm53_gpu_tensor_has(scores, n_scan, sizeof(float))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 indexer received invalid buffers\n");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv41_index_score");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        dsv41_gpu_index_score_args args = {
+            .n_index_head = n_index_head, .index_dim = index_dim,
+            .n_scan = n_scan, .use_positions = positions ? 1u : 0u, .scale = scale,
+        };
+        const uint32_t nsg = 8u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(q) offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(index_k) offset:ds4_gpu_tensor_offset(index_k) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(weights) offset:ds4_gpu_tensor_offset(weights) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(scores) offset:ds4_gpu_tensor_offset(scores) atIndex:4];
+        [enc setBuffer:(positions ? ds4_gpu_tensor_buffer(positions)
+                                  : ds4_gpu_tensor_buffer(scores))
+                offset:(positions ? ds4_gpu_tensor_offset(positions) : 0) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((n_scan + nsg - 1u) / nsg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 indexer");
+    }
+}
+
+typedef struct {
+    uint32_t n_window;
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t topk;
+    uint32_t n_idx_win;
+    float    scale;
+} dsv41_gpu_sparse_attn_args;
+
+/* One simdgroup per (query, head).  The two KV sources share a single pass, and so do
+ * the two index lists: the window slots and the compressed picks are read where each
+ * was written instead of being copied into one array per query. */
+int ds4_gpu_dsv41_sparse_attn(uint32_t s_len,
+                              uint32_t n_head,
+                              uint32_t head_dim,
+                              uint32_t topk,
+                              uint32_t n_window,
+                              float scale,
+                              const ds4_gpu_tensor *q,
+                              const ds4_gpu_tensor *kv,
+                              const ds4_gpu_tensor *kv_cmp,
+                              const ds4_gpu_tensor *sink,
+                              const ds4_gpu_tensor *idxs,
+                              uint32_t n_idx_win,
+                              const ds4_gpu_tensor *idx_cmp,
+                              ds4_gpu_tensor *out) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (s_len == 0 || n_head == 0 || topk == 0 || n_idx_win > topk ||
+        (idx_cmp == NULL && n_idx_win != topk) ||
+        head_dim == 0 || (head_dim % 32u) != 0u || head_dim > 512u ||
+        !glm53_gpu_tensor_has(q, (uint64_t)s_len * n_head * head_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(sink, n_head, sizeof(float)) ||
+        (n_idx_win && !glm53_gpu_tensor_has(idxs, (uint64_t)s_len * n_idx_win, sizeof(int32_t))) ||
+        (idx_cmp && topk > n_idx_win &&
+         !glm53_gpu_tensor_has(idx_cmp, (uint64_t)s_len * (topk - n_idx_win), sizeof(int32_t))) ||
+        !glm53_gpu_tensor_has(out, (uint64_t)s_len * n_head * head_dim, sizeof(float)) ||
+        !kv || !idxs) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 sparse attention received invalid buffers\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv41_sparse_attn");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+
+        dsv41_gpu_sparse_attn_args args = {
+            .n_window = n_window,
+            .n_head = n_head,
+            .head_dim = head_dim,
+            .topk = topk,
+            .n_idx_win = n_idx_win,
+            .scale = scale,
+        };
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(q) offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(kv) offset:ds4_gpu_tensor_offset(kv) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(kv_cmp ? kv_cmp : kv)
+                offset:ds4_gpu_tensor_offset(kv_cmp ? kv_cmp : kv) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(sink) offset:ds4_gpu_tensor_offset(sink) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(idxs) offset:ds4_gpu_tensor_offset(idxs) atIndex:5];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:6];
+        [enc setBuffer:ds4_gpu_tensor_buffer(idx_cmp ? idx_cmp : idxs)
+                offset:ds4_gpu_tensor_offset(idx_cmp ? idx_cmp : idxs) atIndex:7];
+        /* [nsg][head_dim] accumulators plus per-simdgroup max, denominator and count */
+        const uint32_t nsg = 8u;
+        [enc setThreadgroupMemoryLength:(nsg * head_dim + 3u * nsg) * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_head, s_len, 1)
+            threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 sparse attention");
+    }
+}
+
+typedef struct {
+    uint32_t dim;
+    uint32_t hc;
+    float    eps;
+    uint32_t rows;
+    uint32_t use_dead;
+} dsv41_gpu_engram_gate_args;
+
+/* The n-gram rows arrive already gathered: the tables are 203 GB and stay mapped
+ * without being made resident, so the sparse read belongs on the host.  What runs
+ * here is the dense part -- wkv through the shared BF16 mat-vec, then the gate. */
+int ds4_gpu_dsv41_engram(const void *model_map,
+                         uint64_t model_size,
+                         uint64_t wkv_offset,
+                         uint32_t in_dim,
+                         uint32_t n_embd,
+                         uint32_t hc,
+                         float eps,
+                         uint32_t rows,
+                         const ds4_gpu_tensor *dead_rows,
+                         ds4_gpu_tensor *emb,
+                         ds4_gpu_tensor *kv_scratch,
+                         ds4_gpu_tensor *x,
+                         ds4_gpu_tensor *q_weight,
+                         ds4_gpu_tensor *k_weight,
+                         ds4_gpu_tensor *gate,
+                         ds4_gpu_tensor *out,
+                         const ds4_gpu_tensor *wkv) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint32_t out_dim = n_embd * (hc + 1u);
+    uint64_t weights = 0;
+    if (in_dim == 0 || n_embd == 0 || hc == 0 || hc > 32u || rows == 0 ||
+        !glm53_gpu_mul_u64(in_dim, out_dim, &weights) ||
+        !glm53_gpu_tensor_has(emb, (uint64_t)rows * in_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(kv_scratch, (uint64_t)rows * out_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(x, (uint64_t)rows * hc * n_embd, sizeof(float)) ||
+        !glm53_gpu_tensor_has(q_weight, (uint64_t)hc * n_embd, sizeof(float)) ||
+        !glm53_gpu_tensor_has(k_weight, (uint64_t)hc * n_embd, sizeof(float)) ||
+        !glm53_gpu_tensor_has(gate, (uint64_t)rows * hc, sizeof(float)) ||
+        (dead_rows && !glm53_gpu_tensor_has(dead_rows, rows, sizeof(int32_t))) ||
+        !glm53_gpu_tensor_has(out, (uint64_t)rows * hc * n_embd, sizeof(float))) {
+        fprintf(stderr, "ds4: DeepSeek V4.1 engram received invalid buffers\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        /* the engram tables live in a second GGUF that is never handed to the GPU, so its
+         * dense projection arrives as an uploaded tensor rather than a model-map range */
+        uint64_t inner = 0;
+        id<MTLBuffer> weightbuf = nil;
+        if (wkv) {
+            if (!glm53_gpu_tensor_has(wkv, weights, sizeof(uint16_t))) {
+                fprintf(stderr, "ds4: DeepSeek V4.1 engram wkv tensor is undersized\n");
+                return 0;
+            }
+            weightbuf = ds4_gpu_tensor_buffer(wkv);
+            inner = ds4_gpu_tensor_offset(wkv);
+        } else {
+            weightbuf = glm53_gpu_weight_buffer(
+                model_map, model_size, wkv_offset, weights * sizeof(uint16_t),
+                &inner, "engram wkv");
+        }
+        if (!weightbuf) return 0;
+        id<MTLComputePipelineState> mv =
+            ds4_gpu_get_pipeline("kernel_glm53_mul_mv_bf16_f32");
+        id<MTLComputePipelineState> gk =
+            ds4_gpu_get_pipeline("kernel_dsv41_engram_gate");
+        if (!mv || !gk) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+
+        const uint32_t nsg = glm53_gpu_bf16_mv_nsg();
+        glm53_gpu_bf16_matmul_args mm = {
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .n_rows = rows,
+        };
+        [enc setComputePipelineState:mv];
+        [enc setBytes:&mm length:sizeof(mm) atIndex:0];
+        [enc setBuffer:weightbuf offset:(NSUInteger)inner atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(emb)
+                offset:ds4_gpu_tensor_offset(emb) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(kv_scratch)
+                offset:ds4_gpu_tensor_offset(kv_scratch) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((out_dim + nsg - 1u) / nsg, rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1, 1)];
+
+        dsv41_gpu_engram_gate_args ga = {
+            .dim = n_embd,
+            .hc = hc,
+            .eps = eps,
+            .rows = rows,
+            .use_dead = dead_rows ? 1u : 0u,
+        };
+        [enc setComputePipelineState:gk];
+        [enc setBytes:&ga length:sizeof(ga) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x)
+                offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(kv_scratch)
+                offset:ds4_gpu_tensor_offset(kv_scratch) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(q_weight)
+                offset:ds4_gpu_tensor_offset(q_weight) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(k_weight)
+                offset:ds4_gpu_tensor_offset(k_weight) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(gate)
+                offset:ds4_gpu_tensor_offset(gate) atIndex:5];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:6];
+        [enc setBuffer:ds4_gpu_tensor_buffer(dead_rows ? dead_rows : gate)
+                offset:ds4_gpu_tensor_offset(dead_rows ? dead_rows : gate) atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake(hc, rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 engram");
     }
 }
 

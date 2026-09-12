@@ -241,6 +241,200 @@ int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled);
 int ds4_gpu_test_decode_pipeline_fast_lookup(void);
 /* Strict test oracle for the extended decode mul_mv_ext (nsg + nxpsg) cache. */
 int ds4_gpu_test_decode_pipeline_fast_lookup_ext(void);
+/* DeepSeek V4.1 engram: projects the host-gathered n-gram rows through wkv, then
+ * gates the shared value into every hc copy.  `emb` is [rows, n_bucket * head_dim] f32,
+ * `x` and `out` are [rows, hc, n_embd], `gate` is [rows, hc], `kv_scratch` is
+ * [rows, n_embd * (hc + 1)].  `dead_rows` ([rows] int32, or NULL for none) shuts the
+ * gate on image-span tokens. */
+int ds4_gpu_dsv41_engram(const void *model_map,
+                         uint64_t model_size,
+                         uint64_t wkv_offset,
+                         uint32_t in_dim,
+                         uint32_t n_embd,
+                         uint32_t hc,
+                         float eps,
+                         uint32_t rows,
+                         const ds4_gpu_tensor *dead_rows,
+                         ds4_gpu_tensor *emb,
+                         ds4_gpu_tensor *kv_scratch,
+                         ds4_gpu_tensor *x,
+                         ds4_gpu_tensor *q_weight,
+                         ds4_gpu_tensor *k_weight,
+                         ds4_gpu_tensor *gate,
+                         ds4_gpu_tensor *out,
+                         const ds4_gpu_tensor *wkv);
+
+/* DeepSeek V4.1 sparse attention: MQA over a gathered index list (-1 gathers nothing),
+ * with the per-head sink entering the softmax denominator only.  `q` and `out` are
+ * [s_len, n_head, head_dim].
+ *
+ * `n_window` splits the id space: ids below it address `kv` (the window ring), the rest
+ * address `kv_cmp` (the compressed cache); pass n_window >= every id and kv_cmp NULL to
+ * index `kv` alone.  The index list itself may also come in two arrays: the first
+ * `n_idx_win` of each query's `topk` candidates from `idxs` ([s_len, n_idx_win]), the rest
+ * from `idx_cmp` ([s_len, topk - n_idx_win]); with idx_cmp NULL, n_idx_win must be topk. */
+int ds4_gpu_dsv41_sparse_attn(uint32_t s_len,
+                              uint32_t n_head,
+                              uint32_t head_dim,
+                              uint32_t topk,
+                              uint32_t n_window,
+                              float scale,
+                              const ds4_gpu_tensor *q,
+                              const ds4_gpu_tensor *kv,
+                              const ds4_gpu_tensor *kv_cmp,
+                              const ds4_gpu_tensor *sink,
+                              const ds4_gpu_tensor *idxs,
+                              uint32_t n_idx_win,
+                              const ds4_gpu_tensor *idx_cmp,
+                              ds4_gpu_tensor *out);
+
+/* DeepSeek V4.1 CSA2 compressor: pools `ratio` tokens into one latent with a per-channel
+ * softmax gate, RMSNorm fused in.  `kv`/`score` are [groups * ratio, dim], `out` [groups, dim]. */
+int ds4_gpu_dsv41_compress_pool(uint32_t groups,
+                                uint32_t ratio,
+                                uint32_t dim,
+                                float eps,
+                                const ds4_gpu_tensor *kv,
+                                const ds4_gpu_tensor *score,
+                                const ds4_gpu_tensor *norm_w,
+                                ds4_gpu_tensor *out);
+
+/* DeepSeek V4.1 indexer scores: sum over heads of relu(q . k) * weights, the softmax
+ * scale already folded into `weights`.  Selection (candidate blocks, top-k) is separate. */
+int ds4_gpu_dsv41_index_score(uint32_t n_index_head,
+                              uint32_t index_dim,
+                              uint32_t n_scan,
+                              const ds4_gpu_tensor *q,
+                              const ds4_gpu_tensor *index_k,
+                              const ds4_gpu_tensor *weights,
+                              const ds4_gpu_tensor *positions,
+                              float scale,
+                              ds4_gpu_tensor *scores);
+
+/* DeepSeek V4.1 RoPE: adjacent element pairs as one complex number, applied to the last
+ * `rope_dim` elements of every head.  `inverse` conjugates.  cos/sin are [max_pos, rope_dim/2],
+ * so YaRN and the per-layer theta stay on the host. */
+int ds4_gpu_dsv41_rope(uint32_t rows,
+                       uint32_t n_head,
+                       uint32_t head_dim,
+                       uint32_t rope_dim,
+                       uint32_t pos_base,
+                       int inverse,
+                       ds4_gpu_tensor *x,
+                       const ds4_gpu_tensor *cosv,
+                       const ds4_gpu_tensor *sinv);
+/* Same, with row r at position pos_base + r * pos_stride: compressed groups sit
+ * `ratio` positions apart. */
+int ds4_gpu_dsv41_rope_ex(uint32_t rows,
+                          uint32_t n_head,
+                          uint32_t head_dim,
+                          uint32_t rope_dim,
+                          uint32_t pos_base,
+                          uint32_t pos_stride,
+                          int inverse,
+                          ds4_gpu_tensor *x,
+                          const ds4_gpu_tensor *cosv,
+                          const ds4_gpu_tensor *sinv);
+
+
+/* DeepSeek V4.1 grouped output LoRA: wo_a is block diagonal over o_groups, so each output
+ * row reads only its own group's slice of the attention output.  `quantized` selects
+ * f32 (0) or q8_0 (1) weights, read through the model map. */
+int ds4_gpu_dsv41_output_lora(const void *model_map,
+                              uint64_t model_size,
+                              uint64_t wo_a_offset,
+                              uint32_t in_per_group,
+                              uint32_t o_lora,
+                              uint32_t o_groups,
+                              int quantized,
+                              uint32_t rows,
+                              const ds4_gpu_tensor *in,
+                              ds4_gpu_tensor *out);
+
+/* DeepSeek V4.1 indexer level one: score each block by its best position, pinning the
+ * block that holds the newest position. */
+int ds4_gpu_dsv41_block_max(uint32_t width,
+                            uint32_t block,
+                            uint32_t n_blocks,
+                            uint32_t compress_len,
+                            const ds4_gpu_tensor *scores,
+                            ds4_gpu_tensor *block_score);
+
+/* DeepSeek V4.1 exact top-k by (score descending, index descending among equals), then
+ * compaction into ascending positions shifted by `offset`, -1 for unreachable or unfilled.
+ * `keep` is scratch of n int32.  O(n^2) work: n must be <= DS4_GPU_DSV41_RANK_SELECT_MAX. */
+#define DS4_GPU_DSV41_RANK_SELECT_MAX 32768u
+int ds4_gpu_dsv41_topk_select(uint32_t n,
+                              uint32_t k,
+                              uint32_t offset,
+                              uint32_t reach,
+                              const ds4_gpu_tensor *scores,
+                              ds4_gpu_tensor *keep,
+                              ds4_gpu_tensor *out);
+
+/* Same selection, but with the radix scratch (`state` 5 u32, `hist` 256 u32) that lifts
+ * the size cap: past DS4_GPU_DSV41_RANK_SELECT_MAX the O(n^2) rank pass is replaced by an
+ * exact radix select with the identical tie order. */
+int ds4_gpu_dsv41_topk_select_scratch(uint32_t n,
+                                      uint32_t k,
+                                      uint32_t offset,
+                                      uint32_t reach,
+                                      const ds4_gpu_tensor *scores,
+                                      ds4_gpu_tensor *keep,
+                                      ds4_gpu_tensor *out,
+                                      ds4_gpu_tensor *state,
+                                      ds4_gpu_tensor *hist);
+
+/* DeepSeek V4.1: a consumer layer cannot pick a position whose block the candidate source
+ * dropped, which masking to -inf expresses to the rank pass. */
+int ds4_gpu_dsv41_block_mask(uint32_t n,
+                             uint32_t block,
+                             const ds4_gpu_tensor *block_keep,
+                             ds4_gpu_tensor *scores);
+
+/* DeepSeek V4.1 single-pass mHC: projects the flattened, RMS-normalised residual stream
+ * through hc_fn and splits the result into pre / post / comb, with comb made doubly
+ * stochastic by `iters` Sinkhorn sweeps.  `hc_fn` is read through the model map, f32 or
+ * f16 per `f16_weights`. */
+int ds4_gpu_dsv41_hc_mixes(const void *model_map,
+                           uint64_t model_size,
+                           uint64_t hc_fn_offset,
+                           uint32_t n_tokens,
+                           uint32_t hc_dim,
+                           uint32_t hc,
+                           uint32_t iters,
+                           float norm_eps,
+                           float hc_eps,
+                           int f16_weights,
+                           const ds4_gpu_tensor *stream,
+                           const ds4_gpu_tensor *hc_scale,
+                           const ds4_gpu_tensor *hc_base,
+                           ds4_gpu_tensor *pre,
+                           ds4_gpu_tensor *post,
+                           ds4_gpu_tensor *comb);
+
+/* DeepSeek V4.1 mHC stream ends: collapse the hc copies with the previous sublayer's mix,
+ * and expand a sublayer output back out folding the residual through `comb`. */
+int ds4_gpu_dsv41_hc_pre(uint32_t rows, uint32_t dim, uint32_t hc,
+                         const ds4_gpu_tensor *stream,
+                         const ds4_gpu_tensor *mix,
+                         ds4_gpu_tensor *out);
+int ds4_gpu_dsv41_hc_post(uint32_t rows, uint32_t dim, uint32_t hc,
+                          const ds4_gpu_tensor *sub,
+                          const ds4_gpu_tensor *residual,
+                          const ds4_gpu_tensor *post,
+                          const ds4_gpu_tensor *comb,
+                          ds4_gpu_tensor *out);
+
+/* DeepSeek V4.1 MoE routing: sqrtsoftplus scores, bias-steered selection, weights from
+ * the unbiased scores renormalised to `route_scale`. */
+int ds4_gpu_dsv41_route(uint32_t rows, uint32_t n_expert, uint32_t topk,
+                        float route_scale, int norm_topk,
+                        const ds4_gpu_tensor *logits,
+                        const ds4_gpu_tensor *bias,
+                        ds4_gpu_tensor *idx_out,
+                        ds4_gpu_tensor *w_out);
+
 /* Strict test oracle for the generated resident-prefill MXFP4 half LUT. */
 int ds4_gpu_test_mxfp4_down_half_lut(uint16_t *legacy_bits,
                                      uint16_t *lut_bits);
