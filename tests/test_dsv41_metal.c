@@ -1720,7 +1720,7 @@ static int run_radix(const char *label, uint32_t n, uint32_t k, float tie_frac) 
     ds4_gpu_tensor *t_sc = ds4_gpu_tensor_alloc((uint64_t)n * sizeof(float));
     ds4_gpu_tensor *t_keep = ds4_gpu_tensor_alloc((uint64_t)n * sizeof(int32_t));
     ds4_gpu_tensor *t_out = ds4_gpu_tensor_alloc((uint64_t)k * sizeof(int32_t));
-    ds4_gpu_tensor *t_state = ds4_gpu_tensor_alloc(6 * sizeof(uint32_t));
+    ds4_gpu_tensor *t_state = ds4_gpu_tensor_alloc(5 * sizeof(uint32_t));
     ds4_gpu_tensor *t_hist = ds4_gpu_tensor_alloc(256 * sizeof(uint32_t));
     int ok = t_sc && t_keep && t_out && t_state && t_hist;
     ok = ok && ds4_gpu_tensor_write(t_sc, 0, sc, (uint64_t)n * sizeof(float));
@@ -1800,7 +1800,7 @@ static int run_radix_rows(const char *label, uint32_t n, uint32_t k, float tie_f
     ds4_gpu_tensor *t_sc = ds4_gpu_tensor_alloc((uint64_t)rows * n * sizeof(float));
     ds4_gpu_tensor *t_keep = ds4_gpu_tensor_alloc((uint64_t)rows * n * sizeof(int32_t));
     ds4_gpu_tensor *t_out = ds4_gpu_tensor_alloc((uint64_t)rows * k * sizeof(int32_t));
-    ds4_gpu_tensor *t_state = ds4_gpu_tensor_alloc((uint64_t)rows * 6u * sizeof(uint32_t));
+    ds4_gpu_tensor *t_state = ds4_gpu_tensor_alloc((uint64_t)rows * 5u * sizeof(uint32_t));
     ds4_gpu_tensor *t_hist = ds4_gpu_tensor_alloc((uint64_t)rows * 256u * sizeof(uint32_t));
     int ok = sc && keep_r && keep_g && t_sc && t_keep && t_out && t_state && t_hist;
     for (uint32_t r = 0; ok && r < rows; r++) {
