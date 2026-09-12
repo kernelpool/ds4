@@ -43,6 +43,74 @@ path, including pipeline execution for models too large for one host.
 
 To build weights rather than download them, see [GGUF tools](../gguf-tools/README.md).
 
+## DeepSeek V4.1 Flash
+
+DeepSeek V4.1 Flash runs on its own Metal path: 40 trunk layers with four-stream
+hyper-connections, sliding-window attention over the last 128 tokens plus compressed
+attention over latents the two-level indexer selects, the hashed n-gram engram in two
+layers, 384-expert MoE with a shared expert, and three DSpark draft stages. There is no
+download target; build the three GGUFs from the Hugging Face checkpoint with the tools in
+`gguf-tools/`. The backbone converter takes its metadata and tensor list from a
+header-only template, so that is generated first:
+
+```sh
+python3 gguf-tools/deepseek_v41_template.py --hf ../DeepSeek-V4.1-Flash \
+  --out gguf/DeepSeek-V4.1-Flash-template.gguf
+gguf-tools/deepseek4-quantize --hf ../DeepSeek-V4.1-Flash \
+  --template gguf/DeepSeek-V4.1-Flash-template.gguf --experts mxfp4 \
+  --out gguf/DeepSeek-V4.1-Flash-MXFP4.gguf                              # about 306 GB
+python3 gguf-tools/deepseek_v41_engram.py --hf ../DeepSeek-V4.1-Flash \
+  --out gguf/DeepSeek-V4.1-Flash-engram.gguf                             # about 203 GB
+gguf-tools/deepseek4-quantize --hf ../DeepSeek-V4.1-Flash \
+  --dspark-support --dspark-heads-only --out gguf/DeepSeek-V4.1-Flash-dspark.gguf
+```
+
+The backbone keeps the released MXFP4 routed experts and holds projections, shared experts
+and the output at Q8_0; it is resident, so it needs a Mac with more unified memory than
+its size. The engram sidecar is memory-mapped and read a few rows per token, so it only
+has to be on fast storage. The DSpark file carries just the draft heads, since the three
+draft blocks are already in the backbone.
+
+```sh
+./ds4 -m gguf/DeepSeek-V4.1-Flash-MXFP4.gguf --engram gguf/DeepSeek-V4.1-Flash-engram.gguf --ctx 32768
+./ds4 -m gguf/DeepSeek-V4.1-Flash-MXFP4.gguf --engram gguf/DeepSeek-V4.1-Flash-engram.gguf \
+  --mtp-model gguf/DeepSeek-V4.1-Flash-dspark.gguf --dspark --temp 0
+./ds4 -m gguf/DeepSeek-V4.1-Flash-MXFP4.gguf --engram gguf/DeepSeek-V4.1-Flash-engram.gguf \
+  --mtp-model gguf/DeepSeek-V4.1-Flash-dspark.gguf --dspark --mtp-exact-sampling
+./ds4-server -m gguf/DeepSeek-V4.1-Flash-MXFP4.gguf --engram gguf/DeepSeek-V4.1-Flash-engram.gguf \
+  --mtp-model gguf/DeepSeek-V4.1-Flash-dspark.gguf --dspark --ctx 65536 --kv-disk-dir ~/.ds4/server-kv
+```
+
+Pass the engram sidecar with `--engram`: the model loads without it, but its two engram
+layers then skip their lookups and the output degrades. `--dspark` with the heads file
+enables the drafter, which speeds up greedy decoding. At non-zero temperature it keeps
+target-matching greedy drafts like the other models; `--mtp-exact-sampling` accepts each
+draft with the target's own probability instead and preserves the sampling distribution.
+`--dspark-confidence` prunes drafts below a confidence; for this model the default of 0.6
+is the measured optimum in both modes, and `DS4_DSPARK_STATS=1` prints acceptance counts
+at exit.
+
+Prefill runs in chunks of 64 tokens by default; `--prefill-chunk 512` is considerably
+faster on long prompts at the cost of transient buffers that scale with the chunk. The
+compressed caches, index keys and selections stay on the GPU, so long contexts do not
+move data per token. Activations and the matrix kernels stay in F32 (`DS4_DSV41_HALF_MM=1`
+selects the half-precision tiles for comparison). Disk KV checkpoints and live prefix
+reuse work as for the other models; a checkpoint carries the window, the compressed caches,
+the open compressor groups and the draft rings, and a session with another prefill chunk
+can load it.
+
+For A/B checks, `DS4_DSV41_TRACE=1` prints each pass's host and GPU time,
+`DS4_DSV41_FULL_SCAN=1` scores every compressed position in the index layers after the
+candidate source instead of the candidate blocks, `DS4_DSV41_RADIX_MULTI=1` and
+`DS4_DSV41_COMPACT_SINGLE=1` select the multi-dispatch selection kernels,
+`DS4_METAL_Q8_MV_EXT=1` and `DS4_METAL_F16_MV_EXT=1` the generic small-batch matvecs, and
+`DS4_DSV41_FLUSH_LAYERS=0` disables the mid-pass command flushes. `make tests/test_dsv41_metal
+&& ./tests/test_dsv41_metal` compares every V4.1 kernel with a CPU transcription, and
+`./tests/test_dsv41_layer <backbone> <engram> <dspark>` checks each layer kind and the
+drafter against the CPU reference on the released weights.
+
+Metal only, on one machine. Vision is not supported.
+
 ## GLM 5.3 Flash
 
 | Target | Approximate file size | Use |

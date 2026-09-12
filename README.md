@@ -7,8 +7,8 @@ language models on consumer hardware (that is, hardware that people
 can actually own). To reach this goal, we are building
 a small native inference engine optimized first for
 **DeepSeek V4 Flash** (including the experimental vision model),
-and additionally **GLM 5.2 and 5.3**, **GLM 5.3 Flash** and
-**DeepSeek V4 PRO**. The code is self-contained and
+and additionally **GLM 5.2 and 5.3**, **GLM 5.3 Flash**,
+**DeepSeek V4 PRO** and **DeepSeek V4.1 Flash**. The code is self-contained and
 deliberately narrow, not a general GGUF runner: you need to use the
 GGUF files the project produces, that are part of the project
 itself.
