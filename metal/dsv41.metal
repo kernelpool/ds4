@@ -101,8 +101,6 @@ kernel void kernel_dsv41_engram_gate(
 // One simdgroup owns one (query, head); lanes stride the head dimension so the candidate
 // loads stay coalesced, and the running softmax keeps the whole output in registers.
 
-#define DSV41_ATTN_MAX_PER_LANE 16u   // head_dim <= 512
-
 struct dsv41_sparse_attn_args {
     uint n_window;      // ids below this index the window ring, the rest the compressed cache
     uint n_head;
@@ -116,9 +114,11 @@ struct dsv41_sparse_attn_args {
 // running (max, denominator, accumulator), and the partials are combined at the end.  A
 // decode step has a single query, so without this the grid is only n_head simdgroups and
 // the machine sits idle; splitting recovers the occupancy.
-#define DSV41_ATTN_NSG 8u
-
-kernel void kernel_dsv41_sparse_attn(
+//
+// DPL is the head dimension per lane (head_dim / 32), a compile-time constant so the
+// per-lane arrays live in registers and a candidate row's loads issue together.
+template<ushort DPL>
+kernel void kernel_dsv41_sparse_attn_t(
         constant dsv41_sparse_attn_args &args,
         device const float              *q,     // [s_len, n_head, head_dim]
         device const float              *kv,    // [n_window, head_dim], the window ring
@@ -136,18 +136,15 @@ kernel void kernel_dsv41_sparse_attn(
     const uint s = tgpig.y;
     if (h >= args.n_head) return;
 
-    const uint d = args.head_dim;
-    const uint dpl = d / 32u;                       // elements per lane
-    if (dpl == 0u || dpl > DSV41_ATTN_MAX_PER_LANE) return;
-
+    const uint d = (uint)DPL * 32u;
     device const float *qv = q + ((ulong)s * args.n_head + h) * d;
     const uint n_win = args.n_idx_win;
     device const int *idx = idxs + (ulong)s * n_win;
     device const int *idc = idx_cmp + (ulong)s * (args.topk - n_win);
 
-    float qreg[DSV41_ATTN_MAX_PER_LANE];
-    float acc[DSV41_ATTN_MAX_PER_LANE];
-    for (uint i = 0; i < dpl; i++) {
+    float qreg[DPL];
+    float acc[DPL];
+    for (ushort i = 0; i < DPL; i++) {
         qreg[i] = qv[i * 32u + lane];
         acc[i] = 0.0f;
     }
@@ -157,26 +154,38 @@ kernel void kernel_dsv41_sparse_attn(
     float l = 0.0f;
     uint valid = 0u;
 
-    for (uint t = sg; t < args.topk; t += nsg) {
-        const int id = t < n_win ? idx[t] : idc[t - n_win];
-        if (id < 0) continue;
-        // the two caches stay where they are; gathering them into one array cost a blit
-        // and a 256 KB copy per block, and a blit ends the compute encoder
-        device const float *kvv = (uint)id < args.n_window
-                                ? kv + (ulong)id * d
-                                : kv_cmp + (ulong)((uint)id - args.n_window) * d;
+    // four ids are fetched per step so the scan over the list waits on memory once per
+    // four entries; each valid candidate is then folded in as before
+    const uint step = (uint)nsg;
+    for (uint t = sg; t < args.topk; t += 4u * step) {
+        int id4[4];
+        for (ushort j = 0; j < 4; j++) {
+            const uint tj = t + j * step;
+            id4[j] = tj >= args.topk ? -1 : tj < n_win ? idx[tj] : idc[tj - n_win];
+        }
+        for (ushort j = 0; j < 4; j++) {
+            const int id = id4[j];
+            if (id < 0) continue;
+            // the two caches stay where they are; gathering them into one array cost a
+            // blit and a 256 KB copy per block, and a blit ends the compute encoder
+            device const float *kvv = (uint)id < args.n_window
+                                    ? kv + (ulong)id * d
+                                    : kv_cmp + (ulong)((uint)id - args.n_window) * d;
+            float kr[DPL];
+            for (ushort i = 0; i < DPL; i++) kr[i] = kvv[i * 32u + lane];
 
-        float p = 0.0f;
-        for (uint i = 0; i < dpl; i++) p = fma(qreg[i], kvv[i * 32u + lane], p);
-        p = simd_sum(p) * args.scale;
+            float p = 0.0f;
+            for (ushort i = 0; i < DPL; i++) p = fma(qreg[i], kr[i], p);
+            p = simd_sum(p) * args.scale;
 
-        const float mnew = max(m, p);
-        const float corr = exp(m - mnew);           // 0 on the first valid candidate
-        const float e = exp(p - mnew);
-        l = fma(l, corr, e);
-        for (uint i = 0; i < dpl; i++) acc[i] = fma(acc[i], corr, e * kvv[i * 32u + lane]);
-        m = mnew;
-        valid++;
+            const float mnew = max(m, p);
+            const float corr = exp(m - mnew);       // 0 on the first valid candidate
+            const float e = exp(p - mnew);
+            l = fma(l, corr, e);
+            for (ushort i = 0; i < DPL; i++) acc[i] = fma(acc[i], corr, e * kr[i]);
+            m = mnew;
+            valid++;
+        }
     }
 
     // shared layout: [nsg][d] accumulators, then nsg maxima, denominators and valid counts
@@ -184,7 +193,7 @@ kernel void kernel_dsv41_sparse_attn(
     threadgroup float *pm = shared + (uint)nsg * d;
     threadgroup float *pl = pm + nsg;
     threadgroup float *pv = pl + nsg;
-    for (uint i = 0; i < dpl; i++) part[(uint)sg * d + i * 32u + lane] = acc[i];
+    for (ushort i = 0; i < DPL; i++) part[(uint)sg * d + i * 32u + lane] = acc[i];
     if (lane == 0u) {
         pm[sg] = valid ? m : -1.0e30f;
         pl[sg] = l;
@@ -202,24 +211,30 @@ kernel void kernel_dsv41_sparse_attn(
     }
     device float *o = out + ((ulong)s * args.n_head + h) * d;
     if (total_valid == 0.0f) {
-        for (uint i = 0; i < dpl; i++) o[i * 32u + lane] = 0.0f;
+        for (ushort i = 0; i < DPL; i++) o[i * 32u + lane] = 0.0f;
         return;
     }
 
     float L = 0.0f;
-    float sum[DSV41_ATTN_MAX_PER_LANE];
-    for (uint i = 0; i < dpl; i++) sum[i] = 0.0f;
+    float sum[DPL];
+    for (ushort i = 0; i < DPL; i++) sum[i] = 0.0f;
     for (ushort g = 0; g < nsg; g++) {
         if (pv[g] == 0.0f) continue;
         const float w = exp(pm[g] - M);
         L = fma(pl[g], w, L);
-        for (uint i = 0; i < dpl; i++) sum[i] = fma(part[(uint)g * d + i * 32u + lane], w, sum[i]);
+        for (ushort i = 0; i < DPL; i++) sum[i] = fma(part[(uint)g * d + i * 32u + lane], w, sum[i]);
     }
     // the sink is a logit on the denominator alone
     L += exp(sink[h] - M);
     const float inv = 1.0f / L;
-    for (uint i = 0; i < dpl; i++) o[i * 32u + lane] = sum[i] * inv;
+    for (ushort i = 0; i < DPL; i++) o[i * 32u + lane] = sum[i] * inv;
 }
+
+typedef decltype(kernel_dsv41_sparse_attn_t<2>) dsv41_sparse_attn_t;
+template [[host_name("kernel_dsv41_sparse_attn_d64")]]  kernel dsv41_sparse_attn_t kernel_dsv41_sparse_attn_t<2>;
+template [[host_name("kernel_dsv41_sparse_attn_d128")]] kernel dsv41_sparse_attn_t kernel_dsv41_sparse_attn_t<4>;
+template [[host_name("kernel_dsv41_sparse_attn_d256")]] kernel dsv41_sparse_attn_t kernel_dsv41_sparse_attn_t<8>;
+template [[host_name("kernel_dsv41_sparse_attn_d512")]] kernel dsv41_sparse_attn_t kernel_dsv41_sparse_attn_t<16>;
 
 // CSA2 compressor pooling.  `ratio` consecutive tokens collapse into one KV latent,
 // weighted by a softmax taken PER CHANNEL over the group -- not over the channels -- and
@@ -1293,19 +1308,38 @@ kernel void kernel_dsv41_markov_part(
     const int prev = tokens[a.step];
     for (uint r = tid; r < a.rank; r += ntg) e[r] = dsv41_tab(embed, (ulong)prev * a.rank + r, a.f16);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    // a lane owns `per` consecutive ranks, so a row is one contiguous load per lane; four
+    // rows go per step so their loads overlap
     float ev[DSV41_MARKOV_MAX_PER_LANE];
-    for (uint i = 0; i < per; i++) ev[i] = e[i * 32u + lane];
+    for (uint i = 0; i < DSV41_MARKOV_MAX_PER_LANE; i++) ev[i] = i < per ? e[lane * per + i] : 0.0f;
 
     device const float *lg = logits + (ulong)a.step * a.vocab;
     float best = -INFINITY;
     int bi = -1;
-    for (uint v = tgpig * nsg + sg; v < a.vocab; v += a.n_parts * nsg) {
-        float p = 0.0f;
-        for (uint i = 0; i < per; i++) {
-            p = fma(dsv41_tab(head, (ulong)v * a.rank + i * 32u + lane, a.f16), ev[i], p);
+    const uint stride = a.n_parts * nsg;
+    for (uint v0 = tgpig * nsg + sg; v0 < a.vocab; v0 += 4u * stride) {
+        float p4[4];
+        for (ushort j = 0; j < 4; j++) {
+            const uint v = min(v0 + j * stride, a.vocab - 1u);
+            const ulong base = (ulong)v * a.rank + lane * per;
+            float p = 0.0f;
+            if (a.f16 && per == 8u) {
+                device const half4 *hp = (device const half4 *)((device const half *)head + base);
+                const float4 h0 = float4(hp[0]), h1 = float4(hp[1]);
+                p = dot(h0, float4(ev[0], ev[1], ev[2], ev[3])) + dot(h1, float4(ev[4], ev[5], ev[6], ev[7]));
+            } else {
+                for (uint i = 0; i < DSV41_MARKOV_MAX_PER_LANE; i++) {
+                    if (i < per) p = fma(dsv41_tab(head, base + i, a.f16), ev[i], p);
+                }
+            }
+            p4[j] = p;
         }
-        p = simd_sum(p) + lg[v];
-        if (p > best || (p == best && (int)v < bi)) { best = p; bi = (int)v; }
+        for (ushort j = 0; j < 4; j++) {
+            const uint v = v0 + j * stride;
+            if (v >= a.vocab) break;
+            const float p = simd_sum(p4[j]) + lg[v];
+            if (p > best || (p == best && (int)v < bi)) { best = p; bi = (int)v; }
+        }
     }
     if (lane == 0) { sv[sg] = best; si[sg] = bi; }
     threadgroup_barrier(mem_flags::mem_threadgroup);

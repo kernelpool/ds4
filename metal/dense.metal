@@ -197,6 +197,91 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// The same walk for NT tokens at once: a threadgroup's weight rows stream once and meet
+// every token's activations, so 2..8 rows cost little more than one.
+template<short NR0, short NT>
+void kernel_mul_mv_q8_0_f32_nt_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = args.ne00/QK8_0;
+    const int r0 = tgpig.x*NR0;
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *) (src0 + (uint64_t)(r0 + row)*args.nb01);
+    }
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+    const int ib0 = sgitg*NQ + ix;
+
+    device const float4 * yb[NT];
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        yb[t] = (device const float4 *) (src1 + (uint64_t)t*args.nb11 + (ib0*QK8_0 + il*NQ)*sizeof(float));
+    }
+
+    float sumf[NT][NR0];
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[t][row] = 0.f;
+    }
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        float4 yl[NT][2];
+        FOR_UNROLL (short t = 0; t < NT; ++t) {
+            yl[t][0] = yb[t][0];
+            yl[t][1] = yb[t][1];
+            yb[t] += NSG*NQ*QK8_0/4;
+        }
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+            const float4 q0 = float4(qs[0], qs[1], qs[2], qs[3]);
+            const float4 q1 = float4(qs[4], qs[5], qs[6], qs[7]);
+            const float d = ax[row][ib].d;
+            FOR_UNROLL (short t = 0; t < NT; ++t) {
+                sumf[t][row] += (dot(q0, yl[t][0]) + dot(q1, yl[t][1]))*d;
+            }
+        }
+    }
+
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        device float * dst_f32 = (device float *) dst + (uint64_t)t*args.ne0;
+        helper_mv_reduce_and_write<NR0>(dst_f32, sumf[t], r0, args.ne01, tiisg, sgitg, shmem);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+template<short NT>
+kernel void kernel_mul_mv_q8_0_f32_nt(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_nt_impl<N_R0_Q8_0, NT>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+typedef decltype(kernel_mul_mv_q8_0_f32_nt<2>) mul_mv_q8_0_f32_nt_t;
+template [[host_name("kernel_mul_mv_q8_0_f32_nt2")]] kernel mul_mv_q8_0_f32_nt_t kernel_mul_mv_q8_0_f32_nt<2>;
+template [[host_name("kernel_mul_mv_q8_0_f32_nt3")]] kernel mul_mv_q8_0_f32_nt_t kernel_mul_mv_q8_0_f32_nt<3>;
+template [[host_name("kernel_mul_mv_q8_0_f32_nt4")]] kernel mul_mv_q8_0_f32_nt_t kernel_mul_mv_q8_0_f32_nt<4>;
+template [[host_name("kernel_mul_mv_q8_0_f32_nt5")]] kernel mul_mv_q8_0_f32_nt_t kernel_mul_mv_q8_0_f32_nt<5>;
+template [[host_name("kernel_mul_mv_q8_0_f32_nt6")]] kernel mul_mv_q8_0_f32_nt_t kernel_mul_mv_q8_0_f32_nt<6>;
+template [[host_name("kernel_mul_mv_q8_0_f32_nt7")]] kernel mul_mv_q8_0_f32_nt_t kernel_mul_mv_q8_0_f32_nt<7>;
+template [[host_name("kernel_mul_mv_q8_0_f32_nt8")]] kernel mul_mv_q8_0_f32_nt_t kernel_mul_mv_q8_0_f32_nt<8>;
+
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
 // K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked
 // poll-gate flag published by the last-arriving threadgroup (see

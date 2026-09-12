@@ -19308,6 +19308,36 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             return 1;
         }
 
+        /* 2..8 tokens of Q8_0 take the one-token kernel's walk over every token at once;
+         * the mul_mv_ext family below streams these shapes at ~300 GB/s */
+        static int nt_off = -1;
+        if (nt_off < 0) nt_off = getenv("DS4_METAL_Q8_MV_EXT") != NULL;
+        if (n_tok >= 2u && n_tok <= 8u && !nt_off) {
+            char fn[40];
+            snprintf(fn, sizeof(fn), "kernel_mul_mv_q8_0_f32_nt%u", (unsigned)n_tok);
+            ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+            ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+            if (out_dim > 65536u) mv_dispatch.nsg = 8;
+            mv_args.nr0 = mv_dispatch.nr0;
+            id<MTLComputePipelineState> pipeline =
+                ds4_gpu_get_mul_mv_pipeline(fn, mv_dispatch.nsg);
+            if (pipeline) {
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:pipeline];
+                [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+                [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+                [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+                [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+                [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+                                                          (NSUInteger)mv_dispatch.nr0, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+                if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 multi-token matvec")) return 0;
+                return 1;
+            }
+        }
+
         const uint64_t mv_ext_max_tokens =
             ds4_gpu_env_u64("DS4_METAL_Q8_MV_EXT_MAX_TOKENS", 16u, 2u, 128u);
         if (n_tok <= mv_ext_max_tokens && (in_dim % 128u) == 0) {
@@ -47477,7 +47507,7 @@ int ds4_gpu_dsv41_sparse_attn(uint32_t s_len,
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (s_len == 0 || n_head == 0 || topk == 0 || n_idx_win > topk ||
         (idx_cmp == NULL && n_idx_win != topk) ||
-        head_dim == 0 || (head_dim % 32u) != 0u || head_dim > 512u ||
+        (head_dim != 64u && head_dim != 128u && head_dim != 256u && head_dim != 512u) ||
         !glm53_gpu_tensor_has(q, (uint64_t)s_len * n_head * head_dim, sizeof(float)) ||
         !glm53_gpu_tensor_has(sink, n_head, sizeof(float)) ||
         (n_idx_win && !glm53_gpu_tensor_has(idxs, (uint64_t)s_len * n_idx_win, sizeof(int32_t))) ||
@@ -47490,8 +47520,9 @@ int ds4_gpu_dsv41_sparse_attn(uint32_t s_len,
     }
 
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_pipeline("kernel_dsv41_sparse_attn");
+        char fn[40];
+        snprintf(fn, sizeof(fn), "kernel_dsv41_sparse_attn_d%u", head_dim);
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(fn);
         if (!pipeline) return 0;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);

@@ -67359,7 +67359,11 @@ static bool dsv41_gpu_draft_propose(const ds4_model *m, const ds4_weights *w, ds
     }
     dsv41_gpu_buf b_st = {0}, b_mix = {0}, b_x = {0}, b_xn = {0}, b_lg = {0}, b_conf = {0}, b_parts = {0};
     ds4_gpu_tensor *t_tok = ds4_gpu_tensor_alloc(((uint64_t)B + 1u) * sizeof(int32_t));
-    const uint32_t n_parts = 256u;
+    const uint32_t n_parts = 1024u;
+    static int trace = -1;
+    if (trace < 0) trace = getenv("DS4_DSV41_TRACE") != NULL;
+    const double tr0 = trace ? now_sec() : 0.0;
+    const uint64_t al0 = trace ? ds4_gpu_tensor_alloc_count() : 0;
     const bool batched = ds4_gpu_begin_commands() != 0;
     bool ok = t_tok && ds4_gpu_tensor_write(t_tok, 0, &t0, sizeof(int32_t)) != 0 &&
               dsv41_gpu_buf_alloc(&b_st, (uint64_t)B * hc_dim) && dsv41_gpu_buf_put(&b_st, stream, (uint64_t)B * hc_dim) &&
@@ -67380,9 +67384,15 @@ static bool dsv41_gpu_draft_propose(const ds4_model *m, const ds4_weights *w, ds
                                           last->markov_w2->abs_offset, last->markov_w2->type == DS4_TENSOR_F16,
                                           g->conf_proj, t_tok, b_conf.t, b_parts.t, n_parts) != 0;
     if (batched) (void)ds4_gpu_end_commands();
+    const double tr1 = trace ? now_sec() : 0.0;
     ok = ok && ds4_gpu_tensor_read(t_tok, sizeof(int32_t), tokens_out, (uint64_t)B * sizeof(int32_t)) != 0 &&
          ds4_gpu_tensor_read(b_conf.t, 0, conf_out, (uint64_t)B * sizeof(float)) != 0 &&
          (!head_logits || ds4_gpu_tensor_read(b_lg.t, 0, head_logits, (uint64_t)B * vocab * sizeof(float)) != 0);
+    if (trace) {
+        fprintf(stderr, "ds4: V4.1 propose encode %.1f ms wait %.1f ms allocs %llu\n",
+                (tr1 - tr0) * 1000.0, (now_sec() - tr1) * 1000.0,
+                (unsigned long long)(ds4_gpu_tensor_alloc_count() - al0));
+    }
     ds4_gpu_tensor_free(t_tok);
     ds4_gpu_tensor_free(b_st.t); ds4_gpu_tensor_free(b_mix.t); ds4_gpu_tensor_free(b_x.t);
     ds4_gpu_tensor_free(b_xn.t); ds4_gpu_tensor_free(b_lg.t); ds4_gpu_tensor_free(b_conf.t);
