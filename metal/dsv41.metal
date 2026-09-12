@@ -638,6 +638,7 @@ struct dsv41_compact_args {
     uint k;
     uint offset;
     uint reach;     // positions >= this are unreachable and emit -1
+    uint width;     // the whole output row: everything past the picks is -1
 };
 
 kernel void kernel_dsv41_compact(
@@ -676,9 +677,10 @@ kernel void kernel_dsv41_compact(
         if (!keep[j]) continue;
         out[w++] = j < args.reach ? (int)(j + args.offset) : -1;
     }
-    // anything the selection could not fill
-    const uint total = counts[ntg];
-    for (uint i = total + tpitg; i < args.k; i += ntg) out[i] = -1;
+    // anything the selection could not fill, out to the end of the row: a reader that
+    // takes every row at the same width must find -1 past this query's picks
+    const uint filled = min(counts[ntg], args.k);
+    for (uint i = filled + tpitg; i < args.width; i += ntg) out[i] = -1;
 }
 
 // Single-Pass mHC: one projection of the flattened, normalised residual stream, split

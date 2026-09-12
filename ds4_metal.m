@@ -46270,6 +46270,7 @@ typedef struct {
     uint32_t k;
     uint32_t offset;
     uint32_t reach;
+    uint32_t width;
 } dsv41_gpu_compact_args;
 
 int ds4_gpu_dsv41_block_max(uint32_t width,
@@ -46496,7 +46497,12 @@ int ds4_gpu_dsv41_topk_select_scratch(uint32_t n,
                 threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
         }
 
-        dsv41_gpu_compact_args ca = { .n = n, .k = k, .offset = offset, .reach = reach };
+        /* the row is padded to the whole of `out`, so a caller handing in a wider row
+         * than k gets -1 beyond the picks rather than whatever was there */
+        dsv41_gpu_compact_args ca = {
+            .n = n, .k = k, .offset = offset, .reach = reach,
+            .width = (uint32_t)(ds4_gpu_tensor_obj(out).bytes / sizeof(int32_t)),
+        };
         [enc setComputePipelineState:compact];
         [enc setBytes:&ca length:sizeof(ca) atIndex:0];
         [enc setBuffer:ds4_gpu_tensor_buffer(keep) offset:ds4_gpu_tensor_offset(keep) atIndex:1];

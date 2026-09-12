@@ -66570,47 +66570,52 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
                                               (uint64_t)n_tok * win * sizeof(int32_t)) != 0;
     if (!ok) goto done;
 
-    /* --- the causal half, token by token: each position scores and attends over its own
-     * reach.  Rows of the batched tensors are addressed through views, not copies. */
+    /* Tokens with no compressed reach yet (before the first group completes) get no
+     * selection, and the chunk-wide attention below reads every query's picks row at the
+     * same width, so theirs have to read as empty.  Only a sequence's first chunk has one. */
+    if (index_here && gpu_sel && pos0 < ratio) {
+        const size_t bytes = (size_t)n_tok * DS4_N_INDEXER_TOP_K * sizeof(int32_t);
+        int32_t *none = xmalloc(bytes);
+        memset(none, 0xff, bytes);
+        ok = ds4_gpu_tensor_write(win_gpu->picks[il], 0, none, bytes) != 0;
+        free(none);
+        if (!ok) goto done;
+    }
+
+    /* --- the indexer, token by token: each position scores its own reach of the
+     * compressed cache and selects.  With a resident window the attention waits for the
+     * whole chunk below; the harness and the host-select switch gather and attend per
+     * token.  Rows of the batched tensors are addressed through views, not copies. */
     for (uint32_t t = 0; t < n_tok && ok; t++) {
     const uint32_t pos = pos0 + t;
-    dsv41_gpu_buf b_q = { ds4_gpu_tensor_view(b_q_all.t,
-            (uint64_t)t * nh * hd * sizeof(float), (uint64_t)nh * hd * sizeof(float)), 0 };
-    dsv41_gpu_buf b_x = { ds4_gpu_tensor_view(b_x_all.t,
-            (uint64_t)t * dim * sizeof(float), (uint64_t)dim * sizeof(float)), 0 };
-    dsv41_gpu_buf b_qr = { ds4_gpu_tensor_view(b_qr_all.t,
-            (uint64_t)t * lq * sizeof(float), (uint64_t)lq * sizeof(float)), 0 };
-    dsv41_gpu_buf b_iq = {0}, b_wts = {0};
-    ds4_gpu_tensor *v_widx = ds4_gpu_tensor_view(t_widx, (uint64_t)t * win * sizeof(int32_t),
-                                                 (uint64_t)win * sizeof(int32_t));
-    ds4_gpu_tensor *v_pick = NULL;
-    ok = b_q.t && b_x.t && b_qr.t && v_widx;
+    uint32_t clen = 0;
+    if (ratio != 0) clen = st->n_comp[src] < (pos + 1u) / ratio
+                         ? st->n_comp[src] : (pos + 1u) / ratio;
 
     float *ring = st->window_kv + (size_t)il * win * hd;
-    if (ok && !ring_t) {
+    if (!ring_t) {
         /* no resident window: the host ring is the cache, so this row goes back to it */
         dsv41_gpu_buf b_kv = { ds4_gpu_tensor_view(b_kv_all.t,
                 (uint64_t)t * hd * sizeof(float), (uint64_t)hd * sizeof(float)), 0 };
         ok = b_kv.t && dsv41_gpu_buf_get(&b_kv, ring + (size_t)(pos % win) * hd, hd);
         ds4_gpu_tensor_free(b_kv.t);
+        if (!ok) break;
     }
 
-    uint32_t clen = 0;
-    if (ratio != 0) clen = st->n_comp[src] < (pos + 1u) / ratio
-                         ? st->n_comp[src] : (pos + 1u) / ratio;
-
-    /* --- indexer: an index-source layer scores every published compressed position and
-     * selects; the layers between reuse what their source published.  The scoring is the
+    /* an index-source layer scores every published compressed position and selects; the
+     * layers between reuse what their source published.  The scoring is the
      * O(clen * heads * dim) part; the selection is O(clen) and is shared with the CPU
      * reference so both produce the identical tie order. */
-    if (ok && index_here && clen > 0) {
+    if (index_here && clen > 0) {
         const uint32_t topk_i = DS4_N_INDEXER_TOP_K < clen ? DS4_N_INDEXER_TOP_K : clen;
         float *scores = gpu_sel ? NULL : xmalloc((size_t)clen * sizeof(float));
-        b_iq.t = ds4_gpu_tensor_view(b_iq_all.t, (uint64_t)t * ih * idim * sizeof(float),
-                                     (uint64_t)ih * idim * sizeof(float));
-        b_wts.t = ds4_gpu_tensor_view(b_wts_all.t, (uint64_t)t * ih * sizeof(float),
-                                      (uint64_t)ih * sizeof(float));
-        ok = b_iq.t != NULL && b_wts.t != NULL;
+        dsv41_gpu_buf b_x = { ds4_gpu_tensor_view(b_x_all.t,
+                (uint64_t)t * dim * sizeof(float), (uint64_t)dim * sizeof(float)), 0 };
+        dsv41_gpu_buf b_iq = { ds4_gpu_tensor_view(b_iq_all.t,
+                (uint64_t)t * ih * idim * sizeof(float), (uint64_t)ih * idim * sizeof(float)), 0 };
+        dsv41_gpu_buf b_wts = { ds4_gpu_tensor_view(b_wts_all.t,
+                (uint64_t)t * ih * sizeof(float), (uint64_t)ih * sizeof(float)), 0 };
+        ok = b_x.t && b_iq.t && b_wts.t;
         if (win_gpu) {
             b_sc = win_gpu->sc;
             b_ikall.t = win_gpu->ikey[src];     /* already on the device, nothing to copy */
@@ -66641,6 +66646,7 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
             } else if (g_ds4_candidate_source_layer < il) {
                 ok = ok && ds4_gpu_dsv41_block_mask(clen, blk, win_gpu->bkeep, b_sc.t) != 0;
             }
+            /* the row is index_topk wide and is padded to that width with -1 */
             ds4_gpu_tensor *v_own = ds4_gpu_tensor_view(win_gpu->picks[il],
                     (uint64_t)t * DS4_N_INDEXER_TOP_K * sizeof(int32_t),
                     (uint64_t)DS4_N_INDEXER_TOP_K * sizeof(int32_t));
@@ -66661,72 +66667,68 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
             }
         }
         free(scores);
+        ds4_gpu_tensor_free(b_x.t); ds4_gpu_tensor_free(b_iq.t); ds4_gpu_tensor_free(b_wts.t);
         if (!win_gpu) {
             ds4_gpu_tensor_free(b_sc.t); b_sc.t = NULL;
             ds4_gpu_tensor_free(b_ikall.t); b_ikall.t = NULL;
         }
+        if (!ok) break;
     }
 
-    /* within a chunk every position has its own selection and its own count, so neither
-     * can come from the layer-wide scalar a single-token path could use */
+    if (gpu_sel) continue;
+
+    /* the harness and the host-select switch gather one list per query and attend now */
     uint32_t k_comp = 0;
-    if (ok && ratio != 0 && clen > 0) {
-        k_comp = gpu_sel ? (DS4_N_INDEXER_TOP_K < clen ? DS4_N_INDEXER_TOP_K : clen)
-                         : st->topk[isrc];
-    }
+    if (ratio != 0 && clen > 0) k_comp = st->topk[isrc];
     const uint32_t topk = win + k_comp;
     const uint32_t n_kv = win + clen;
-    /* the two caches are read where they live; gathering them cost a 256 KB blit per
-     * block plus another for the compressed half, and every blit ends the encoder */
+    int32_t *idxs = xmalloc((size_t)topk * sizeof(int32_t));
+    memcpy(idxs, widx + (size_t)t * win, win * sizeof(int32_t));
+    if (k_comp) {
+        memcpy(idxs + win, st->topk_idxs + (size_t)isrc * DS4_N_INDEXER_TOP_K,
+               k_comp * sizeof(int32_t));
+    }
     ds4_gpu_tensor *kv_win = ring_t;
     ds4_gpu_tensor *kv_cmp = (win_gpu && clen) ? win_gpu->ckv[src] : NULL;
-    ds4_gpu_tensor *idx0 = v_widx;
-    uint32_t n_idx_win = win;
-    if (ok && gpu_sel) {
-        /* the picks are read out of the source layer's own buffer */
-        if (k_comp) {
-            v_pick = ds4_gpu_tensor_view(win_gpu->picks[isrc],
-                    (uint64_t)t * DS4_N_INDEXER_TOP_K * sizeof(int32_t),
-                    (uint64_t)k_comp * sizeof(int32_t));
-            ok = v_pick != NULL;
+    if (!win_gpu) {
+        ok = dsv41_gpu_buf_alloc(&b_join, (uint64_t)n_kv * hd);
+        ok = ok && dsv41_gpu_buf_put(&b_join, ring, (uint64_t)win * hd);
+        if (ok && clen) {
+            ok = ds4_gpu_tensor_write(b_join.t, (uint64_t)win * hd * sizeof(float),
+                                      st->compress_kv + (size_t)src * st->max_pos * hd,
+                                      (uint64_t)clen * hd * sizeof(float)) != 0;
         }
-    } else if (ok) {
-        /* the harness and the host-select switch gather one list per query */
-        int32_t *idxs = xmalloc((size_t)topk * sizeof(int32_t));
-        memcpy(idxs, widx + (size_t)t * win, win * sizeof(int32_t));
-        if (k_comp) {
-            memcpy(idxs + win, st->topk_idxs + (size_t)isrc * DS4_N_INDEXER_TOP_K,
-                   k_comp * sizeof(int32_t));
-        }
-        if (!win_gpu) {
-            ok = dsv41_gpu_buf_alloc(&b_join, (uint64_t)n_kv * hd);
-            ok = ok && dsv41_gpu_buf_put(&b_join, ring, (uint64_t)win * hd);
-            if (ok && clen) {
-                ok = ds4_gpu_tensor_write(b_join.t, (uint64_t)win * hd * sizeof(float),
-                                          st->compress_kv + (size_t)src * st->max_pos * hd,
-                                          (uint64_t)clen * hd * sizeof(float)) != 0;
-            }
-            kv_win = b_join.t;
-            kv_cmp = NULL;      /* one contiguous array, so every id addresses it */
-        }
-        t_idx = ds4_gpu_tensor_alloc((uint64_t)topk * sizeof(int32_t));
-        ok = ok && t_idx != NULL &&
-             ds4_gpu_tensor_write(t_idx, 0, idxs, (uint64_t)topk * sizeof(int32_t)) != 0;
-        free(idxs);
-        idx0 = t_idx;
-        n_idx_win = topk;
+        kv_win = b_join.t;
+        kv_cmp = NULL;      /* one contiguous array, so every id addresses it */
     }
+    dsv41_gpu_buf b_q = { ds4_gpu_tensor_view(b_q_all.t,
+            (uint64_t)t * nh * hd * sizeof(float), (uint64_t)nh * hd * sizeof(float)), 0 };
+    t_idx = ds4_gpu_tensor_alloc((uint64_t)topk * sizeof(int32_t));
+    ok = ok && b_q.t && t_idx != NULL &&
+         ds4_gpu_tensor_write(t_idx, 0, idxs, (uint64_t)topk * sizeof(int32_t)) != 0;
+    free(idxs);
     ok = ok && ds4_gpu_dsv41_sparse_attn(1, nh, hd, topk, win_gpu ? rslots : n_kv,
                                          1.0f / sqrtf((float)hd),
-                                         b_q.t, kv_win, kv_cmp, k->sink, idx0, n_idx_win,
-                                         v_pick, b_q.t) != 0;
-    ds4_gpu_tensor_free(b_q.t); ds4_gpu_tensor_free(b_x.t); ds4_gpu_tensor_free(b_qr.t);
-    ds4_gpu_tensor_free(b_iq.t); ds4_gpu_tensor_free(b_wts.t);
-    ds4_gpu_tensor_free(v_widx); ds4_gpu_tensor_free(v_pick);
+                                         b_q.t, kv_win, kv_cmp, k->sink, t_idx, topk, NULL,
+                                         b_q.t) != 0;
+    ds4_gpu_tensor_free(b_q.t);
     ds4_gpu_tensor_free(t_idx); t_idx = NULL;
     ds4_gpu_tensor_free(b_join.t); b_join.t = NULL;
     }
     if (!ok) goto done;
+
+    /* --- attention for the whole chunk at once.  Every position's window is already in
+     * the ring and every position's picks are in its source's rows, so a layer attends in
+     * one dispatch of heads x tokens rather than tokens dispatches of heads. */
+    if (gpu_sel) {
+        const uint32_t k_all = ratio != 0 ? DS4_N_INDEXER_TOP_K : 0u;
+        ok = ds4_gpu_dsv41_sparse_attn(n_tok, nh, hd, win + k_all, rslots,
+                                       1.0f / sqrtf((float)hd), b_q_all.t, ring_t,
+                                       k_all ? win_gpu->ckv[src] : NULL, k->sink,
+                                       t_widx, win, k_all ? win_gpu->picks[isrc] : NULL,
+                                       b_q_all.t) != 0;
+        if (!ok) goto done;
+    }
 
     /* the queries' rotation comes back off before the grouped projection */
     ok = ok && ds4_gpu_dsv41_rope(n_tok, nh, hd, rd, pos0, 1, b_q_all.t, cos_t, sin_t);
