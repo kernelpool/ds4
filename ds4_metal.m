@@ -47093,7 +47093,7 @@ int ds4_gpu_dsv41_index_score(uint32_t n_index_head,
         [enc setBuffer:(positions ? ds4_gpu_tensor_buffer(positions)
                                   : ds4_gpu_tensor_buffer(scores))
                 offset:(positions ? ds4_gpu_tensor_offset(positions) : 0) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake((n_scan + nsg - 1u) / nsg, 1, 1)
+        [enc dispatchThreadgroups:MTLSizeMake((n_scan + 4u * nsg - 1u) / (4u * nsg), 1, 1)
             threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 indexer");
@@ -47140,7 +47140,7 @@ int ds4_gpu_dsv41_index_score_rows(uint32_t rows,
         [enc setBuffer:ds4_gpu_tensor_buffer(weights) offset:ds4_gpu_tensor_offset(weights) atIndex:3];
         [enc setBuffer:ds4_gpu_tensor_buffer(scores) offset:ds4_gpu_tensor_offset(scores) atIndex:4];
         [enc setBuffer:ds4_gpu_tensor_buffer(scores) offset:0 atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake((n_scan + nsg - 1u) / nsg, rows, 1)
+        [enc dispatchThreadgroups:MTLSizeMake((n_scan + 4u * nsg - 1u) / (4u * nsg), rows, 1)
             threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 chunk indexer");
@@ -47201,12 +47201,13 @@ int ds4_gpu_dsv41_select_rows(uint32_t rows,
     };
     if (rows == 0 || ratio == 0 || k_max == 0 || (blocks && block == 0)) return 0;
     const uint32_t n_max = dsv41_gpu_row_n(&a, rows - 1u);
-    const int radix = n_max > DS4_GPU_DSV41_RANK_SELECT_MAX || dsv41_gpu_force_radix();
+    /* the O(n^2) rank pass loses to the radix passes from about 12k candidates */
+    const int radix = n_max > 12288u || dsv41_gpu_force_radix();
     if (stride < n_max || (n_max && !scores) ||
         (n_max && !glm53_gpu_tensor_has(scores, (uint64_t)(rows - 1u) * stride + n_max, sizeof(float))) ||
         (n_max && !glm53_gpu_tensor_has(keep, (uint64_t)(rows - 1u) * stride + n_max, sizeof(int32_t))) ||
         (out && (width == 0 || !glm53_gpu_tensor_has(out, (uint64_t)rows * width, sizeof(int32_t)))) ||
-        (radix && n_max && (!glm53_gpu_tensor_has(state, (uint64_t)rows * 5u, sizeof(uint32_t)) ||
+        (radix && n_max && (!glm53_gpu_tensor_has(state, (uint64_t)rows * 6u, sizeof(uint32_t)) ||
                             !glm53_gpu_tensor_has(hist, (uint64_t)rows * 256u, sizeof(uint32_t))))) {
         fprintf(stderr, "ds4: DeepSeek V4.1 chunk select received invalid buffers\n");
         return 0;
@@ -47215,7 +47216,11 @@ int ds4_gpu_dsv41_select_rows(uint32_t rows,
         id<MTLComputePipelineState> p_rank = ds4_gpu_get_pipeline("kernel_dsv41_rank_select_rows");
         id<MTLComputePipelineState> p_compact = ds4_gpu_get_pipeline("kernel_dsv41_compact_rows");
         id<MTLComputePipelineState> p_init = ds4_gpu_get_pipeline("kernel_dsv41_radix_init_rows");
-        id<MTLComputePipelineState> p_hist = ds4_gpu_get_pipeline("kernel_dsv41_radix_hist_rows");
+        /* the fused pass saves a dispatch per digit; past 64k candidates its per-threadgroup
+         * device fence costs more than that, so the separate scan takes over */
+        const bool fused = n_max <= 65536u;
+        id<MTLComputePipelineState> p_hist = ds4_gpu_get_pipeline(
+            fused ? "kernel_dsv41_radix_hist_scan_rows" : "kernel_dsv41_radix_hist_rows");
         id<MTLComputePipelineState> p_scan = ds4_gpu_get_pipeline("kernel_dsv41_radix_scan_rows");
         id<MTLComputePipelineState> p_keep = ds4_gpu_get_pipeline("kernel_dsv41_radix_keep_rows");
         if (!p_rank || !p_compact || !p_init || !p_hist || !p_scan || !p_keep) return 0;
@@ -47242,9 +47247,11 @@ int ds4_gpu_dsv41_select_rows(uint32_t rows,
                 for (uint32_t pass = 0; pass < 4u; pass++) {
                     enc = ds4_gpu_compute_encoder(cb);
                     dsv41_gpu_rows_bind(enc, &a, p_hist, scores, state, hist);
+                    if (fused) [enc setThreadgroupMemoryLength:257u * sizeof(uint32_t) atIndex:0];
                     [enc dispatchThreads:MTLSizeMake(n_max, rows, 1)
                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                     ds4_gpu_end_compute_encoder(cb, enc);
+                    if (fused) continue;
                     enc = ds4_gpu_compute_encoder(cb);
                     dsv41_gpu_rows_bind(enc, &a, p_scan, state, hist, NULL);
                     [enc dispatchThreads:MTLSizeMake(rows, 1, 1)

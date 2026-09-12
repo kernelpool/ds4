@@ -66397,7 +66397,7 @@ typedef struct {
     uint32_t nb_stride;         /* max_blocks: row stride of bscore and bkeep */
     dsv41_gpu_buf bscore;       /* [chunk][max_blocks] */
     ds4_gpu_tensor *bkeep;      /* [chunk][max_blocks] int32 */
-    ds4_gpu_tensor *rstate;     /* radix select: [chunk] x 5 u32 of refinement state */
+    ds4_gpu_tensor *rstate;     /* radix select: [chunk] x 6 u32 of refinement state */
     ds4_gpu_tensor *rhist;      /* radix select: [chunk] x 256 u32 histograms */
     /* DSpark drafting: the target layers' stream means for the rows of the last trunk
      * pass, the projected main_kv rows of those positions awaiting acceptance, and per
@@ -66494,7 +66494,7 @@ static bool dsv41_gpu_window_open(dsv41_gpu_window *g, uint32_t n_layer, uint32_
     }
     g->nb_stride = max_blocks;
     g->bkeep = ds4_gpu_tensor_alloc((uint64_t)chunk * max_blocks * sizeof(int32_t));
-    g->rstate = ds4_gpu_tensor_alloc((uint64_t)chunk * 5u * sizeof(uint32_t));
+    g->rstate = ds4_gpu_tensor_alloc((uint64_t)chunk * 6u * sizeof(uint32_t));
     g->rhist = ds4_gpu_tensor_alloc((uint64_t)chunk * 256u * sizeof(uint32_t));
     {
         const uint64_t pairs = (uint64_t)chunk * DS4_N_EXPERT_USED;

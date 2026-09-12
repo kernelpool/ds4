@@ -322,6 +322,10 @@ struct dsv41_index_score_args {
 // weights_proj output.  `positions`, when used, restricts the scan to a candidate set: a layer that reads a
 // source's candidate blocks can never pick anything outside it, so scoring the rest is
 // wasted work.  Output is COMPACTED -- scores[i] belongs to positions[i].
+// A simdgroup scores DSV41_INDEX_SCORE_P consecutive candidates at once, four
+// independent chains per lane, so the walk over index_dim waits on memory once per four.
+#define DSV41_INDEX_SCORE_P 4u
+
 kernel void kernel_dsv41_index_score(
         constant dsv41_index_score_args &args,
         device const float              *q,       // [n_index_head, index_dim]
@@ -333,27 +337,42 @@ kernel void kernel_dsv41_index_score(
         ushort lane  [[thread_index_in_simdgroup]],
         ushort sg    [[simdgroup_index_in_threadgroup]],
         ushort nsg   [[simdgroups_per_threadgroup]]) {
-    const uint i = tgpig.x * (uint)nsg + (uint)sg;
+    const uint i0 = (tgpig.x * (uint)nsg + (uint)sg) * DSV41_INDEX_SCORE_P;
     const uint t = tgpig.y;
-    if (i >= args.n_scan || t >= args.rows) return;
-    const uint j = args.use_positions ? (uint)positions[i] : i;
+    if (i0 >= args.n_scan || t >= args.rows) return;
 
     const uint idim = args.index_dim;
     q += (ulong)t * args.n_index_head * idim;
     weights += (ulong)t * args.n_index_head;
     scores += (ulong)t * args.stride;
-    device const float *k = index_k + (ulong)j * idim;
-
-    float contrib = 0.0f;
-    if ((uint)lane < args.n_index_head) {
-        device const float *qh = q + (ulong)lane * idim;
-        float dot = 0.0f;
-        for (uint e = 0; e < idim; e++) dot = fma(qh[e], k[e], dot);
-        // rectified before the head weight, which may be negative
-        contrib = dot > 0.0f ? dot * weights[lane] * args.scale : 0.0f;
+    device const float *k[DSV41_INDEX_SCORE_P];
+    for (uint p = 0; p < DSV41_INDEX_SCORE_P; p++) {
+        const uint i = min(i0 + p, args.n_scan - 1u);
+        k[p] = index_k + (ulong)(args.use_positions ? (uint)positions[i] : i) * idim;
     }
-    const float total = simd_sum(contrib);
-    if (lane == 0u) scores[i] = total;
+
+    float dot[DSV41_INDEX_SCORE_P] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const bool live = (uint)lane < args.n_index_head;
+    device const float *qh = q + (ulong)(live ? lane : 0) * idim;
+    const uint idim4 = idim / 4u;
+    for (uint e = 0; e < idim4; e++) {
+        const float4 qv = ((device const float4 *)qh)[e];
+        for (uint p = 0; p < DSV41_INDEX_SCORE_P; p++) {
+            dot[p] = fma(qv.x, k[p][4u * e], dot[p]);
+            dot[p] = fma(qv.y, k[p][4u * e + 1u], dot[p]);
+            dot[p] = fma(qv.z, k[p][4u * e + 2u], dot[p]);
+            dot[p] = fma(qv.w, k[p][4u * e + 3u], dot[p]);
+        }
+    }
+    for (uint e = idim4 * 4u; e < idim; e++) {
+        for (uint p = 0; p < DSV41_INDEX_SCORE_P; p++) dot[p] = fma(qh[e], k[p][e], dot[p]);
+    }
+    // rectified before the head weight, which may be negative
+    const float w = live ? weights[lane] * args.scale : 0.0f;
+    for (uint p = 0; p < DSV41_INDEX_SCORE_P; p++) {
+        const float total = simd_sum(live && dot[p] > 0.0f ? dot[p] * w : 0.0f);
+        if (lane == 0u && i0 + p < args.n_scan) scores[i0 + p] = total;
+    }
 }
 
 // Interleaved RoPE.  V4.1 takes ADJACENT ELEMENT PAIRS as one complex number -- not the
@@ -544,6 +563,7 @@ struct dsv41_radix_state {
     uint k_rem;     // how many are still needed from the current prefix class
     uint thresh;    // the settled score key, once the value phase is done
     uint pass;      // 0 on the first pass of a phase, so the prefix check is skipped
+    atomic_uint done;   // threadgroups of the current pass that have added their histogram
 };
 
 static inline uint dsv41_sortable(float f) {
@@ -810,6 +830,7 @@ kernel void kernel_dsv41_radix_init_rows(
         state[t].k_rem = min(a.k_max, n);
         state[t].thresh = 0u;
         state[t].pass = 0u;
+        atomic_store_explicit(&state[t].done, 0u, memory_order_relaxed);
     }
     for (uint b = tpitg.x; b < 256u; b += ntg.x) hist[(ulong)t * 256u + b] = 0u;
 }
@@ -861,6 +882,69 @@ kernel void kernel_dsv41_radix_scan_rows(
         st->shift -= 8u;
     }
     for (uint b = 0; b < 256u; b++) hist[b] = 0u;
+}
+
+// The histogram pass and its scan in one dispatch: the last threadgroup to add to a
+// row's histogram settles the digit, so a select is two modes of four dispatches.
+kernel void kernel_dsv41_radix_hist_scan_rows(
+        constant dsv41_rows_args &a,
+        device const float       *scores,
+        device dsv41_radix_state *state,
+        device atomic_uint       *hist,
+        threadgroup uint         *sh [[threadgroup(0)]],   // [257]
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        uint2 tpitg [[thread_position_in_threadgroup]],
+        uint2 ntg   [[threads_per_threadgroup]],
+        uint2 tgpg  [[threadgroups_per_grid]]) {
+    const uint t = tgpig.y;
+    if (t >= a.rows) return;
+    device dsv41_radix_state *st = state + t;
+    const uint n = dsv41_row_n(a, t);
+    const uint shift = st->shift, prefix = st->prefix, pass = st->pass, thresh = st->thresh;
+    const uint j = tgpig.x * ntg.x + tpitg.x;
+    if (j < n) {
+        const uint u = dsv41_sortable(scores[(ulong)t * a.stride + j]);
+        if (a.mode == 0u || u == thresh) {
+            const uint key = a.mode == 0u ? u : j;
+            if (pass == 0u || (key >> (shift + 8u)) == prefix) {
+                atomic_fetch_add_explicit(&hist[(ulong)t * 256u + ((key >> shift) & 255u)], 1u,
+                                          memory_order_relaxed);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tpitg.x == 0u) {
+        sh[256] = atomic_fetch_add_explicit(&st->done, 1u, memory_order_relaxed) + 1u == tgpg.x;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sh[256] == 0u) return;
+
+    // the row's last threadgroup: take the settled histogram, clear it for the next pass
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint b = tpitg.x; b < 256u; b += ntg.x) {
+        sh[b] = atomic_load_explicit(&hist[(ulong)t * 256u + b], memory_order_relaxed);
+        atomic_store_explicit(&hist[(ulong)t * 256u + b], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tpitg.x != 0u) return;
+    uint cum = 0u;
+    uint chosen = 0u;
+    for (int b = 255; b >= 0; b--) {
+        const uint c = sh[b];
+        if (cum + c >= st->k_rem) { chosen = (uint)b; break; }
+        cum += c;
+    }
+    st->prefix = pass == 0u ? chosen : ((prefix << 8u) | chosen);
+    st->k_rem -= cum;
+    st->pass = pass + 1u;
+    if (shift == 0u) {
+        if (a.mode == 0u) st->thresh = st->prefix;
+        st->shift = 24u;
+        st->pass = 0u;
+    } else {
+        st->shift = shift - 8u;
+    }
+    atomic_store_explicit(&st->done, 0u, memory_order_relaxed);
 }
 
 kernel void kernel_dsv41_radix_keep_rows(

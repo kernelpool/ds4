@@ -1720,7 +1720,7 @@ static int run_radix(const char *label, uint32_t n, uint32_t k, float tie_frac) 
     ds4_gpu_tensor *t_sc = ds4_gpu_tensor_alloc((uint64_t)n * sizeof(float));
     ds4_gpu_tensor *t_keep = ds4_gpu_tensor_alloc((uint64_t)n * sizeof(int32_t));
     ds4_gpu_tensor *t_out = ds4_gpu_tensor_alloc((uint64_t)k * sizeof(int32_t));
-    ds4_gpu_tensor *t_state = ds4_gpu_tensor_alloc(5 * sizeof(uint32_t));
+    ds4_gpu_tensor *t_state = ds4_gpu_tensor_alloc(6 * sizeof(uint32_t));
     ds4_gpu_tensor *t_hist = ds4_gpu_tensor_alloc(256 * sizeof(uint32_t));
     int ok = t_sc && t_keep && t_out && t_state && t_hist;
     ok = ok && ds4_gpu_tensor_write(t_sc, 0, sc, (uint64_t)n * sizeof(float));
@@ -1782,6 +1782,57 @@ static int run_radix(const char *label, uint32_t n, uint32_t k, float tie_frac) 
            "(n=%u k=%u ties~%.0f%%)\n",
            label, "radix select", pass ? "ok  " : "FAIL", kept, k, bad, bad_batch, ms, n, k,
            100.0 * tie_frac);
+    ds4_gpu_tensor_free(t_sc); ds4_gpu_tensor_free(t_keep); ds4_gpu_tensor_free(t_out);
+    ds4_gpu_tensor_free(t_state); ds4_gpu_tensor_free(t_hist);
+    free(sc); free(keep_r); free(keep_g);
+    return !pass;
+}
+
+/* The rows entry's radix passes (the engine's path) against the same repeated-argmax
+ * reference, over rows of different reach sharing one score array. */
+static int run_radix_rows(const char *label, uint32_t n, uint32_t k, float tie_frac, uint32_t rows) {
+    float *sc = malloc((size_t)n * sizeof(float));
+    int32_t *keep_r = malloc((size_t)n * sizeof(int32_t));
+    int32_t *keep_g = malloc((size_t)rows * n * sizeof(int32_t));
+    for (uint32_t i = 0; i < n; i++) {
+        sc[i] = ((float)((i * 2654435761u) % 1000u) / 1000.0f) < tie_frac ? 0.0f : rnd();
+    }
+    ds4_gpu_tensor *t_sc = ds4_gpu_tensor_alloc((uint64_t)rows * n * sizeof(float));
+    ds4_gpu_tensor *t_keep = ds4_gpu_tensor_alloc((uint64_t)rows * n * sizeof(int32_t));
+    ds4_gpu_tensor *t_out = ds4_gpu_tensor_alloc((uint64_t)rows * k * sizeof(int32_t));
+    ds4_gpu_tensor *t_state = ds4_gpu_tensor_alloc((uint64_t)rows * 6u * sizeof(uint32_t));
+    ds4_gpu_tensor *t_hist = ds4_gpu_tensor_alloc((uint64_t)rows * 256u * sizeof(uint32_t));
+    int ok = sc && keep_r && keep_g && t_sc && t_keep && t_out && t_state && t_hist;
+    for (uint32_t r = 0; ok && r < rows; r++) {
+        ok = ds4_gpu_tensor_write(t_sc, (uint64_t)r * n * sizeof(float), sc, (uint64_t)n * sizeof(float));
+    }
+    /* row r reaches n - rows + r + 1 positions */
+    const uint32_t pos0 = n - rows;
+    setenv("DS4_DSV41_FORCE_RADIX", "1", 1);
+    const double t0 = now_ms();
+    ok = ok && ds4_gpu_dsv41_select_rows(rows, n, n, pos0, 1u, k, 0, k, 0, 0, t_sc, t_keep, t_out,
+                                         t_state, t_hist);
+    unsetenv("DS4_DSV41_FORCE_RADIX");
+    const double ms = now_ms() - t0;
+    ok = ok && ds4_gpu_tensor_read(t_keep, 0, keep_g, (uint64_t)rows * n * sizeof(int32_t));
+    uint32_t bad = 0;
+    for (uint32_t r = 0; ok && r < rows; r++) {
+        const uint32_t nr = pos0 + r + 1u;
+        for (uint32_t i = 0; i < n; i++) keep_r[i] = 0;
+        for (uint32_t s2 = 0; s2 < k; s2++) {
+            int best = -1;
+            float bv = 0.0f;
+            for (uint32_t j = 0; j < nr; j++) {
+                if (keep_r[j]) continue;
+                if (best < 0 || sc[j] >= bv) { best = (int)j; bv = sc[j]; }
+            }
+            if (best >= 0) keep_r[best] = 1;
+        }
+        for (uint32_t i = 0; i < nr; i++) if (keep_g[(size_t)r * n + i] != keep_r[i]) bad++;
+    }
+    const int pass = ok && !bad;
+    printf("  [%s] %-18s %s  %u mismatches over %u rows, %.2f ms (n=%u k=%u ties~%.0f%%)\n",
+           label, "radix select rows", pass ? "ok  " : "FAIL", bad, rows, ms, n, k, 100.0 * tie_frac);
     ds4_gpu_tensor_free(t_sc); ds4_gpu_tensor_free(t_keep); ds4_gpu_tensor_free(t_out);
     ds4_gpu_tensor_free(t_state); ds4_gpu_tensor_free(t_hist);
     free(sc); free(keep_r); free(keep_g);
@@ -1862,6 +1913,8 @@ int main(void) {
     fail |= run_radix("all-tied", 4096u, 512u, 1.0f);
     fail |= run_radix("released", 65536u, 512u, 0.20f);
     fail |= run_radix("1M-ctx", 1048576u, 512u, 0.30f);
+    fail |= run_radix_rows("rows", 20000u, 512u, 0.30f, 3u);
+    fail |= run_radix_rows("rows-64k", 65536u, 512u, 0.20f, 2u);
     /* the O(n^2) rank select must REFUSE sizes it cannot serve, not run them slowly:
      * block selection at long context (clen/8 blocks) lands here and needs a different
      * algorithm, so the guard has to be real */
