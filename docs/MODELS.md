@@ -71,6 +71,14 @@ its size. The engram sidecar is memory-mapped and read a few rows per token, so 
 has to be on fast storage. The DSpark file carries just the draft heads, since the three
 draft blocks are already in the backbone.
 
+V4.1 uses its own prompt format: the conversation opens with `<｜System｜>`, thinking
+carries a numeric reasoning budget instead of the Think Max text (`--think` 75,
+`--think-max` 100, or `--reasoning-effort N` for any value in 1..100; the server also
+accepts an integer `reasoning_effort` per request), later system messages get their own
+`<｜System｜>`, and tool calls use the spaced DSML tags `<｜DSML｜ calls>`,
+`<｜DSML｜ invoke>` and `<｜DSML｜ parameter>`. The CLI, agent and server select this
+format when a V4.1 GGUF is loaded.
+
 ```sh
 ./ds4 -m gguf/DeepSeek-V4.1-Flash-MXFP4.gguf --engram gguf/DeepSeek-V4.1-Flash-engram.gguf --ctx 32768
 ./ds4 -m gguf/DeepSeek-V4.1-Flash-MXFP4.gguf --engram gguf/DeepSeek-V4.1-Flash-engram.gguf \

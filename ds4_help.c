@@ -215,6 +215,7 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "--think", "Use normal thinking mode.");
     opt(fp, c, "--think-max", "Use Think Max when context is large enough.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
+    opt(fp, c, "--reasoning-effort N", "DeepSeek V4.1 reasoning budget 1..100 while thinking. Default: 75, 100 with --think-max.");
     if (full) {
         opt(fp, c, "-sys, --system TEXT", "System prompt. Empty string disables the default where supported.");
         opt(fp, c, "-p, --prompt TEXT", "One-shot prompt text.");
@@ -346,6 +347,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
+    opt(fp, c, "--reasoning-effort N", "Default DeepSeek V4.1 reasoning budget 1..100 for requests that give none.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");

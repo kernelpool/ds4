@@ -508,11 +508,11 @@ static void build_chat_prompt(ds4_engine *engine,
     if (ds4_engine_is_glm_dsa(engine)) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
         if (effort) ds4_chat_append_message(engine, out, "system", effort);
-    } else if (think_mode == DS4_THINK_MAX) {
-        ds4_chat_append_max_effort_prefix(engine, out);
+        if (gen->system && gen->system[0])
+            ds4_chat_append_message(engine, out, "system", gen->system);
+    } else {
+        ds4_chat_append_system_prefix(engine, out, think_mode, gen->system);
     }
-    if (gen->system && gen->system[0])
-        ds4_chat_append_message(engine, out, "system", gen->system);
     ds4_prompt_prefix_append(engine, out, &gen->prefix);
     ds4_chat_append_message(engine, out, "user", gen->prompt ? gen->prompt : "");
     ds4_chat_append_assistant_prefix(engine, out, think_mode);
@@ -1337,6 +1337,7 @@ typedef struct {
     int ctx_size;
     int think_prefix_pos;
     int think_prefix_tokens;
+    const char *system;
 } repl_chat;
 
 static void repl_chat_free(repl_chat *chat);
@@ -1402,12 +1403,13 @@ static const char *repl_glm_reasoning_effort_text(ds4_think_mode mode) {
 
 static void repl_chat_build_think_prefix(ds4_engine *engine,
                                          ds4_think_mode mode,
+                                         const char *system,
                                          ds4_tokens *prefix) {
     if (ds4_engine_is_glm_dsa(engine)) {
         const char *effort = repl_glm_reasoning_effort_text(mode);
         if (effort) ds4_chat_append_message(engine, prefix, "system", effort);
-    } else if (mode == DS4_THINK_MAX) {
-        ds4_chat_append_max_effort_prefix(engine, prefix);
+    } else {
+        ds4_chat_append_system_prefix(engine, prefix, mode, system);
     }
 }
 
@@ -1418,7 +1420,7 @@ static void repl_chat_apply_think_prefix(ds4_engine *engine,
                                          repl_chat *chat,
                                          ds4_think_mode mode) {
     ds4_tokens prefix = {0};
-    repl_chat_build_think_prefix(engine, mode, &prefix);
+    repl_chat_build_think_prefix(engine, mode, chat->system, &prefix);
 
     bool same = chat->think_prefix_tokens == prefix.len;
     if (same && prefix.len > 0) {
@@ -1458,9 +1460,10 @@ static int repl_chat_init(ds4_engine *engine, repl_chat *chat, const cli_config 
     memset(chat, 0, sizeof(*chat));
     ds4_chat_begin(engine, &chat->transcript);
     chat->think_prefix_pos = chat->transcript.len;
+    if (cfg->gen.system && cfg->gen.system[0]) chat->system = cfg->gen.system;
     repl_chat_apply_think_prefix(engine, chat, cli_effective_think_mode(&cfg->gen));
-    if (cfg->gen.system && cfg->gen.system[0]) {
-        ds4_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
+    if (chat->system && ds4_engine_is_glm_dsa(engine)) {
+        ds4_chat_append_message(engine, &chat->transcript, "system", chat->system);
     }
     ds4_prompt_prefix_append(engine, &chat->transcript, &cfg->gen.prefix);
     if (repl_chat_create_session(engine, chat, cfg->gen.ctx_size) != 0) {
@@ -2172,6 +2175,13 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.think_mode = DS4_THINK_MAX;
         } else if (!strcmp(arg, "--nothink")) {
             c.gen.think_mode = DS4_THINK_NONE;
+        } else if (!strcmp(arg, "--reasoning-effort")) {
+            int budget = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (budget > 100) {
+                fprintf(stderr, "ds4: %s must be 1..100\n", arg);
+                exit(2);
+            }
+            ds4_set_reasoning_budget(budget);
         } else if (!strcmp(arg, "--head-test")) {
             c.gen.head_test = true;
         } else if (!strcmp(arg, "--first-token-test")) {

@@ -305,6 +305,7 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
+bool ds4_engine_is_dsv41(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
 bool ds4_engine_is_qwen4(ds4_engine *e);
 /* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */
@@ -314,6 +315,11 @@ bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);
 const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode);
+/* DeepSeek V4.1 numeric reasoning effort: --reasoning-effort N (1-100) overrides
+ * the per-mode budget (low 50, high 75, max 100); 0 when thinking is off. */
+void ds4_set_reasoning_budget(int budget);
+int ds4_reasoning_budget(ds4_think_mode mode);
+void ds4_dsv41_reasoning_effort_text(int budget, char *buf, size_t cap);
 uint32_t ds4_think_max_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
 /* Uses the active model shape selected by ds4_engine_open(); call after opening
@@ -373,6 +379,10 @@ void ds4_encode_chat_prompt(
         ds4_think_mode think_mode,
         ds4_tokens *out);
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens);
+/* Think prefix plus the optional system text as one system block: DeepSeek V4.1
+ * opens it with <｜System｜> and the reasoning-effort line when thinking. */
+void ds4_chat_append_system_prefix(ds4_engine *e, ds4_tokens *tokens,
+                                   ds4_think_mode think_mode, const char *system);
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content);
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode);
 
