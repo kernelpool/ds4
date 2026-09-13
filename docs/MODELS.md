@@ -120,7 +120,7 @@ files are generated, not tracked: `tests/deepseek_v41/make_mini_model.py --snaps
 `tests/deepseek_v41/mini`, and `make_mini_gguf.py --mini tests/deepseek_v41/mini --out
 tests/deepseek_v41/mini/mini.gguf` packs the GGUF the test loads.
 
-Metal only, on one machine. Vision is not supported.
+Metal only. Vision is not supported.
 
 ## GLM 5.3 Flash
 
