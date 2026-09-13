@@ -510,6 +510,10 @@ static void build_chat_prompt(ds4_engine *engine,
         if (effort) ds4_chat_append_message(engine, out, "system", effort);
         if (gen->system && gen->system[0])
             ds4_chat_append_message(engine, out, "system", gen->system);
+    } else if (ds4_engine_is_deepseek41(engine)) {
+        ds4_chat_append_think_prefix(engine, out, think_mode);
+        if (gen->system && gen->system[0])
+            ds4_chat_append_message(engine, out, "system", gen->system);
     } else {
         ds4_chat_append_system_prefix(engine, out, think_mode, gen->system);
     }
@@ -1291,8 +1295,8 @@ static char *trim_inplace(char *s) {
 static void print_repl_help(void) {
     puts("Commands:");
     puts("  /help          Show this help.");
-    puts("  /think         Use normal thinking mode.");
-    puts("  /think-max     Use Think Max only when context is at least 393216 tokens.");
+    puts("  /think [N]     Use normal thinking, or V4.1 effort 0..100 (0 disables thinking).");
+    puts("  /think-max     Use maximum thinking (V4.1: 100; V4: requires ctx >= 393216).");
     puts("  /nothink       Disable thinking mode.");
     puts("  /ctx N         Set context size for following prompts.");
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
@@ -1338,6 +1342,7 @@ typedef struct {
     int think_prefix_pos;
     int think_prefix_tokens;
     const char *system;
+    bool initial_system_text;
 } repl_chat;
 
 static void repl_chat_free(repl_chat *chat);
@@ -1408,6 +1413,8 @@ static void repl_chat_build_think_prefix(ds4_engine *engine,
     if (ds4_engine_is_glm_dsa(engine)) {
         const char *effort = repl_glm_reasoning_effort_text(mode);
         if (effort) ds4_chat_append_message(engine, prefix, "system", effort);
+    } else if (ds4_engine_is_deepseek41(engine)) {
+        ds4_chat_append_think_prefix(engine, prefix, mode);
     } else {
         ds4_chat_append_system_prefix(engine, prefix, mode, system);
     }
@@ -1416,11 +1423,13 @@ static void repl_chat_build_think_prefix(ds4_engine *engine,
 /* Insert/replace the model-family thinking prefix inside the existing
  * transcript.  It lives immediately after the BOS sequence and before any
  * user/system text, matching the GGUF chat templates. */
-static void repl_chat_apply_think_prefix(ds4_engine *engine,
+static bool repl_chat_apply_think_prefix(ds4_engine *engine,
                                          repl_chat *chat,
                                          ds4_think_mode mode) {
     ds4_tokens prefix = {0};
     repl_chat_build_think_prefix(engine, mode, chat->system, &prefix);
+    if (ds4_engine_is_deepseek41(engine) && chat->initial_system_text && !prefix.len)
+        ds4_chat_append_message(engine, &prefix, "system", "");
 
     bool same = chat->think_prefix_tokens == prefix.len;
     if (same && prefix.len > 0) {
@@ -1430,11 +1439,16 @@ static void repl_chat_apply_think_prefix(ds4_engine *engine,
     }
     if (!same) {
         const int old_prefix_tokens = chat->think_prefix_tokens;
+        const int shift = prefix.len - old_prefix_tokens;
+        if (chat->ctx_size > 0 && (int64_t)chat->transcript.len + shift >= chat->ctx_size) {
+            fprintf(stderr, "ds4: no context room to change the thinking prefix\n");
+            ds4_tokens_free(&prefix);
+            return false;
+        }
         tokens_remove(&chat->transcript, chat->think_prefix_pos,
                       chat->think_prefix_tokens);
         tokens_insert(&chat->transcript, chat->think_prefix_pos, &prefix);
         chat->think_prefix_tokens = prefix.len;
-        const int shift = prefix.len - old_prefix_tokens;
         for (size_t i = 0; i < chat->image_count; i++) {
             chat->images[i].token_start =
                 (uint32_t)((int64_t)chat->images[i].token_start + shift);
@@ -1442,6 +1456,7 @@ static void repl_chat_apply_think_prefix(ds4_engine *engine,
         if (chat->session) ds4_session_invalidate(chat->session);
     }
     ds4_tokens_free(&prefix);
+    return true;
 }
 
 static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx_size) {
@@ -1458,6 +1473,7 @@ static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx
 
 static int repl_chat_init(ds4_engine *engine, repl_chat *chat, const cli_config *cfg) {
     memset(chat, 0, sizeof(*chat));
+    chat->initial_system_text = cfg->gen.system && cfg->gen.system[0];
     ds4_chat_begin(engine, &chat->transcript);
     chat->think_prefix_pos = chat->transcript.len;
     if (cfg->gen.system && cfg->gen.system[0]) chat->system = cfg->gen.system;
@@ -1535,7 +1551,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
 
     ds4_think_mode think_mode = ds4_think_mode_for_context(cfg->gen.think_mode,
                                                            chat->ctx_size);
-    repl_chat_apply_think_prefix(engine, chat, think_mode);
+    if (!repl_chat_apply_think_prefix(engine, chat, think_mode)) return 1;
     const int rollback_len = chat->transcript.len;
     const size_t rollback_images = chat->image_count;
     if (image) {
@@ -1765,22 +1781,31 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
 
         if (!strcmp(cmd, "/help")) {
             print_repl_help();
-        } else if (!strcmp(cmd, "/think")) {
-            cfg->gen.think_mode = DS4_THINK_HIGH;
-            repl_chat_apply_think_prefix(engine, &chat, DS4_THINK_HIGH);
-            puts("Thinking mode: high.");
+        } else if (!strncmp(cmd, "/think", 6) &&
+                   (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
+            const char *arg = trim_inplace(cmd + 6);
+            ds4_think_mode mode = DS4_THINK_HIGH;
+            if (arg[0] && (!ds4_engine_is_deepseek41(engine) ||
+                           !ds4_think_mode_parse_level(arg, &mode))) {
+                fprintf(stderr, "ds4: /think N requires V4.1 and a level from 0 to 100\n");
+            } else if (repl_chat_apply_think_prefix(engine, &chat, mode)) {
+                cfg->gen.think_mode = mode;
+                printf("Thinking mode: %s.\n", ds4_think_mode_name(mode));
+            }
         } else if (!strcmp(cmd, "/think-max")) {
-            cfg->gen.think_mode = DS4_THINK_MAX;
-            bool active = ds4_think_mode_for_context(cfg->gen.think_mode,
+            bool active = ds4_think_mode_for_context(DS4_THINK_MAX,
                                                      chat.ctx_size) == DS4_THINK_MAX;
-            repl_chat_apply_think_prefix(engine, &chat,
-                                         active ? DS4_THINK_MAX : DS4_THINK_HIGH);
-            cli_warn_think_max_downgraded(&cfg->gen, "/think-max");
-            printf("Thinking mode: %s.\n", active ? "max" : "high (ctx below 393216)");
+            if (repl_chat_apply_think_prefix(engine, &chat,
+                                              active ? DS4_THINK_MAX : DS4_THINK_HIGH)) {
+                cfg->gen.think_mode = DS4_THINK_MAX;
+                cli_warn_think_max_downgraded(&cfg->gen, "/think-max");
+                printf("Thinking mode: %s.\n", active ? "max" : "high (ctx below 393216)");
+            }
         } else if (!strcmp(cmd, "/nothink")) {
-            cfg->gen.think_mode = DS4_THINK_NONE;
-            repl_chat_apply_think_prefix(engine, &chat, DS4_THINK_NONE);
-            puts("Thinking mode: none.");
+            if (repl_chat_apply_think_prefix(engine, &chat, DS4_THINK_NONE)) {
+                cfg->gen.think_mode = DS4_THINK_NONE;
+                puts("Thinking mode: none.");
+            }
         } else if (!strncmp(cmd, "/power", 6) && (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
             char *arg = trim_inplace(cmd + 6);
             if (!arg[0]) {
@@ -2175,6 +2200,11 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--imatrix-min-expert-samples")) {
             c.gen.imatrix_min_expert_samples =
                 parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--think-level")) {
+            if (!ds4_think_mode_parse_level(need_arg(&i, argc, argv, arg), &c.gen.think_mode)) {
+                fprintf(stderr, "ds4: --think-level requires an integer from 0 to 100\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--think")) {
             c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
@@ -2303,7 +2333,8 @@ int main(int argc, char **argv) {
             rc = ds4_dump_chat_tokenization(cfg.engine.model_path,
                                             cfg.gen.system,
                                             cfg.gen.prompt,
-                                            cli_effective_think_mode(&cfg.gen),
+                                            cfg.gen.think_mode,
+                                            cfg.gen.ctx_size,
                                             stdout);
         }
         ds4_dist_options_free(cfg.dist);
@@ -2357,6 +2388,14 @@ int main(int argc, char **argv) {
         ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return 1;
+    }
+    if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 && !ds4_engine_is_deepseek41(engine)) {
+        fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 model\n");
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        ds4_prompt_prefix_free(&cfg.gen.prefix);
+        free(cfg.prompt_owned);
+        return 2;
     }
     cli_apply_model_sampling_defaults(engine, &cfg.gen);
     if (cfg.engine.tp.role == DS4_TP_WORKER) {

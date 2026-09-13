@@ -2789,7 +2789,7 @@ kernel void kernel_mul_mm(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 2048 * sizeof(S0));   // 64 x 32 of S0
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 64u*32u*sizeof(S0));
 
     constexpr int NR0 = 64;
     constexpr int NR1 = 32;
@@ -3191,7 +3191,8 @@ kernel void kernel_mul_mm_f16_f32_scaled(
 
 typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
 
-// Host-visible prefill matmul variants for F16 and Q8_0 weights.
+// Dense prefill variants, including a full-F32 router without half conversion.
+template [[host_name("kernel_mul_mm_f32_f32_full")]] kernel mul_mm_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, half4x4, 1, dequantize_f16,  half,  half4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
 // F32 staging: the same kernel with the tiles and the activations kept in float, for

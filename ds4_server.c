@@ -673,7 +673,15 @@ typedef enum {
     SERVER_MODEL_SYNTAX_DEEPSEEK_V41,
     SERVER_MODEL_SYNTAX_GLM,
     SERVER_MODEL_SYNTAX_QWEN,
+    SERVER_MODEL_SYNTAX_DEEPSEEK41,
 } server_model_syntax;
+
+#define DS41_TOOL_CALLS_START "<｜DSML｜ calls>"
+#define DS41_TOOL_CALLS_END "</｜DSML｜ calls>"
+#define DS41_INVOKE_START "<｜DSML｜ invoke"
+#define DS41_INVOKE_END "</｜DSML｜ invoke>"
+#define DS41_PARAM_START "<｜DSML｜ parameter"
+#define DS41_PARAM_END "</｜DSML｜ parameter>"
 
 static void random_tool_id(char *dst, size_t dstlen, api_style api) {
     static uint64_t fallback_ctr;
@@ -743,6 +751,11 @@ typedef struct {
 } tool_schema_orders;
 
 typedef struct {
+    size_t begin, end;
+    char *id, *content;
+} tool_result_span;
+
+typedef struct {
     char *role;
     char *content;
     server_image_inputs images;
@@ -752,6 +765,8 @@ typedef struct {
     int tool_call_ids_len;
     int tool_call_ids_cap;
     tool_calls calls;
+    tool_result_span *tool_results;
+    int tool_results_len;
 } chat_msg;
 
 typedef struct {
@@ -778,6 +793,7 @@ static void id_list_push_unique(stop_list *ids, const char *id);
 static void id_list_free(stop_list *ids);
 static bool responses_live_has_call_id(server *s, const char *id);
 static bool anthropic_live_has_call_id(server *s, const char *id);
+static stop_list live_tool_call_order(server *s, api_style api, const stop_list *ids);
 
 typedef struct {
     req_kind kind;
@@ -888,6 +904,11 @@ static void chat_msg_free(chat_msg *m) {
     for (int i = 0; i < m->tool_call_ids_len; i++) free(m->tool_call_ids[i]);
     free(m->tool_call_ids);
     tool_calls_free(&m->calls);
+    for (int i = 0; i < m->tool_results_len; i++) {
+        free(m->tool_results[i].id);
+        free(m->tool_results[i].content);
+    }
+    free(m->tool_results);
     memset(m, 0, sizeof(*m));
 }
 
@@ -1199,11 +1220,13 @@ static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
     if (ds4_engine_is_qwen4(engine)) return SERVER_MODEL_SYNTAX_QWEN;
     if (ds4_engine_is_dsv41(engine)) return SERVER_MODEL_SYNTAX_DEEPSEEK_V41;
     return ds4_engine_is_glm_dsa(engine) ?
-           SERVER_MODEL_SYNTAX_GLM : SERVER_MODEL_SYNTAX_DEEPSEEK;
+           SERVER_MODEL_SYNTAX_GLM : ds4_engine_is_deepseek41(engine) ?
+           SERVER_MODEL_SYNTAX_DEEPSEEK41 : SERVER_MODEL_SYNTAX_DEEPSEEK;
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
     if (ds4_engine_is_qwen4(engine)) return "qwen3.8-flash-next";
+    if (ds4_engine_is_deepseek41(engine)) return "deepseek-v4.1-flash";
     if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
     if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
     return ds4_engine_model_id(engine) == 1 ?
@@ -1221,6 +1244,7 @@ static bool server_model_alias_known(const char *id) {
             !strcmp(id, "qwen/qwen3.8-flash-next") ||
             !strcmp(id, "qwen/qwen3.8-flash-next-chat") ||
             !strcmp(id, "qwen/qwen3.8-flash-next-reasoner") ||
+            !strcmp(id, "deepseek-v4.1-flash") ||
             !strcmp(id, "deepseek-v4-pro") ||
             !strcmp(id, "glm-5.2") ||
             !strcmp(id, "glm-5.2-chat") ||
@@ -2274,9 +2298,18 @@ static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat
         chat_msg_add_tool_call_id(msg, id);
         buf b = {0};
         buf_puts(&b, msg->content ? msg->content : "");
+        const size_t begin = b.len;
         buf_puts(&b, "<tool_result>");
         append_tool_result_text(&b, nested.content);
         buf_puts(&b, "</tool_result>");
+        /* Preserve parsed boundaries, not just markup which ordinary user
+         * text can also contain. V4.1 orders and separates these blocks. */
+        msg->tool_results = xrealloc(msg->tool_results,
+            (size_t)(msg->tool_results_len + 1) * sizeof(msg->tool_results[0]));
+        msg->tool_results[msg->tool_results_len++] = (tool_result_span){
+            .begin = begin, .end = b.len, .id = id ? xstrdup(id) : NULL,
+            .content = nested.content};
+        nested.content = NULL;
         free(msg->content);
         msg->content = buf_take(&b);
         if (nested.images.len) {
@@ -2398,8 +2431,12 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
                     goto fail;
                 }
             } else if (!strcmp(key, "content")) {
-                free(msg.content);
-                msg.content = NULL;
+                /* Duplicate content members would leave stale block offsets
+                 * and tool IDs. Refuse an ambiguous protocol message. */
+                if (msg.content || msg.calls.len || msg.tool_results_len) {
+                    free(key);
+                    goto fail;
+                }
                 if (!parse_anthropic_content(p, &msg, true)) {
                     free(key);
                     goto fail;
@@ -3461,6 +3498,10 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
     return buf_take(&out);
 }
 
+static char *render_deepseek41_chat(const chat_msgs *msgs, int start,
+                                   const char *tool_schemas,
+                                   ds4_think_mode mode, bool live_tail);
+
 static char *render_chat_prompt_text_with_budget(server_model_syntax syntax,
                                                  const chat_msgs *msgs,
                                                  const char *tool_schemas,
@@ -3474,9 +3515,186 @@ static char *render_chat_prompt_text_with_budget(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return render_qwen_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode);
     }
+    if (syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41)
+        return render_deepseek41_chat(msgs, 0, tool_schemas, think_mode, false);
     return render_deepseek_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode,
                                             syntax == SERVER_MODEL_SYNTAX_DEEPSEEK_V41,
                                             reasoning_budget);
+}
+
+typedef struct {
+    const chat_msg *msg;
+    size_t order, position;
+} ds41_tool_result_order;
+
+/* Most views borrow the original message. Only split Anthropic blocks own
+ * strings, kept in fragments so the source history and image list stay intact. */
+static chat_msgs ds41_message_views(const chat_msgs *msgs, chat_msgs *fragments,
+                                    int *start) {
+    chat_msgs views = {0};
+    const int first = *start;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (i == first) *start = views.len;
+        if (strcmp(m->role, "user") || !m->tool_results_len) {
+            chat_msgs_push(&views, *m);
+            continue;
+        }
+        size_t begin = 0, length = strlen(m->content);
+        for (int j = 0; j <= m->tool_results_len; j++) {
+            const tool_result_span *span = j < m->tool_results_len ? &m->tool_results[j] : NULL;
+            const size_t end = span ? span->begin : length;
+            if (end > begin) {
+                chat_msg text = {.role = xstrdup("user"),
+                    .content = xstrndup(m->content + begin, end - begin)};
+                chat_msgs_push(fragments, text);
+                chat_msgs_push(&views, text);
+            }
+            if (span) {
+                chat_msg result = {.role = xstrdup("tool"),
+                    .content = xstrdup(span->content ? span->content : ""),
+                    .tool_call_id = span->id ? xstrdup(span->id) : NULL};
+                chat_msgs_push(fragments, result);
+                chat_msgs_push(&views, result);
+                begin = span->end;
+            }
+        }
+    }
+    if (!msgs || first >= msgs->len) *start = views.len;
+    return views;
+}
+
+static int ds41_compare_tool_results(const void *a, const void *b) {
+    const ds41_tool_result_order *x = a, *y = b;
+    if (x->order != y->order) return x->order < y->order ? -1 : 1;
+    return (x->position > y->position) - (x->position < y->position);
+}
+
+/* Parallel tool replies can arrive out of order. V4.1 renders them in
+ * call order within each merged user turn, leaving ordinary text in place. */
+static const chat_msg **ds41_order_messages(const chat_msgs *msgs, const stop_list *initial_order) {
+    if (!msgs || !msgs->len) return NULL;
+    const chat_msg **ordered = xmalloc((size_t)msgs->len * sizeof(*ordered));
+    ds41_tool_result_order *results = xmalloc((size_t)msgs->len * sizeof(*results));
+    rax *order = raxNew();
+    for (int i = 0; initial_order && i < initial_order->len; i++) {
+        const char *id = initial_order->v[i];
+        raxInsert(order, (unsigned char *)id, strlen(id), (void *)(uintptr_t)(i + 1), NULL);
+    }
+    for (int i = 0; i < msgs->len;) {
+        const chat_msg *m = &msgs->v[i];
+        ordered[i] = m;
+        if (!strcmp(m->role, "assistant") && m->calls.len) {
+            raxFree(order);
+            order = raxNew();
+            for (int j = 0; j < m->calls.len; j++) {
+                const char *id = m->calls.v[j].id;
+                if (id && id[0]) raxInsert(order, (unsigned char *)id, strlen(id),
+                                            (void *)(uintptr_t)(j + 1), NULL);
+            }
+        }
+        if (!role_is_user_like(m->role)) { i++; continue; }
+        const int begin = i;
+        size_t count = 0;
+        while (i < msgs->len && role_is_user_like(msgs->v[i].role)) {
+            m = ordered[i] = &msgs->v[i];
+            if (strcmp(m->role, "user")) {
+                const char *id = m->tool_call_id;
+                void *rank = id ? raxFind(order, (unsigned char *)id, strlen(id)) : raxNotFound;
+                results[count++] = (ds41_tool_result_order){.msg = m,
+                    .order = rank == raxNotFound ? 0 : (uintptr_t)rank - 1,
+                    .position = (size_t)i};
+            }
+            i++;
+        }
+        qsort(results, count, sizeof(*results), ds41_compare_tool_results);
+        size_t next = 0;
+        for (int j = begin; j < i; j++)
+            if (strcmp(msgs->v[j].role, "user")) ordered[j] = results[next++].msg;
+    }
+    raxFree(order);
+    free(results);
+    return ordered;
+}
+
+/* The same renderer owns full requests and live tool-result tails, so their
+ * separators and role transitions cannot disagree at the cache boundary. */
+static char *render_deepseek41_chat_ordered(const chat_msgs *msgs, int start,
+                                           const char *tool_schemas,
+                                           ds4_think_mode mode, bool live_tail,
+                                           const stop_list *initial_order) {
+    buf out = {0};
+    chat_msgs fragments = {0};
+    chat_msgs views = ds41_message_views(msgs, &fragments, &start);
+    msgs = &views;
+    const chat_msg **ordered = ds41_order_messages(msgs, initial_order);
+    const bool think = ds4_think_mode_enabled(mode);
+    const bool keep_reasoning = live_tail || chat_history_uses_tool_context(msgs, tool_schemas);
+    const char *effort = ds4_deepseek41_reasoning_effort_text(mode);
+    bool initial_system = false, pending = false, user_open = false;
+    int last_user = -1;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_user_like(m->role) || (i > 0 && role_is_system(m->role))) last_user = i;
+    }
+    if (live_tail) {
+        buf_puts(&out, "<｜end▁of▁sentence｜>");
+    } else {
+        buf_puts(&out, "<｜begin▁of▁sentence｜>");
+        if (effort || (tool_schemas && tool_schemas[0])) {
+            buf_puts(&out, "<｜System｜>");
+            initial_system = true;
+            if (effort) buf_puts(&out, effort);
+            if (tool_schemas && tool_schemas[0])
+                append_tools_prompt_text(&out, tool_schemas, true);
+        }
+    }
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *m = ordered[i];
+        if (role_is_system(m->role)) {
+            if (i == 0 && initial_system) {
+                if (tool_schemas && tool_schemas[0]) buf_puts(&out, "\n\n");
+            } else buf_puts(&out, "<｜System｜>");
+            buf_puts(&out, m->content ? m->content : "");
+            pending = i > 0 || live_tail;
+            user_open = false;
+        } else if (role_is_user_like(m->role)) {
+            buf_puts(&out, user_open ? "\n\n" : "<｜User｜>");
+            if (strcmp(m->role, "user")) {
+                buf_puts(&out, "<tool_result>");
+                append_tool_result_text(&out, m->content);
+                buf_puts(&out, "</tool_result>");
+            } else buf_puts(&out, m->content ? m->content : "");
+            pending = user_open = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            if (pending) {
+                buf_puts(&out, "<｜Assistant｜>");
+                if (think && (keep_reasoning || i > last_user)) {
+                    buf_puts(&out, "<think>");
+                    buf_puts(&out, m->reasoning ? m->reasoning : "");
+                }
+                buf_puts(&out, "</think>");
+            }
+            buf_puts(&out, m->content ? m->content : "");
+            append_dsml_tool_calls_text(&out, &m->calls, &dsml_tags_v41);
+            buf_puts(&out, "<｜end▁of▁sentence｜>");
+            pending = user_open = false;
+        }
+    }
+    if (pending) {
+        buf_puts(&out, "<｜Assistant｜>");
+        buf_puts(&out, think ? "<think>" : "</think>");
+    }
+    free(ordered);
+    free(views.v);
+    chat_msgs_free(&fragments);
+    return buf_take(&out);
+}
+
+static char *render_deepseek41_chat(const chat_msgs *msgs, int start,
+                                   const char *tool_schemas,
+                                   ds4_think_mode mode, bool live_tail) {
+    return render_deepseek41_chat_ordered(msgs, start, tool_schemas, mode, live_tail, NULL);
 }
 
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
@@ -3706,6 +3924,8 @@ static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_live_tool_tail(msgs, start, tool_orders, think_mode);
     }
+    if (syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41)
+        return render_deepseek41_chat(msgs, start, NULL, think_mode, true);
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return render_qwen_live_tool_tail(msgs, start, tool_orders, think_mode);
     }
@@ -3718,6 +3938,20 @@ static DS4_SERVER_MAYBE_UNUSED char *render_live_tool_tail(
         ds4_think_mode think_mode) {
     return render_live_tool_tail_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK,
                                             msgs, start, NULL, think_mode);
+}
+
+static char *render_request_live_tool_tail(server *s, const request *r,
+                                           const chat_msgs *msgs, int start,
+                                           const stop_list *ids) {
+    if (r->model_syntax != SERVER_MODEL_SYNTAX_DEEPSEEK41)
+        return render_live_tool_tail_for_syntax(r->model_syntax, msgs, start,
+                                                 &r->tool_orders, r->think_mode);
+    /* Output-only requests omit the assistant message which declares order.
+     * Copy the remembered order under its mutex, never borrow mutable IDs. */
+    stop_list order = live_tool_call_order(s, r->api, ids);
+    char *text = render_deepseek41_chat_ordered(msgs, start, NULL, r->think_mode, true, &order);
+    id_list_free(&order);
+    return text;
 }
 
 static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
@@ -3810,7 +4044,7 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
  * server state is still exactly at the remembered token frontier before using
  * it.  If another request already replaced the session, normal token/text/disk
  * prefix matching handles the request instead. */
-static void responses_prepare_live_continuation(request *r,
+static void responses_prepare_live_continuation(server *s, request *r,
                                                 const chat_msgs *msgs) {
     if (!r || r->api != API_RESPONSES || !msgs || msgs->len == 0) return;
 
@@ -3839,8 +4073,7 @@ static void responses_prepare_live_continuation(request *r,
 
     free(r->responses_live_suffix_text);
     r->responses_live_suffix_text =
-        render_live_tool_tail_for_syntax(r->model_syntax, msgs, tail_start,
-                                         &r->tool_orders, r->think_mode);
+        render_request_live_tool_tail(s, r, msgs, tail_start, &r->responses_live_call_ids);
 }
 
 static bool anthropic_msg_is_tool_result_tail(const chat_msg *m) {
@@ -3912,7 +4145,7 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
  * model sampled.  If the incoming tool_result IDs match the live sampled
  * frontier, generate_job() can skip replay matching entirely and append just
  * EOS + tool_result + next assistant prefix to the real KV. */
-static void anthropic_prepare_live_continuation(request *r,
+static void anthropic_prepare_live_continuation(server *s, request *r,
                                                 const chat_msgs *msgs) {
     if (!r || r->api != API_ANTHROPIC || !msgs || msgs->len == 0) return;
 
@@ -3934,8 +4167,7 @@ static void anthropic_prepare_live_continuation(request *r,
 
     free(r->anthropic_live_suffix_text);
     r->anthropic_live_suffix_text =
-        render_live_tool_tail_for_syntax(r->model_syntax, msgs, tail_start,
-                                         &r->tool_orders, r->think_mode);
+        render_request_live_tool_tail(s, r, msgs, tail_start, &r->anthropic_live_call_ids);
 }
 
 /* The API parsers are intentionally selective JSON parsers: they keep only
@@ -4322,6 +4554,12 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         msg.content = system;
         system = NULL;
         chat_msgs_push(&msgs, msg);
+        if (r->model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41) {
+            /* This is the API's initial system prompt, not a later system
+             * turn, which V4.1 preserves at its original history position. */
+            memmove(msgs.v + 1, msgs.v, (size_t)(msgs.len - 1) * sizeof(msgs.v[0]));
+            msgs.v[0] = msg;
+        }
     }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
@@ -4341,7 +4579,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    anthropic_prepare_live_continuation(r, &msgs);
+    anthropic_prepare_live_continuation(s, r, &msgs);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
@@ -5376,7 +5614,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    responses_prepare_live_continuation(r, &msgs);
+    responses_prepare_live_continuation(s, r, &msgs);
     r->prompt_text = render_chat_prompt_text_with_budget(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode, r->reasoning_budget);
@@ -5696,6 +5934,7 @@ static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
 static const char *find_any_tool_start(const char *s) {
     const char *best = NULL;
     const char *candidates[] = {
+        strstr(s, DS41_TOOL_CALLS_START),
         strstr(s, DS4_TOOL_CALLS_START),
         strstr(s, DS4_TOOL_CALLS_START_SHORT),
         strstr(s, DS4_TOOL_CALLS_START_V41),
@@ -5711,6 +5950,7 @@ static const char *find_any_tool_start(const char *s) {
 static const char *find_any_tool_end(const char *s) {
     const char *best = NULL;
     const char *candidates[] = {
+        strstr(s, DS41_TOOL_CALLS_END),
         strstr(s, DS4_TOOL_CALLS_END),
         strstr(s, DS4_TOOL_CALLS_END_SHORT),
         strstr(s, DS4_TOOL_CALLS_END_V41),
@@ -5749,6 +5989,7 @@ static const char *find_last_substr(const char *s, const char *needle) {
 static const char *find_tool_structural_text(const char *s, const char *needle,
                                              bool last) {
     static const char *wrappers[][2] = {
+        {DS41_PARAM_START, DS41_PARAM_END},
         {DS4_PARAM_START, DS4_PARAM_END},
         {DS4_PARAM_START_SHORT, DS4_PARAM_END_SHORT},
         {DS4_PARAM_START_V41, DS4_PARAM_END_V41},
@@ -6027,6 +6268,12 @@ static bool parse_deepseek_generated_message_ex(const char *text,
     if (!start) {
         start = strstr(tool_search, "<tool_calls>");
         style = start ? 1 : style;
+    }
+    const char *v41_start = strstr(tool_search, "\n\n" DS41_TOOL_CALLS_START);
+    if (!v41_start) v41_start = strstr(tool_search, DS41_TOOL_CALLS_START);
+    if (v41_start && (!start || v41_start < start)) {
+        start = v41_start;
+        style = 3;
     }
     if (!start) {
         split_reasoning_content(text, strlen(text), content_out, reasoning_out);
@@ -6557,11 +6804,17 @@ static bool try_repair_dsml(const char *s, size_t len, buf *out) {
 
     /* Detect style from first <tool_calls> tag */
     const char *ts, *te, *is, *ie, *ps, *pe;
-    if (strstr(scan_start, DS4_TOOL_CALLS_START)) {
+    const char *first = find_any_tool_start(scan_start);
+    if (!first) return false;
+    if (!strncmp(first, DS41_TOOL_CALLS_START, strlen(DS41_TOOL_CALLS_START))) {
+        ts = DS41_TOOL_CALLS_START; te = DS41_TOOL_CALLS_END;
+        is = DS41_INVOKE_START; ie = DS41_INVOKE_END;
+        ps = DS41_PARAM_START; pe = DS41_PARAM_END;
+    } else if (!strncmp(first, DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START))) {
         ts = DS4_TOOL_CALLS_START;  te = DS4_TOOL_CALLS_END;
         is = DS4_INVOKE_START;      ie = DS4_INVOKE_END;
         ps = DS4_PARAM_START;       pe = DS4_PARAM_END;
-    } else if (strstr(scan_start, DS4_TOOL_CALLS_START_SHORT)) {
+    } else if (!strncmp(first, DS4_TOOL_CALLS_START_SHORT, strlen(DS4_TOOL_CALLS_START_SHORT))) {
         ts = DS4_TOOL_CALLS_START_SHORT;  te = DS4_TOOL_CALLS_END_SHORT;
         is = DS4_INVOKE_START_SHORT;      ie = DS4_INVOKE_END_SHORT;
         ps = DS4_PARAM_START_SHORT;       pe = DS4_PARAM_END_SHORT;
@@ -7183,6 +7436,11 @@ typedef struct {
 
 static const dsml_syntax dsml_syntaxes[] = {
     {
+        DS41_TOOL_CALLS_START, DS41_TOOL_CALLS_END,
+        DS41_INVOKE_START, DS41_INVOKE_END,
+        DS41_PARAM_START, DS41_PARAM_END,
+    },
+    {
         DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END,
         DS4_INVOKE_START, DS4_INVOKE_END,
         DS4_PARAM_START, DS4_PARAM_END,
@@ -7639,7 +7897,14 @@ static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
     ts->active = true;
     ts->state = DSML_TOOL_BETWEEN_INVOKES;
     ts->parse_pos = pos;
-    if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START)) {
+    if (raw_full_lit(raw, raw_len, pos, DS41_TOOL_CALLS_START)) {
+        ts->parse_pos += strlen(DS41_TOOL_CALLS_START);
+        ts->tool_calls_end = DS41_TOOL_CALLS_END;
+        ts->invoke_start = DS41_INVOKE_START;
+        ts->invoke_end = DS41_INVOKE_END;
+        ts->param_start = DS41_PARAM_START;
+        ts->param_end = DS41_PARAM_END;
+    } else if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START)) {
         ts->parse_pos += strlen(DS4_TOOL_CALLS_START);
         ts->tool_calls_end = DS4_TOOL_CALLS_END;
         ts->invoke_start = DS4_INVOKE_START;
@@ -9995,7 +10260,7 @@ static bool server_encode_image(server *s, const server_image_input *input,
                                          input->encoded_len, out, err, errlen))
         return false;
     server_image_cache_put(&s->image_cache, input, out,
-                            4096, /* Both supported vision encoders emit 4096-wide rows. */
+                            (uint32_t)ds4_engine_embd_dim(s->engine),
                             SERVER_IMAGE_CACHE_BYTES);
     server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding encoded; cache=%zu bytes",
                s->image_cache.bytes);
@@ -10371,6 +10636,26 @@ static bool anthropic_live_has_call_id(server *s, const char *id) {
     return found;
 }
 
+static stop_list live_tool_call_order(server *s, api_style api, const stop_list *ids) {
+    stop_list order = {0};
+    if (!s || !ids || !ids->len || (api != API_RESPONSES && api != API_ANTHROPIC)) return order;
+    pthread_mutex_lock(&s->tool_mu);
+    for (int i = 0; i < s->slot_count; i++) {
+        const live_tool_state *live = api == API_RESPONSES ?
+            &s->slots[i].responses_live : &s->slots[i].anthropic_live;
+        if (!live->valid || live->call_ids.len != ids->len) continue;
+        bool match = true;
+        for (int j = 0; j < ids->len && match; j++)
+            match = id_list_contains(&live->call_ids, ids->v[j]);
+        if (!match) continue;
+        for (int j = 0; j < live->call_ids.len; j++)
+            id_list_push_unique(&order, live->call_ids.v[j]);
+        break;
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return order;
+}
+
 static bool responses_live_matches_request(server *s, server_slot *slot,
                                            const stop_list *ids,
                                            int live_tokens) {
@@ -10679,6 +10964,8 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
         const char *start;
         const char *end;
     } forms[] = {
+        {"\n\n" DS41_TOOL_CALLS_START, DS41_TOOL_CALLS_END},
+        {DS41_TOOL_CALLS_START, DS41_TOOL_CALLS_END},
         {"\n\n" DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END},
         {DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END},
         {"\n\n" DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT},
@@ -14635,6 +14922,8 @@ static bool send_models(server *s, int fd) {
         append_model_json(&b, s, "qwen3.8-flash-next-chat");
         buf_putc(&b, ',');
         append_model_json(&b, s, "qwen3.8-flash-next-reasoner");
+    } else if (ds4_engine_is_deepseek41(s->engine)) {
+        append_model_json(&b, s, server_model_id_from_engine(s->engine));
     } else if (ds4_engine_is_glm_dsa(s->engine)) {
         append_model_json(&b, s, "glm-5.2");
         buf_putc(&b, ',');
@@ -18795,7 +19084,7 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
     system.content = xstrdup("You are terse.");
     chat_msgs_push(&msgs, system);
 
-    anthropic_prepare_live_continuation(&r, &msgs);
+    anthropic_prepare_live_continuation(NULL, &r, &msgs);
     TEST_ASSERT(r.anthropic_live_call_ids.len == 1);
     TEST_ASSERT(!strcmp(r.anthropic_live_call_ids.v[0], "toolu_live"));
     TEST_ASSERT(r.anthropic_live_suffix_text != NULL);
@@ -18975,7 +19264,7 @@ static void test_responses_live_tail_renders_tool_outputs_only(void) {
     tool.content = xstrdup("/tmp");
     chat_msgs_push(&msgs, tool);
 
-    responses_prepare_live_continuation(&r, &msgs);
+    responses_prepare_live_continuation(NULL, &r, &msgs);
     TEST_ASSERT(r.responses_live_call_ids.len == 1);
     TEST_ASSERT(!strcmp(r.responses_live_call_ids.v[0], "call_live"));
     TEST_ASSERT(r.responses_live_suffix_text != NULL);
@@ -21460,9 +21749,198 @@ static void test_server_image_embedding_cache(void) {
     src.token_count = 1;
     server_image_cache_put(&cache, &input, &src, 2, sizeof(data));
     TEST_ASSERT(cache.bytes == 0);
+
+    /* V4.1 image rows are wider than the older 4096-dimensional encoders. */
+    float wide[2 * 5120];
+    for (size_t i = 0; i < sizeof(wide) / sizeof(*wide); i++) wide[i] = (float)i;
+    src.data = wide;
+    src.token_count = 2;
+    server_image_cache_put(&cache, &input, &src, 5120, SERVER_IMAGE_CACHE_BYTES);
+    TEST_ASSERT(cache.bytes == sizeof(wide) + input.encoded_len);
+    const bool found = server_image_cache_get(&cache, &input, &out);
+    TEST_ASSERT(found);
+    if (found) {
+        TEST_ASSERT(out.token_count == 2 && !memcmp(out.data, wide, sizeof(wide)));
+        ds4_vision_embedding_free(&out);
+    }
+    server_image_cache_clear(&cache);
+}
+
+static void test_deepseek41_server_stream(void) {
+    const char *raw = "Plan.</think>\n\n" DS41_TOOL_CALLS_START "\n"
+        DS41_INVOKE_START " name=\"write\">\n"
+        DS41_PARAM_START " name=\"content\" string=\"true\">"
+        "literal </think> &lt;/｜DSML｜ parameter> caf\xc3\xa8" DS41_PARAM_END "\n"
+        DS41_INVOKE_END "\n" DS41_TOOL_CALLS_END;
+    for (size_t split = 0; split <= strlen(raw); split++) {
+        int sv[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] < 0 || sv[1] < 0) return;
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_OPENAI;
+        r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK41;
+        r.stream = r.has_tools = true;
+        r.think_mode = DS4_THINK_HIGH;
+        openai_stream st;
+        openai_stream_start(&r, &st);
+        char *partial = xstrndup(raw, split);
+        TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_v41", &st,
+                                              partial, split, false));
+        free(partial);
+        TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_v41", &st,
+                                              raw, strlen(raw), false));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        buf arguments = {0};
+        const char *p = out;
+        while ((p = strstr(p, "\"arguments\":")) != NULL) {
+            p += strlen("\"arguments\":");
+            char *delta = NULL;
+            TEST_ASSERT(json_string(&p, &delta));
+            if (!delta) break;
+            buf_puts(&arguments, delta);
+            free(delta);
+        }
+        json_args args = {0};
+        TEST_ASSERT(arguments.ptr && json_args_parse(arguments.ptr, &args));
+        int index = json_args_find_unused(&args, "content");
+        TEST_ASSERT(index >= 0 && !strcmp(args.v[index].value,
+                    "literal </think> </｜DSML｜ parameter> caf\xc3\xa8"));
+        TEST_ASSERT(strstr(out, "\"name\":\"write\""));
+        TEST_ASSERT(!strstr(out, DS41_TOOL_CALLS_START));
+        bool complete = index >= 0 && !strcmp(args.v[index].value,
+                            "literal </think> </｜DSML｜ parameter> caf\xc3\xa8");
+        if (!complete) fprintf(stderr, "V4.1 SSE split=%zu: %s\n", split, out);
+        json_args_free(&args); buf_free(&arguments); free(out);
+        openai_stream_free(&st); request_free(&r);
+        close(sv[0]); close(sv[1]);
+        if (!complete) break;
+    }
+}
+
+static void test_deepseek41_server_tools(void) {
+    tool_calls original = {0}, parsed = {0};
+    tool_call call = {.name = xstrdup("write"),
+        .arguments = xstrdup("{\"path\":\"a.c\",\"content\":\"literal </think> </｜DSML｜ parameter> &lt;/｜DSML｜ parameter>\"}")};
+    tool_calls_push(&original, call);
+    buf raw = {0};
+    buf_puts(&raw, "Plan.</think>");
+    append_dsml_tool_calls_text(&raw, &original, &dsml_tags_v41);
+    char *content = NULL, *reasoning = NULL;
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK41,
+                raw.ptr, true, &content, &reasoning, &parsed));
+    TEST_ASSERT(parsed.len == 1 && content && !content[0]);
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "Plan."));
+    if (parsed.len == 1) {
+        json_args args = {0};
+        TEST_ASSERT(json_args_parse(parsed.v[0].arguments, &args));
+        int index = json_args_find_unused(&args, "content");
+        TEST_ASSERT(index >= 0 && !strcmp(args.v[index].value,
+            "literal </think> </｜DSML｜ parameter> &lt;/｜DSML｜ parameter>"));
+        json_args_free(&args);
+    }
+    free(content); free(reasoning);
+    tool_calls_free(&parsed); tool_calls_free(&original);
+    buf_free(&raw);
+
+    const char *json = "[{\"role\":\"user\",\"content\":\"Hi\"},"
+        "{\"role\":\"assistant\",\"content\":\"Ready\"},"
+        "{\"role\":\"tool\",\"content\":\"first\"},"
+        "{\"role\":\"tool\",\"content\":\"second\"},"
+        "{\"role\":\"system\",\"content\":\"Continue\"}]";
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&json, &msgs));
+    char *full = render_deepseek41_chat(&msgs, 0, NULL, DS4_THINK_HIGH, false);
+    char *tail = render_deepseek41_chat(&msgs, 2, NULL, DS4_THINK_HIGH, true);
+    const char *boundary = strstr(full, "<｜end▁of▁sentence｜>");
+    TEST_ASSERT(boundary && !strcmp(boundary, tail));
+    TEST_ASSERT(strstr(tail, "</tool_result>\n\n<tool_result>"));
+    TEST_ASSERT(strstr(tail, "<｜System｜>Continue<｜Assistant｜><think>"));
+    free(full); free(tail); chat_msgs_free(&msgs);
+}
+
+static void test_deepseek41_anthropic_results(void) {
+    const char *json = "[{\"role\":\"user\",\"content\":\"Inspect\"},"
+        "{\"role\":\"assistant\",\"content\":["
+        "{\"type\":\"tool_use\",\"id\":\"a\",\"name\":\"read\",\"input\":{}},"
+        "{\"type\":\"tool_use\",\"id\":\"b\",\"name\":\"read\",\"input\":{}}]},"
+        "{\"content\":["
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"b\",\"content\":\"SECOND </tool_result> &lt;\"},"
+        "{\"type\":\"text\",\"text\":\"literal <tool_result>text</tool_result>\"},"
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"a\",\"content\":\"\"}],\"role\":\"user\"},"
+        "{\"role\":\"assistant\",\"content\":\"Done\"},"
+        "{\"role\":\"user\",\"content\":\"Continue\"}]";
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&json, &msgs));
+    TEST_ASSERT(msgs.len == 5 && msgs.v[2].tool_results_len == 2);
+    if (msgs.len != 5) { chat_msgs_free(&msgs); return; }
+    char *source = xstrdup(msgs.v[2].content);
+    char *old = render_deepseek_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH, false, 0);
+    char *full = render_deepseek41_chat(&msgs, 0, NULL, DS4_THINK_HIGH, false);
+    char *tail = render_deepseek41_chat(&msgs, 2, NULL, DS4_THINK_HIGH, true);
+    const char *boundary = strstr(full, "<｜end▁of▁sentence｜>");
+    TEST_ASSERT(boundary && !strcmp(boundary, tail));
+    TEST_ASSERT(strstr(full, "<tool_result></tool_result>\n\n"
+        "literal <tool_result>text</tool_result>\n\n"
+        "<tool_result>SECOND &lt;/tool_result> &lt;</tool_result>"));
+    free(tail);
+    tail = render_deepseek41_chat(&msgs, 4, NULL, DS4_THINK_HIGH, true);
+    TEST_ASSERT(!strcmp(tail, "<｜end▁of▁sentence｜><｜User｜>Continue<｜Assistant｜><think>"));
+    TEST_ASSERT(!strcmp(source, msgs.v[2].content));
+    char *unchanged = render_deepseek_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH, false, 0);
+    TEST_ASSERT(!strcmp(old, unchanged));
+    free(source); free(old); free(full); free(tail); free(unchanged);
+    chat_msgs_free(&msgs);
+    json = "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
+           "\"tool_use_id\":\"x\",\"content\":\"old\"}],\"content\":\"new\"}]";
+    TEST_ASSERT(!parse_anthropic_messages(&json, &msgs));
+    chat_msgs_free(&msgs);
+}
+
+static void test_deepseek41_live_result_order(void) {
+    server s = {0};
+    server_slot slot;
+    test_server_bind_slot(&s, &slot);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    for (int anthropic = 0; anthropic < 2; anthropic++) {
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK41;
+        r.api = anthropic ? API_ANTHROPIC : API_RESPONSES;
+        r.think_mode = DS4_THINK_HIGH;
+        live_tool_state *live = anthropic ? &slot.anthropic_live : &slot.responses_live;
+        live->valid = true;
+        id_list_push_unique(&live->call_ids, "a");
+        id_list_push_unique(&live->call_ids, "b");
+        const char *json = anthropic ?
+            "[{\"role\":\"user\",\"content\":["
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"b\",\"content\":\"SECOND\"},"
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"a\",\"content\":\"FIRST\"}]}]" :
+            "[{\"role\":\"tool\",\"tool_call_id\":\"b\",\"content\":\"SECOND\"},"
+            "{\"role\":\"tool\",\"tool_call_id\":\"a\",\"content\":\"FIRST\"}]";
+        chat_msgs msgs = {0};
+        TEST_ASSERT(anthropic ? parse_anthropic_messages(&json, &msgs) : parse_messages(&json, &msgs));
+        if (anthropic) anthropic_prepare_live_continuation(&s, &r, &msgs);
+        else responses_prepare_live_continuation(&s, &r, &msgs);
+        const char *tail = anthropic ? r.anthropic_live_suffix_text : r.responses_live_suffix_text;
+        TEST_ASSERT(tail && !strcmp(tail,
+            "<｜end▁of▁sentence｜><｜User｜><tool_result>FIRST</tool_result>\n\n"
+            "<tool_result>SECOND</tool_result><｜Assistant｜><think>"));
+        live_tool_state_clear_locked(live);
+        /* Rendered requests own their bytes even if the slot is replaced. */
+        TEST_ASSERT(tail && strstr(tail, "FIRST</tool_result>\n\n<tool_result>SECOND"));
+        chat_msgs_free(&msgs);
+        request_free(&r);
+    }
+    pthread_mutex_destroy(&s.tool_mu);
 }
 
 static void ds4_server_unit_tests_run(void) {
+    test_deepseek41_server_stream();
+    test_deepseek41_server_tools();
+    test_deepseek41_anthropic_results();
+    test_deepseek41_live_result_order();
     test_visible_image_key();
     test_anthropic_tool_image_output();
     test_responses_tool_image_output();

@@ -9,6 +9,9 @@ a small native inference engine optimized first for
 **DeepSeek V4 Flash** (including the experimental vision model),
 and additionally **GLM 5.2 and 5.3**, **GLM 5.3 Flash**,
 **DeepSeek V4 PRO** and **DeepSeek V4.1 Flash**. The code is self-contained and
+**DeepSeek V4.1 Flash** (Metal, and text inference on CUDA),
+and additionally **GLM 5.2 and 5.3**, **GLM 5.3 Flash** and
+**DeepSeek V4 PRO**. The code is self-contained and
 deliberately narrow, not a general GGUF runner: you need to use the
 GGUF files the project produces, that are part of the project
 itself.
@@ -163,10 +166,17 @@ the [client setup guide](docs/CLIENTS.md).
 requirements. DeepSeek Vision Experimental uses a different checkpoint from
 Flash 0731; GLM 5.3 Flash adds vision to the same text model.
 
+DeepSeek V4.1 Flash text and vision run on Metal; text also runs on a DGX Spark.
+Q2 runs with SSD streaming on one 128 GB Mac or Spark, or resident across two
+Macs or two Sparks using RDMA. Q4 needs SSD streaming or a 512 GB Mac.
+Engram tables remain on disk in every mode, so use a fast
+local SSD. See the [model guide](docs/MODELS.md#deepseek-v41-flash) for downloads
+and setup.
+
 With the matching encoder passed as `--vision FILE`, use `/read image.png`
 in the CLI or `view_image` in the native agent.
 
-Speculative decoding is opt-in. GLM uses `--mtp`; Flash DSpark needs a matching
+Speculative decoding is opt-in. GLM uses `--mtp`; V4 Flash DSpark needs a matching
 support GGUF. It can improve generation, but not every workload benefits.
 Read [speculative decoding](docs/SPECULATIVE_DECODING.md) for setup and the
 difference between default opportunistic sampling and `--mtp-exact-sampling`.
@@ -175,13 +185,17 @@ difference between default opportunistic sampling and `--mtp-exact-sampling`.
 
 Thinking is enabled by default. Use `--nothink` or `/nothink` for direct
 answers, and `--think` or `/think` to enable it again.
+For V4.1, `ds4` and `ds4-agent` also accept
+`--think-level 25` or `/think 25`: 1 to 100 sets the reasoning effort, and
+0 disables thinking. `--think` selects 75, `--think-max` selects 100.
+Changing the level in a conversation rebuilds its cached prefix.
 The normal sampling defaults are temperature 1, top-p 1, and min-p 0.05;
 `--temp 0` selects greedy output.
 
-For DeepSeek, `--power N` trades throughput for lower sustained GPU load.
-The default is 100. GLM currently requires `--power 100`.
+For DeepSeek V4, `--power N` trades throughput for lower sustained GPU load.
+The default is 100. V4.1 and GLM currently require `--power 100`.
 
-DeepSeek Flash and GLM 5.3 Flash also support directional steering. Load a
+DeepSeek V4 Flash and GLM 5.3 Flash also support directional steering. Load a
 vector with `--dir-steering-file FILE`; `/steer F` adjusts its scale for
 subsequent tokens in a local CLI or agent session, without rebuilding the
 existing KV cache. See [steering documentation](dir-steering/README.md).
