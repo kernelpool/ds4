@@ -68,6 +68,16 @@ int main(int argc, char **argv) {
     const char *engram = argc > 2 ? argv[2] : NULL;
     const char *dspark = argc > 3 ? argv[3] : NULL;
     const int real = argc > 1;
+    if (!real) {
+        FILE *probe = fopen(gguf, "rb");
+        if (!probe) {
+            fprintf(stderr, "%s: the mini fixture is generated, not tracked; build it with "
+                    "tests/deepseek_v41/make_mini_model.py and make_mini_gguf.py "
+                    "(see docs/MODELS.md), or pass the released checkpoint\n", gguf);
+            return 2;
+        }
+        fclose(probe);
+    }
     const unsigned dim = real ? 5120u : 256u, hc = 4u, stream = dim * hc;
 
     const int *tokens = real ? REAL_TOKENS : MINI_TOKENS;

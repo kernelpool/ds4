@@ -113,7 +113,12 @@ candidate source instead of the candidate blocks, `DS4_DSV41_RADIX_MULTI=1` and
 `DS4_DSV41_FLUSH_LAYERS=0` disables the mid-pass command flushes. `make tests/test_dsv41_metal
 && ./tests/test_dsv41_metal` compares every V4.1 kernel with a CPU transcription, and
 `./tests/test_dsv41_layer <backbone> <engram> <dspark>` checks each layer kind and the
-drafter against the CPU reference on the released weights.
+drafter against the CPU reference on the released weights. Without arguments it runs a
+six-layer random mini model against the reference implementation's own outputs; those
+files are generated, not tracked: `tests/deepseek_v41/make_mini_model.py --snapshot DIR`
+(torch 2.4 and the checkpoint's `inference/` code) writes the weights and oracles into
+`tests/deepseek_v41/mini`, and `make_mini_gguf.py --mini tests/deepseek_v41/mini --out
+tests/deepseek_v41/mini/mini.gguf` packs the GGUF the test loads.
 
 Metal only, on one machine. Vision is not supported.
 
