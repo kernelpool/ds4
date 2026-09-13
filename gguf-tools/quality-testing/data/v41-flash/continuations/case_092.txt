@@ -1,0 +1,5 @@
+# Simple SQL Query: Count Rows Per Category
+
+```sql
+SELECT category, COUNT(*) AS row_count
+FROM

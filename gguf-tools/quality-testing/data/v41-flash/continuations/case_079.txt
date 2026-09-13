@@ -1,0 +1,4 @@
+# Checklist: Revisione Lifetime di Memoria in una PR
+
+## Ownership e Borrowing
+- [ ] Ogni

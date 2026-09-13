@@ -1,0 +1,3 @@
+# Why a Page Cache Makes a Second File Read Faster
+
+A **page cache** (also called the buffer cache or

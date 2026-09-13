@@ -1,0 +1,5 @@
+# Why RMSNorm Needs a Sum of Squares and a Scaling Pass
+
+## The Setup
+
+RMSNorm (Zhang & S

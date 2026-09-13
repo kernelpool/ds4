@@ -1,0 +1,4 @@
+# Piano breve per testare il chunking di prompt lunghi
+
+## 1. Obiettivo
+Verificare

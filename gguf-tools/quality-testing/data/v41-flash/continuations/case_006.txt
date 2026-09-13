@@ -1,0 +1,3 @@
+# Top-p Sampling vs. Temperature Zero (Greedy) Decoding
+
+These are two ends of a spectrum:

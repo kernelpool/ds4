@@ -1,0 +1,3 @@
+# Formato sicuro per salvare l'header di un checkpoint modello
+
+Un header di checkpoint contiene metadati

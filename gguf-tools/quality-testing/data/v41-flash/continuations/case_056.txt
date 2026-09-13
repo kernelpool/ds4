@@ -1,0 +1,3 @@
+# Il ruolo del router in un layer Mixture-of-Experts
+
+Il **router** (o *gating network

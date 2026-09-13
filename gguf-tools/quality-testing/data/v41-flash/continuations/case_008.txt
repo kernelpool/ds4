@@ -1,0 +1,3 @@
+# Why GPU Prefill Can Be Faster Than Single-Token Decode
+
+The counterintuitive part is that prefill

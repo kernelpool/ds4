@@ -1,0 +1,5 @@
+# Why Sorted Arrays Make Membership Tests Faster
+
+## The Core Idea
+
+A **membership test** asks: "

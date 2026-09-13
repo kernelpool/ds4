@@ -1,0 +1,5 @@
+# Why Grouped MoE Expert Execution Improves Prefill
+
+## The core problem
+
+In a Mixture-of-

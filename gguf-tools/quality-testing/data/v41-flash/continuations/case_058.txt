@@ -1,0 +1,3 @@
+# Checklist per Validare un Modello Quantizzato
+
+Ecco una checklist pratica per verificare che un modello LLM

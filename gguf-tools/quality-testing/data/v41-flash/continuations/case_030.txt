@@ -1,0 +1,3 @@
+# Ricerca binaria del punto di inserimento
+
+Data una **lista ordinata** `A` e un valore

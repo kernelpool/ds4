@@ -1,0 +1,8 @@
+# Online Softmax in Attention (Simple Explanation)
+
+## The Problem
+
+Standard attention computes:
+
+```
+Attention(Q, K,

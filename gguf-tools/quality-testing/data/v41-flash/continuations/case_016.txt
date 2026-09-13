@@ -1,0 +1,5 @@
+# Top-p vs Temperatura Zero: Pro e Contro
+
+## Cosa fanno
+
+- **Temperatura

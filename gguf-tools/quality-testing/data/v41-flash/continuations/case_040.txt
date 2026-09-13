@@ -1,0 +1,3 @@
+Here are the first five measurements to take, ordered to isolate the bottleneck fastest:
+
+1. **Time-to-first-token

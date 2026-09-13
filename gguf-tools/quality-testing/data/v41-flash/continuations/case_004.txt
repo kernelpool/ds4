@@ -1,0 +1,5 @@
+# Why KV Cache Checkpointing Helps Agentic Sessions
+
+## The core problem
+
+In a transformer, generating token *

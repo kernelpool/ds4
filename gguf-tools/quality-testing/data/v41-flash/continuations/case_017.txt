@@ -1,0 +1,1 @@
+La decodifica speculativa mantiene l'output esatto perché usa un meccanismo di **verifica

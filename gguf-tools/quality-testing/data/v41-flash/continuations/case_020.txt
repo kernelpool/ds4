@@ -1,0 +1,5 @@
+# Binary Search for Insertion Point
+
+## The Goal
+
+Given a **sorted array** and a **target value**,

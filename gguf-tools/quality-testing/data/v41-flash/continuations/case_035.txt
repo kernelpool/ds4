@@ -1,0 +1,5 @@
+# Ring Buffer (Buffer Circolare)
+
+## Cos'è
+
+Un **ring buffer** è una struttura dati di dimens

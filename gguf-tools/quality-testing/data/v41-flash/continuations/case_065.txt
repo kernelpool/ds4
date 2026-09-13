@@ -1,0 +1,3 @@
+# Trie Representation of a Set of Strings
+
+A **trie** (pronounced "try," from re**t

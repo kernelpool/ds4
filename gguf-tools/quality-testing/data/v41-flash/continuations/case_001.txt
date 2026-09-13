@@ -1,0 +1,4 @@
+# TCP Echo Server for Slow Clients — Design
+
+## Goal
+Echo bytes back to clients without letting slow readers block

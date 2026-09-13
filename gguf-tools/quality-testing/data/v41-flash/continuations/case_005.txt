@@ -1,0 +1,7 @@
+# Binary Heap Push (Insert) Operation
+
+## Pseudocode
+
+```
+function push(heap, value):
+    // Step

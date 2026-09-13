@@ -1,0 +1,5 @@
+# Online Softmax nell'attenzione (spiegazione semplice)
+
+## Il problema di base
+
+Nell'atten

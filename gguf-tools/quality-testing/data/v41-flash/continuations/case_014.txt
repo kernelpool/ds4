@@ -1,0 +1,5 @@
+# Perché la KV cache su disco aiuta nelle sessioni agentiche
+
+## Il problema di fondo
+
+In una

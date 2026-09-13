@@ -1,0 +1,4 @@
+# PR Review Checklist: Memory Lifetimes
+
+## Ownership & Allocation
+- [ ] Every allocation has a clearly identified owner

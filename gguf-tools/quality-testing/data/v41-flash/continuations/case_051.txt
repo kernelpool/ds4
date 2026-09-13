@@ -1,0 +1,3 @@
+# Perché piccole differenze nei logit possono cambiare una continuazione greedy
+
+La risposta breve: **

@@ -1,0 +1,3 @@
+# Three Invariants for a Tokenizer Special-Token Table
+
+A special-token table maps reserved strings (e

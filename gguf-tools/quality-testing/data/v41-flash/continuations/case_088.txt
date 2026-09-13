@@ -1,0 +1,3 @@
+# Why Tokenizers Must Treat Special Tags Carefully
+
+Special tags (like `<|endoftext|>`, `[

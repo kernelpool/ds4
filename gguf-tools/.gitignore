@@ -14,3 +14,5 @@ quality-testing/data/*
 !quality-testing/data/glm53-flash-openrouter-zai-fp8-100/**
 !quality-testing/data/flash-vision-exp-openrouter-novita-100/
 !quality-testing/data/flash-vision-exp-openrouter-novita-100/**
+!quality-testing/data/v41-flash/
+!quality-testing/data/v41-flash/**

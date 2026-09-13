@@ -1,0 +1,5 @@
+# Derivazione di RMSNorm
+
+## Definizione
+
+RMSNorm (Root Mean Square Layer Normalization) normalizza un

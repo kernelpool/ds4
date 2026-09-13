@@ -1,0 +1,1 @@
+Evaluating 50 prompts is more informative than evaluating one favorite prompt because it trades a narrow, potentially flattering snapshot for

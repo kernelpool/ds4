@@ -1,0 +1,3 @@
+# Latency vs. Throughput
+
+These are two fundamental but distinct measures of system performance. They're often confused because

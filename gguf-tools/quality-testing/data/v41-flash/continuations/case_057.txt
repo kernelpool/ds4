@@ -1,0 +1,3 @@
+# Differenza tra righe KV raw e righe KV compresse
+
+Nel contesto dei modelli transformer (in

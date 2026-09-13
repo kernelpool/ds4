@@ -171,6 +171,9 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   `gguf-tools/quality-testing/score_official /path/to/deepseek-v4-flash.gguf gguf-tools/quality-testing/data/flash/manifest.tsv /tmp/flash.tsv 4096`.
   This manifest is also for the 0731 checkpoint. A later checkpoint needs a
   separately named 100-case fixture and must not be scored against this one.
+- Run the 100-case DeepSeek V4.1 Flash fixture for every released V4.1 GGUF,
+  with the engram sidecar:
+  `gguf-tools/quality-testing/score_official /path/to/deepseek-v4.1-flash.gguf gguf-tools/quality-testing/data/v41-flash/manifest.tsv /tmp/v41.tsv 4096 --engram /path/to/deepseek-v4.1-flash-engram.gguf`.
 - Treat the native MXFP4 Flash GGUF as a separate release artifact. Run the
   same 100-case fixture on Metal, resident CUDA, and CUDA SSD streaming when
   those backends are advertised; compare each result with the Metal baseline.

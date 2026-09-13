@@ -1,0 +1,1 @@
+A confidence interval is a range of values that likely contains the true answer you're looking for — along with a statement of

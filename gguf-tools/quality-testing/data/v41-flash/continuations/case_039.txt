@@ -1,0 +1,3 @@
+# Confrontare due quantizzazioni senza fidarsi di una sola risposta
+
+Quando devi valutare se una

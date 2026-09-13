@@ -1,0 +1,5 @@
+# Pseudocodice: Inserimento in un Heap Binario
+
+## Premessa
+
+Un **heap binario

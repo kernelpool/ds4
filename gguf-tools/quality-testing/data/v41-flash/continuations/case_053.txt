@@ -1,0 +1,6 @@
+# Schema JSON minimo per una Tool Call
+
+```json
+{
+  "name": "get_weather",
+ 

@@ -27,6 +27,11 @@ calling hosted APIs:
   official DeepSeek API with `top_logprobs=20`.
 - `data/pro-0813`: 100 DeepSeek V4 PRO 0813 continuations collected from the
   official DeepSeek API with `top_logprobs=20`.
+- `data/v41-flash`: 100 DeepSeek V4.1 Flash continuations collected from the
+  official DeepSeek API (`deepseek-flash`, thinking disabled) with
+  `top_logprobs=20`; the API returned degenerate logprobs (0.0 for the chosen
+  token, -9999 otherwise), so the fixture is effectively a deterministic
+  continuation set. Pass `--engram FILE` to `score_official` for this model.
 
 DeepSeek V4 Flash also has tracked official smoke vectors in
 `tests/test-vectors/`.  Those vectors drive `./ds4_test --logprob-vectors` and

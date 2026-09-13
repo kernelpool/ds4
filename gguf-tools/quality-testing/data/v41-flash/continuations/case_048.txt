@@ -1,0 +1,3 @@
+# Checklist: Validating Instruction-Following in a Quantized Model
+
+## 1. Pre-Validation Setup

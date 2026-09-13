@@ -1,0 +1,1 @@
+Speculative decoding preserves exact greedy output by using a **verification step that accepts only tokens the target model would have chosen

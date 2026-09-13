@@ -1,0 +1,4 @@
+# Funzione C per limitare un intero a un intervallo
+
+```c
+int clamp(int value, int
