@@ -95,8 +95,9 @@ trunk's routed experts are split between the ranks and everything else is replic
 each rank holds half the experts plus the dense weights and the engram sidecar. Pass the
 same `--engram`, `--mtp-model` and DSpark options to the worker and the coordinator.
 
-Prefill runs in chunks of 64 tokens by default; `--prefill-chunk 512` is considerably
-faster on long prompts at the cost of transient buffers that scale with the chunk. The
+Prefill runs in chunks of 512 tokens by default; `--prefill-chunk` changes it. A larger
+chunk helps very long prompts a little more, a smaller one trims the per-session scratch
+that scales with it, and the output does not depend on the choice. The
 compressed caches, index keys and selections stay on the GPU, so long contexts do not
 move data per token. Activations and the matrix kernels stay in F32 (`DS4_DSV41_HALF_MM=1`
 selects the half-precision tiles for comparison). Disk KV checkpoints and live prefix

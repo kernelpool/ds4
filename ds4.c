@@ -66897,6 +66897,7 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
     dsv41_gpu_buf b_post = {0}, b_comb = {0}, b_attnpre = {0}, b_moe = {0};
     dsv41_gpu_buf b_iq_all = {0}, b_wts_all = {0}, b_join = {0}, b_ikall = {0}, b_sc = {0};
     ds4_gpu_tensor *t_widx = NULL, *t_idx = NULL;
+    ds4_gpu_tensor *kv_slot = NULL;
     int32_t *widx = NULL;
     /* the per-layer constants: the session's resident set, or a block's own upload */
     dsv41_gpu_consts own = {0};
@@ -66969,7 +66970,6 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
     ds4_gpu_tensor *ring_t = win_gpu && !draft ? win_gpu->ring[il] : NULL;
     const uint32_t rslots = win_gpu && !draft ? win_gpu->ring_slots : win;
     ds4_gpu_tensor *kv_dst = b_kv_all.t;
-    ds4_gpu_tensor *kv_slot = NULL;
     if (ring_t && n_tok == 1u) {
         kv_slot = ds4_gpu_tensor_view(ring_t,
                 (uint64_t)(pos0 % rslots) * hd * sizeof(float), (uint64_t)hd * sizeof(float));
@@ -67297,7 +67297,7 @@ done:
     ds4_gpu_tensor_free(b_post.t); ds4_gpu_tensor_free(b_comb.t);
     ds4_gpu_tensor_free(b_iq_all.t); ds4_gpu_tensor_free(b_wts_all.t);
     ds4_gpu_tensor_free(b_moe.t); ds4_gpu_tensor_free(b_attnpre.t);
-    ds4_gpu_tensor_free(t_widx); ds4_gpu_tensor_free(t_idx);
+    ds4_gpu_tensor_free(t_widx); ds4_gpu_tensor_free(t_idx); ds4_gpu_tensor_free(kv_slot);
     free(widx);
     if (k == &own) {
         ds4_gpu_tensor_free(own.hsc); ds4_gpu_tensor_free(own.hba);
@@ -67820,7 +67820,7 @@ static dsv41_session_state *dsv41_session_state_alloc(ds4_engine *e, uint32_t ct
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     const dsv41_draft_spec *dsp = dsv41_draft_spec_get(e);
     ss->cap = ctx + 1u;
-    ss->chunk = e->prefill_chunk ? e->prefill_chunk : 64u;
+    ss->chunk = e->prefill_chunk ? e->prefill_chunk : 512u;
     if (ss->chunk > ctx) ss->chunk = ctx;
     dsv41_ref_state_init(&ss->st, n_trunk, ss->cap);
     ss->ids = xcalloc(ss->cap, sizeof(int32_t));

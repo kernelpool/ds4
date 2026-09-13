@@ -22,7 +22,7 @@ static void die(const char *msg) {
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s MODEL manifest.tsv OUT.tsv [ctx] "
-            "[--quality] [--rendered-prompt] "
+            "[--quality] [--rendered-prompt] [--engram FILE] "
             "[--gpu-vram N[,N,...]|auto] [--gpu-devices N[,N,...]] "
             "[--cuda-tensor-parallel] "
             "[--ssd-streaming] [--ssd-streaming-cold] "
@@ -596,6 +596,7 @@ int main(int argc, char **argv) {
     uint64_t ssd_streaming_cache_bytes = 0;
     uint32_t ssd_streaming_preload_experts = 0;
     const char *first_logits_path = NULL;
+    const char *engram_path = NULL;
     int max_cases = 0;
     ds4_dist_options dist = {0};
     ds4_tp_options tp = {0};
@@ -625,6 +626,8 @@ int main(int argc, char **argv) {
             quality = true;
         } else if (!strcmp(arg, "--rendered-prompt")) {
             rendered_prompt = true;
+        } else if (!strcmp(arg, "--engram")) {
+            engram_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-vram")) {
             gpu_vram_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-devices")) {
@@ -674,6 +677,7 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = model_path,
+        .engram_path = engram_path,
 #ifdef __APPLE__
         .backend = DS4_BACKEND_METAL,
 #else
