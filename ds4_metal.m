@@ -9279,14 +9279,18 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
 
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
     if (!tensor) return 0;
-    const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
-    return obj.bytes;
+    @autoreleasepool {
+        const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
+        return obj.bytes;
+    }
 }
 
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
-    DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
-    return (uint8_t *)[obj.buffer contents] + obj.offset;
+    @autoreleasepool {
+        DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
+        return (uint8_t *)[obj.buffer contents] + obj.offset;
+    }
 }
 
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
@@ -9297,22 +9301,28 @@ int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count)
     return 1;
 }
 
+/* The property reads autorelease the buffer; without a pool of their own, a
+ * caller on a plain C thread keeps every touched buffer alive for good. */
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || (!data && bytes != 0)) return 0;
-    DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
-    if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
-    if (bytes != 0) {
-        memcpy((uint8_t *)[obj.buffer contents] + obj.offset + offset, data, (size_t)bytes);
+    @autoreleasepool {
+        DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
+        if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
+        if (bytes != 0) {
+            memcpy((uint8_t *)[obj.buffer contents] + obj.offset + offset, data, (size_t)bytes);
+        }
     }
     return 1;
 }
 
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || (!data && bytes != 0)) return 0;
-    const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
-    if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
-    if (bytes != 0) {
-        memcpy(data, (const uint8_t *)[obj.buffer contents] + obj.offset + offset, (size_t)bytes);
+    @autoreleasepool {
+        const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
+        if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
+        if (bytes != 0) {
+            memcpy(data, (const uint8_t *)[obj.buffer contents] + obj.offset + offset, (size_t)bytes);
+        }
     }
     return 1;
 }
@@ -9322,24 +9332,26 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           uint64_t bytes) {
     if (!dst || !src) return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    DS4MetalTensor *d = ds4_gpu_tensor_obj(dst);
-    const DS4MetalTensor *s = ds4_gpu_tensor_const_obj(src);
-    if (dst_offset > d.bytes || bytes > d.bytes - dst_offset) return 0;
-    if (src_offset > s.bytes || bytes > s.bytes - src_offset) return 0;
-    if (bytes == 0) return 1;
-    if (!g_batch_cb) return 0;
+    @autoreleasepool {
+        DS4MetalTensor *d = ds4_gpu_tensor_obj(dst);
+        const DS4MetalTensor *s = ds4_gpu_tensor_const_obj(src);
+        if (dst_offset > d.bytes || bytes > d.bytes - dst_offset) return 0;
+        if (src_offset > s.bytes || bytes > s.bytes - src_offset) return 0;
+        if (bytes == 0) return 1;
+        if (!g_batch_cb) return 0;
 
-    ds4_gpu_close_batch_encoder();
-    g_batch_has_work = YES;
-    id<MTLBlitCommandEncoder> blit = ds4_gpu_blit_encoder(g_batch_cb, "tensor_copy", 1u);
-    if (!blit) return 0;
-    [blit copyFromBuffer:s.buffer
-            sourceOffset:(NSUInteger)(s.offset + src_offset)
-                toBuffer:d.buffer
-       destinationOffset:(NSUInteger)(d.offset + dst_offset)
-                    size:(NSUInteger)bytes];
-    [blit endEncoding];
-    return 1;
+        ds4_gpu_close_batch_encoder();
+        g_batch_has_work = YES;
+        id<MTLBlitCommandEncoder> blit = ds4_gpu_blit_encoder(g_batch_cb, "tensor_copy", 1u);
+        if (!blit) return 0;
+        [blit copyFromBuffer:s.buffer
+                sourceOffset:(NSUInteger)(s.offset + src_offset)
+                    toBuffer:d.buffer
+           destinationOffset:(NSUInteger)(d.offset + dst_offset)
+                        size:(NSUInteger)bytes];
+        [blit endEncoding];
+        return 1;
+    }
 }
 
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
@@ -9347,42 +9359,44 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    uint64_t count) {
     if (!dst || !src) return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    DS4MetalTensor *d = ds4_gpu_tensor_obj(dst);
-    const DS4MetalTensor *s = ds4_gpu_tensor_const_obj(src);
-    if (count == 0) return 1;
-    if (count > UINT64_MAX / sizeof(float) ||
-        count > UINT64_MAX / sizeof(uint16_t)) {
-        return 0;
-    }
-    const uint64_t src_bytes = count * sizeof(float);
-    const uint64_t dst_bytes = count * sizeof(uint16_t);
-    if (src_offset > s.bytes || src_bytes > s.bytes - src_offset ||
-        dst_offset > d.bytes || dst_bytes > d.bytes - dst_offset) {
-        return 0;
-    }
-
     @autoreleasepool {
-        int owned = 0;
-        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
-        if (!cb) return 0;
-
-        uint64_t done = 0;
-        int ok = 1;
-        while (done < count && ok) {
-            uint64_t chunk64 = count - done;
-            if (chunk64 > UINT32_MAX) chunk64 = UINT32_MAX;
-            const uint32_t chunk = (uint32_t)chunk64;
-            ok = ds4_gpu_encode_cpy_f32_f16_1d(
-                    cb,
-                    s.buffer,
-                    (NSUInteger)(s.offset + src_offset + done * sizeof(float)),
-                    d.buffer,
-                    (NSUInteger)(d.offset + dst_offset + done * sizeof(uint16_t)),
-                    chunk);
-            done += chunk;
+        DS4MetalTensor *d = ds4_gpu_tensor_obj(dst);
+        const DS4MetalTensor *s = ds4_gpu_tensor_const_obj(src);
+        if (count == 0) return 1;
+        if (count > UINT64_MAX / sizeof(float) ||
+            count > UINT64_MAX / sizeof(uint16_t)) {
+            return 0;
         }
-        if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "tensor f32 to f16 copy");
-        return ok;
+        const uint64_t src_bytes = count * sizeof(float);
+        const uint64_t dst_bytes = count * sizeof(uint16_t);
+        if (src_offset > s.bytes || src_bytes > s.bytes - src_offset ||
+            dst_offset > d.bytes || dst_bytes > d.bytes - dst_offset) {
+            return 0;
+        }
+
+        @autoreleasepool {
+            int owned = 0;
+            id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+            if (!cb) return 0;
+
+            uint64_t done = 0;
+            int ok = 1;
+            while (done < count && ok) {
+                uint64_t chunk64 = count - done;
+                if (chunk64 > UINT32_MAX) chunk64 = UINT32_MAX;
+                const uint32_t chunk = (uint32_t)chunk64;
+                ok = ds4_gpu_encode_cpy_f32_f16_1d(
+                        cb,
+                        s.buffer,
+                        (NSUInteger)(s.offset + src_offset + done * sizeof(float)),
+                        d.buffer,
+                        (NSUInteger)(d.offset + dst_offset + done * sizeof(uint16_t)),
+                        chunk);
+                done += chunk;
+            }
+            if (ok) ok = ds4_gpu_finish_command_buffer(cb, owned, "tensor f32 to f16 copy");
+            return ok;
+        }
     }
 }
 
