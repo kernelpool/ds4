@@ -143,6 +143,9 @@ int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers);
 int ds4_tp_batch_block_end(ds4_tp *tp);
 /* Raise the per-gate timeout to at least ms (an explicit DS4_TP_GATE_TIMEOUT_MS wins). */
 void ds4_tp_raise_gate_timeout_ms(ds4_tp *tp, uint64_t ms);
+/* Cooperative teardown: any in-flight exchange wait bails immediately instead
+ * of sitting out its timeout.  Call before joining the gate service thread. */
+void ds4_tp_request_abort(ds4_tp *tp);
 
 /* Prefill batch gate: arbitrary-size symmetric payload exchange over bulk
  * RDMA, with interleaved 2MB TCP rounds as fallback (see ds4_tp.c). */

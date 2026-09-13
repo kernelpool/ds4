@@ -186,6 +186,7 @@ struct ds4_tp {
     int control_fd;
     int data_fd;                /* TCP fallback, headers, and verify gates */
     bool rdma_active;
+    atomic_bool abort_requested; /* teardown: exchange wait loops bail at once */
     uint32_t peer_ctx;
     uint32_t n_layer;
     uint32_t n_embd;
@@ -274,6 +275,21 @@ static void tp_socket_tune(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    /* A silent partition (yanked cable, no FIN) otherwise leaves the control
+     * reads waiting for the OS keepalive; this reports it within seconds. */
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#ifdef TCP_KEEPALIVE
+    int idle = 5;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
+#endif
+#ifdef TCP_KEEPINTVL
+    int intvl = 2;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+#endif
+#ifdef TCP_KEEPCNT
+    int cnt = 3;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
     /* Gate exchanges are latency-critical 16KB messages; large socket
      * buffers only matter for the TCP fallback's pipelining. */
     int sz = 4 * 1024 * 1024;
@@ -304,6 +320,10 @@ static int tp_peer_closed(const ds4_tp *tp) {
     if (n == 0) return 1;
     if (n > 0) return 0;
     return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+}
+
+static int tp_aborted(const ds4_tp *tp) {
+    return atomic_load_explicit(&tp->abort_requested, memory_order_relaxed);
 }
 #endif
 
@@ -1271,6 +1291,10 @@ static int tp_rdma_block_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows
     uint32_t peer_poll = 0;
     while (ok && r->block_recv_done < want) {
         ok = tp_rdma_drain_cq(tp);
+        if (ok && tp_aborted(tp)) {
+            fprintf(stderr, "ds4-tp: verify-block gate aborted for teardown\n");
+            ok = 0;
+        }
         if (ok && (++peer_poll & 0x3fffu) == 0 && tp_peer_closed(tp)) {
             fprintf(stderr, "ds4-tp: peer disconnected during verify-block gate\n");
             ok = 0;
@@ -1390,6 +1414,10 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
     uint32_t peer_poll = 0;
     while (ok && r->recv_done < seq) {
         ok = tp_rdma_drain_cq(tp);
+        if (ok && tp_aborted(tp)) {
+            fprintf(stderr, "ds4-tp: RDMA gate aborted for teardown\n");
+            ok = 0;
+        }
         if (ok && (++peer_poll & 0x3fffu) == 0 && tp_peer_closed(tp)) {
             fprintf(stderr, "ds4-tp: peer disconnected during RDMA gate\n");
             ok = 0;
@@ -1500,6 +1528,11 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
             } else if (r->send_outstanding > 0) {
                 r->send_outstanding--;
             }
+        }
+        if (tp_aborted(tp)) {
+            fprintf(stderr, "ds4-tp: RDMA receive drain aborted for teardown\n");
+            pthread_mutex_unlock(&r->post_lock);
+            return 0;
         }
         if ((peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
             fprintf(stderr,
@@ -1683,6 +1716,10 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                 } else {
                     send_done++;
                 }
+            }
+            if (tp_aborted(tp)) {
+                fprintf(stderr, "ds4-tp: bulk RDMA gate aborted for teardown\n");
+                return 0;
             }
             if (nwc == 0 && (peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
                 fprintf(stderr, "ds4-tp: peer disconnected during big gate\n");
@@ -2028,6 +2065,10 @@ int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers) {
 
 /* End of the verify block: every gate must have been exchanged (all
  * posted receives consumed) and our signaled sends reaped. */
+void ds4_tp_request_abort(ds4_tp *tp) {
+    if (tp) atomic_store(&tp->abort_requested, true);
+}
+
 void ds4_tp_raise_gate_timeout_ms(ds4_tp *tp, uint64_t ms) {
     if (!tp || tp->gate_timeout_set || tp->gate_timeout_ms >= ms) return;
     tp->gate_timeout_ms = ms;
@@ -2043,6 +2084,7 @@ int ds4_tp_batch_block_end(ds4_tp *tp) {
     double deadline = tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0;
     while (ok && (r->block_recv_done < want || r->send_outstanding > 0)) {
         ok = tp_rdma_drain_cq(tp);
+        if (ok && tp_aborted(tp)) ok = 0;
         if (ok && tp_now_sec() > deadline) {
             fprintf(stderr, "ds4-tp: verify-block end: %llu/%llu rows received, %u sends pending\n",
                     (unsigned long long)r->block_recv_done, (unsigned long long)want,

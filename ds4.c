@@ -73790,6 +73790,8 @@ void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
     if (e->tp.active) {
+        /* unblock an exchange the service thread may be waiting in before joining it */
+        ds4_tp_request_abort(e->tp.ctx);
         ds4_gpu_tp_shutdown();
         const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
         for (uint32_t i = 0; i < slots; i++) {
