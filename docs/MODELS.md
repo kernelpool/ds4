@@ -68,8 +68,10 @@ gguf-tools/deepseek4-quantize --hf ../DeepSeek-V4.1-Flash \
 The backbone keeps the released MXFP4 routed experts and holds projections, shared experts
 and the output at Q8_0; it is resident, so it needs a Mac with more unified memory than
 its size. The engram sidecar is memory-mapped and read a few rows per token, so it only
-has to be on fast storage. The DSpark file carries just the draft heads, since the three
-draft blocks are already in the backbone.
+has to be on fast storage; `--engram-resident on` pins its tables in memory instead when
+they fit beside the model, which `auto` decides from the machine's memory (a two-Mac pair
+holds one table per node, see [distributed inference](DISTRIBUTED.md)). The DSpark file
+carries just the draft heads, since the three draft blocks are already in the backbone.
 
 V4.1 uses its own prompt format: the conversation opens with `<｜System｜>`, thinking
 carries a numeric reasoning budget instead of the Think Max text (`--think` 75,

@@ -819,6 +819,12 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--engram")) {
             c.engine.engram_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--engram-resident")) {
+            c.engine.engram_resident = ds4_engram_residency_parse(need_arg(&i, argc, argv, arg));
+            if (c.engine.engram_resident == -2) {
+                fprintf(stderr, "ds4-agent: %s expects auto, on or off\n", arg);
+                exit(2);
+            }
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.glm_mtp = true;
         } else if (!strcmp(arg, "--mtp-model")) {

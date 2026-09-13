@@ -1174,6 +1174,8 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *engram_path;
+    int engram_resident;
     const char *trace_path;
     const char *regrade_trace_path;
     const char *case_sequence;
@@ -1659,6 +1661,14 @@ static eval_config parse_options(int argc, char **argv) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-model")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--engram")) {
+            c.engram_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--engram-resident")) {
+            c.engram_resident = ds4_engram_residency_parse(need_arg(&i, argc, argv, arg));
+            if (c.engram_resident == -2) {
+                fprintf(stderr, "ds4-eval: %s expects auto, on or off\n", arg);
+                exit(2);
+            }
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -4771,6 +4781,8 @@ int main(int argc, char **argv) {
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
         .mtp_path = cfg.mtp_path,
+        .engram_path = cfg.engram_path,
+        .engram_resident = cfg.engram_resident,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_size > 0 ? cfg.ctx_size : 0,

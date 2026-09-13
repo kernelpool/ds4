@@ -131,6 +131,7 @@ typedef struct {
     const char *mtp_path;
     const char *vision_path;
     const char *engram_path;
+    int engram_resident;        /* DeepSeek V4.1 tables: 0 auto, 1 pinned, -1 mapped */
     ds4_backend backend;
     int n_threads;
     int context_size;
@@ -306,6 +307,8 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_dsv41(ds4_engine *e);
+/* "auto", "on" or "off" for ds4_engine_options.engram_resident; -2 when unknown */
+int ds4_engram_residency_parse(const char *s);
 bool ds4_engine_is_glm53(ds4_engine *e);
 bool ds4_engine_is_qwen4(ds4_engine *e);
 /* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */

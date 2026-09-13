@@ -178,6 +178,10 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO long prompts 8192; others 4096.");
     if (full) {
+        if (tool != DS4_HELP_BENCH) {
+            opt(fp, c, "--engram FILE", "DeepSeek V4.1 engram sidecar GGUF.");
+            opt(fp, c, "--engram-resident MODE", "V4.1 engram tables: auto pins the tables this rank holds when memory allows, on forces it, off keeps them mapped. Default: auto");
+        }
         if (tool == DS4_HELP_EVAL || tool == DS4_HELP_BENCH) {
             opt(fp, c, "--mtp-model FILE", "External MTP or DSpark support GGUF.");
         }

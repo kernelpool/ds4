@@ -91,10 +91,15 @@ For GLM MTP, enable `--mtp` on both. For DeepSeek DSpark, both need the
 matching support model and DSpark options.
 
 DeepSeek V4.1 Flash splits its trunk's routed experts the same way and keeps
-attention, the indexer, the engram lookups and the draft stages replicated, so
-both ranks need the backbone, the engram sidecar (`--engram`) and, for DSpark,
-the heads file with the same options. A DSpark block is verified on both ranks
-in lockstep and the worker keeps the prefix the coordinator commits.
+attention, the indexer and the draft stages replicated, so both ranks need the
+backbone, the engram sidecar (`--engram`) and, for DSpark, the heads file with
+the same options. The two engram tables are split by rank: each rank reads one
+table for both and swaps the rows with its peer before every pass, so a node
+touches half the sidecar. With `--engram-resident auto` (the default) a rank
+pins its table in memory when the node has room for it beside the model, and
+otherwise maps it with read-ahead; `on` and `off` force either. A DSpark block
+is verified on both ranks in lockstep and the worker keeps the prefix the
+coordinator commits.
 
 TP disk-cache restore currently rebuilds the exact saved token prefix on both
 ranks rather than restoring the coordinator alone. Expect prefill on restore.

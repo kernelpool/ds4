@@ -7400,6 +7400,31 @@ static void engram_gather_row(const ds4_model *m, const ds4_tensor *t, uint64_t 
     ds4_dequant_e4m3_row((const block_e4m3 *)base, dim, out);
 }
 
+/* Tensor parallelism shards the tables by layer: rank r reads table r for both ranks
+ * and takes the other from its peer, so each node holds half the file. */
+static uint32_t g_engram_world = 1u, g_engram_rank = 0u;
+
+static bool engram_table_owned(uint32_t li) {
+    return g_engram_world == 1u || li % g_engram_world == g_engram_rank;
+}
+
+static uint64_t engram_row_bytes(void) {
+    return (uint64_t)(DS4_N_ENGRAM_HEAD_DIM / QK_E4M3) * sizeof(block_e4m3);
+}
+
+static const uint8_t *engram_row_ptr(const ds4_model *m, const ds4_tensor *t, uint64_t row) {
+    if (row >= t->dim[1]) ds4_die("engram row index is outside the table");
+    return (const uint8_t *)tensor_data(m, t) + row * engram_row_bytes();
+}
+
+int ds4_engram_residency_parse(const char *s) {
+    if (!s) return -2;
+    if (!strcmp(s, "auto")) return 0;
+    if (!strcmp(s, "on") || !strcmp(s, "pinned")) return 1;
+    if (!strcmp(s, "off") || !strcmp(s, "mapped")) return -1;
+    return -2;
+}
+
 /* Raw token ids become compressed ids; a dead token (an image span) takes no part in
  * an n-gram, so it is marked rather than mapped. */
 static DS4_MAYBE_UNUSED void engram_compress_tokens(
@@ -66105,6 +66130,73 @@ static struct {
     uint64_t bounce_bytes;
 } g_dsv41_tp;
 
+/* The peer's table rows for the pass in flight: raw e4m3 rows, [table][token][bucket]. */
+static struct {
+    uint8_t *send, *recv;
+    uint64_t cap;
+    uint32_t pos0, n_tok;
+    uint64_t seq;
+} g_dsv41_engram_peer;
+
+/* Before the first block, each rank gathers the rows its table holds for the pass's
+ * tokens and swaps them with the peer's through the prefill bulk gate.  The hashes
+ * need only the token history, which both ranks keep. */
+static bool dsv41_engram_exchange(const dsv41_ref_engram *eng, uint32_t pos0,
+                                  uint32_t n_tok, uint32_t l0, uint32_t l1) {
+    const ds4_engine_tp_state *tp = g_dsv41_tp.tp;
+    if (!eng || !eng->m || !tp || !tp->active || g_engram_world == 1u) return true;
+    const ds4_engram_hash *h = eng->h;
+    bool any = false;
+    for (uint32_t li = 0; li < h->n_layer; li++) {
+        if (h->layer_id[li] >= l0 && h->layer_id[li] < l1) any = true;
+    }
+    if (!any) return true;
+    const uint64_t rb = engram_row_bytes();
+    const uint64_t per_table = (uint64_t)n_tok * h->n_bucket * rb;
+    const uint64_t bytes = per_table * (h->n_layer / g_engram_world);
+    if (g_dsv41_engram_peer.cap < bytes) {
+        free(g_dsv41_engram_peer.send); free(g_dsv41_engram_peer.recv);
+        g_dsv41_engram_peer.send = xmalloc(bytes);
+        g_dsv41_engram_peer.recv = xmalloc(bytes);
+        g_dsv41_engram_peer.cap = bytes;
+    }
+    uint8_t *dst = g_dsv41_engram_peer.send;
+    for (uint32_t li = 0; li < h->n_layer; li++) {
+        if (!engram_table_owned(li)) continue;
+        for (uint32_t t = 0; t < n_tok; t++) {
+            int64_t rows[DS4_MAX_ENGRAM_BUCKET];
+            engram_hash_rows(h, li, eng->ids, eng->dead, pos0 + t, rows);
+            for (uint32_t i = 0; i < h->n_bucket; i++, dst += rb) {
+                memcpy(dst, engram_row_ptr(eng->m, eng->w->embed[li], (uint64_t)rows[i]), rb);
+            }
+        }
+    }
+    g_dsv41_engram_peer.pos0 = pos0;
+    g_dsv41_engram_peer.n_tok = n_tok;
+    if (!ds4_tp_big_gate_exchange(tp->ctx, 0xE9u, ++g_dsv41_engram_peer.seq,
+                                  g_dsv41_engram_peer.send, g_dsv41_engram_peer.recv, bytes)) {
+        ds4_tp_mark_failed(tp->ctx);
+        return false;
+    }
+    return true;
+}
+
+/* The buckets of a peer-held table for one token of the pass, dequantized. */
+static void engram_peer_lookup(const ds4_engram_hash *h, uint32_t li, uint32_t pos, float *out) {
+    if (pos < g_dsv41_engram_peer.pos0 || pos - g_dsv41_engram_peer.pos0 >= g_dsv41_engram_peer.n_tok) {
+        ds4_die("engram rows for this position were not exchanged");
+    }
+    uint32_t k = 0;
+    for (uint32_t j = 0; j < li; j++) if (!engram_table_owned(j)) k++;
+    const uint64_t rb = engram_row_bytes();
+    const uint8_t *src = g_dsv41_engram_peer.recv +
+        (((uint64_t)k * g_dsv41_engram_peer.n_tok + (pos - g_dsv41_engram_peer.pos0)) * h->n_bucket) * rb;
+    for (uint32_t i = 0; i < h->n_bucket; i++) {
+        ds4_dequant_e4m3_row((const block_e4m3 *)(src + i * rb), DS4_N_ENGRAM_HEAD_DIM,
+                             out + (size_t)i * DS4_N_ENGRAM_HEAD_DIM);
+    }
+}
+
 static bool dsv41_tp_trunk(uint32_t il) {
     return g_dsv41_tp.tp && g_dsv41_tp.tp->active && !dsv41_tp_layer_replicated(il);
 }
@@ -66494,8 +66586,12 @@ static bool dsv41_gpu_engram_step(const dsv41_ref_engram *eng, const dsv41_gpu_e
         ds4_gpu_tensor *t_dead = ds4_gpu_tensor_alloc((uint64_t)n_tok * sizeof(int32_t));
         float *emb = xmalloc((size_t)n_tok * in_dim * sizeof(float));
         for (uint32_t t = 0; t < n_tok; t++) {
-            engram_lookup(eng->m, eng->w, eng->h, li, eng->ids, eng->dead, pos0 + t,
-                          emb + (size_t)t * in_dim);
+            if (engram_table_owned(li)) {
+                engram_lookup(eng->m, eng->w, eng->h, li, eng->ids, eng->dead, pos0 + t,
+                              emb + (size_t)t * in_dim);
+            } else {
+                engram_peer_lookup(eng->h, li, pos0 + t, emb + (size_t)t * in_dim);
+            }
         }
         ok = t_dead != NULL &&
              ds4_gpu_tensor_write(t_dead, 0, eng->dead + pos0,
@@ -67629,6 +67725,8 @@ static bool dsv41_gpu_forward_rows(const ds4_model *m, const ds4_weights *w,
         ok = ok && dsv41_gpu_buf_put(&b_st, stream, (uint64_t)n_tok * hc_dim) &&
                    dsv41_gpu_buf_put(&b_mix, pre_mix, (uint64_t)n_tok * hc);
     }
+
+    ok = ok && dsv41_engram_exchange(eng, pos0, n_tok, l0, l1);
 
     /* one command batch for the whole call: a dispatch per command buffer spends more
      * time committing and waiting than computing */
@@ -71823,6 +71921,56 @@ int ds4_engine_create_with_gpu_config(ds4_engine **out,
     return ds4_engine_open_internal(out, opt, gpu_cfg);
 }
 
+
+/* Where a rank's engram tables live: pinned when the node has the memory for them
+ * beside the model (or asked to), otherwise mapped with read-ahead; the tables the
+ * peer holds are never touched. */
+static void engram_residency(ds4_engine *e, int policy) {
+    const ds4_engram_hash *h = &g_ds4_engram;
+    const uint64_t rb = engram_row_bytes();
+    uint64_t owned = 0;
+    for (uint32_t li = 0; li < h->n_layer; li++) {
+        if (engram_table_owned(li)) owned += h->n_rows[li] * rb;
+    }
+    if (policy == 0) {
+        uint64_t phys = 0;
+        size_t len = sizeof(phys);
+        if (sysctlbyname("hw.memsize", &phys, &len, NULL, 0) != 0 || phys == 0) {
+            phys = (uint64_t)sysconf(_SC_PHYS_PAGES) * (uint64_t)sysconf(_SC_PAGE_SIZE);
+        }
+        policy = owned + e->model.size + (UINT64_C(64) << 30) <= phys ? 1 : -1;
+    }
+    const uint64_t page = (uint64_t)getpagesize();
+    const double t0 = now_sec();
+    uint64_t pinned = 0;
+    for (uint32_t li = 0; li < h->n_layer; li++) {
+        if (!engram_table_owned(li)) continue;
+        const uint8_t *base = tensor_data(&e->engram_model, e->engram_weights.embed[li]);
+        const uint64_t lead = (uintptr_t)base & (page - 1u);
+        void *p = (void *)(base - lead);
+        const size_t n = (size_t)(lead + h->n_rows[li] * rb);
+        if (policy == 1 && mlock(p, n) == 0) {
+            pinned += n;
+        } else {
+            if (policy == 1) {
+                ds4_log(stderr, DS4_LOG_WARNING, "ds4: engram table %u: mlock failed (%s), keeping it mapped",
+                        h->layer_id[li], strerror(errno));
+            }
+#if defined(POSIX_MADV_WILLNEED)
+            (void)posix_madvise(p, n, POSIX_MADV_WILLNEED);
+#endif
+        }
+    }
+    ds4_log(stderr, DS4_LOG_OK, "engram: rank %u of %u holds %.1f GiB of %u table%s, %s\n",
+            g_engram_rank, g_engram_world, (double)owned / (1024.0 * 1024.0 * 1024.0),
+            h->n_layer, h->n_layer == 1 ? "" : "s",
+            pinned ? "pinned" : "mapped with read-ahead");
+    if (pinned) {
+        ds4_log(stderr, DS4_LOG_OK, "engram: %.1f GiB pinned in %.1f s\n",
+                (double)pinned / (1024.0 * 1024.0 * 1024.0), now_sec() - t0);
+    }
+}
+
 static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
                                      const ds4_gpu_config *gpu_cfg) {
@@ -72008,13 +72156,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #endif
     }
     if (opt->engram_path && opt->engram_path[0]) {
-        /* Private read-only mapping, no prefetch: the tables are 203 GB and must stay
-         * out of both the resident set and the GPU map ranges.  Rows are faulted in
-         * one at a time by engram_lookup. */
-        /* the tables are gathered on the CPU inside the layer loop, so a cold page
-         * is a stall there; ask for the read-ahead up front */
-        model_open(&e->engram_model, opt->engram_path, false, true);
+        /* Private read-only mapping outside the GPU map ranges; the tables a rank
+         * holds are then pinned or read ahead by engram_residency. */
+        model_open(&e->engram_model, opt->engram_path, false, false);
         engram_weights_bind(&e->engram_weights, &g_ds4_engram, &e->engram_model);
+        g_engram_world = ds4_tp_enabled(&opt->tp) ? 2u : 1u;
+        g_engram_rank = opt->tp.role == DS4_TP_WORKER ? 1u : 0u;
+        if (g_ds4_engram.n_layer % g_engram_world != 0) {
+            ds4_die("engram sharding needs a table count divisible by the rank count");
+        }
+        engram_residency(e, opt->engram_resident);
         e->engram_ready = true;
     }
     if (load_slice && load_layer_end == UINT32_MAX) {
