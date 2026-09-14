@@ -48303,14 +48303,26 @@ int ds4_gpu_dsv41_engram(const void *model_map,
             .out_dim = out_dim,
             .n_rows = rows,
         };
-        [enc setComputePipelineState:mv];
-        [enc setBytes:&mm length:sizeof(mm) atIndex:0];
+        /* a chunk's rows take the tile matmul, a few rows the shared walk */
+        const bool tiles = rows > 8u && (in_dim % 32u) == 0u;
+        const bool bc_out = (out_dim % 64u) != 0u || (rows % 32u) != 0u;
+        id<MTLComputePipelineState> mmp = tiles ?
+            ds4_gpu_get_mul_mm_pipeline("kernel_glm53_mul_mm_bf16_f32", false, bc_out) : nil;
+        ds4_gpu_mul_mm_args mma = ds4_gpu_make_mm_args(in_dim, out_dim, rows,
+                                                       (uint64_t)in_dim * sizeof(uint16_t));
+        [enc setComputePipelineState:mmp ? mmp : mv];
+        if (mmp) [enc setBytes:&mma length:sizeof(mma) atIndex:0];
+        else [enc setBytes:&mm length:sizeof(mm) atIndex:0];
         [enc setBuffer:weightbuf offset:(NSUInteger)inner atIndex:1];
         [enc setBuffer:ds4_gpu_tensor_buffer(emb)
                 offset:ds4_gpu_tensor_offset(emb) atIndex:2];
         [enc setBuffer:ds4_gpu_tensor_buffer(kv_scratch)
                 offset:ds4_gpu_tensor_offset(kv_scratch) atIndex:3];
-        if (nt > 1u) {
+        if (mmp) {
+            [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((rows + 31u) / 32u, (out_dim + 63u) / 64u, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        } else if (nt > 1u) {
             [enc setThreadgroupMemoryLength:(NSUInteger)nt * 256u * sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake((out_dim + 4u * nsg - 1u) / (4u * nsg), (rows + nt - 1u) / nt, 1)
                 threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1, 1)];

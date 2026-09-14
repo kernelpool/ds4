@@ -68719,12 +68719,72 @@ static DS4_MAYBE_UNUSED void dsv41_ref_draft(const ds4_model *m, const ds4_weigh
 typedef struct {
     ds4_gpu_tensor *t;
     uint64_t bytes;
+    ds4_gpu_tensor *pooled;     /* the recycled allocation, when t still is it */
 } dsv41_gpu_buf;
+
+/* Scratch the GPU alone touches is recycled by size: the queue runs in order, so a buffer
+ * freed once its dispatches are encoded can back the next layer's without a wait, and a
+ * chunk stops creating gigabytes of fresh buffers per layer.  Buffers the host writes take
+ * fresh memory (dsv41_gpu_buf_alloc_host), since an earlier user may still be in flight. */
+#define DSV41_GPU_POOL_MAX 96
+static struct { ds4_gpu_tensor *t; uint64_t bytes; } g_dsv41_gpu_pool[DSV41_GPU_POOL_MAX];
+static uint32_t g_dsv41_gpu_pool_n;
+static pthread_mutex_t g_dsv41_gpu_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static bool dsv41_gpu_buf_alloc_host(dsv41_gpu_buf *b, uint64_t n_floats) {
+    b->bytes = n_floats * sizeof(float);
+    b->pooled = NULL;
+    b->t = ds4_gpu_tensor_alloc(b->bytes);
+    return b->t != NULL;
+}
 
 static bool dsv41_gpu_buf_alloc(dsv41_gpu_buf *b, uint64_t n_floats) {
     b->bytes = n_floats * sizeof(float);
-    b->t = ds4_gpu_tensor_alloc(b->bytes);
+    b->t = NULL;
+    pthread_mutex_lock(&g_dsv41_gpu_pool_mu);
+    for (uint32_t i = 0; i < g_dsv41_gpu_pool_n; i++) {
+        if (g_dsv41_gpu_pool[i].bytes != b->bytes) continue;
+        b->t = g_dsv41_gpu_pool[i].t;
+        g_dsv41_gpu_pool[i] = g_dsv41_gpu_pool[--g_dsv41_gpu_pool_n];
+        break;
+    }
+    pthread_mutex_unlock(&g_dsv41_gpu_pool_mu);
+    if (!b->t) b->t = ds4_gpu_tensor_alloc(b->bytes);
+    b->pooled = b->t;
     return b->t != NULL;
+}
+
+static void dsv41_gpu_buf_free(dsv41_gpu_buf *b) {
+    ds4_gpu_tensor *t = b->t;
+    b->t = NULL;
+    if (!t) return;
+    if (t != b->pooled) { ds4_gpu_tensor_free(t); return; }
+    b->pooled = NULL;
+    pthread_mutex_lock(&g_dsv41_gpu_pool_mu);
+    if (g_dsv41_gpu_pool_n == DSV41_GPU_POOL_MAX) {
+        /* full: the smallest entry goes, the large ones are the costly allocations */
+        uint32_t k = 0;
+        for (uint32_t i = 1; i < g_dsv41_gpu_pool_n; i++)
+            if (g_dsv41_gpu_pool[i].bytes < g_dsv41_gpu_pool[k].bytes) k = i;
+        if (g_dsv41_gpu_pool[k].bytes < b->bytes) {
+            ds4_gpu_tensor_free(g_dsv41_gpu_pool[k].t);
+            g_dsv41_gpu_pool[k] = g_dsv41_gpu_pool[--g_dsv41_gpu_pool_n];
+        }
+    }
+    if (g_dsv41_gpu_pool_n < DSV41_GPU_POOL_MAX) {
+        g_dsv41_gpu_pool[g_dsv41_gpu_pool_n].t = t;
+        g_dsv41_gpu_pool[g_dsv41_gpu_pool_n++].bytes = b->bytes;
+        t = NULL;
+    }
+    pthread_mutex_unlock(&g_dsv41_gpu_pool_mu);
+    if (t) ds4_gpu_tensor_free(t);
+}
+
+static void dsv41_gpu_pool_drain(void) {
+    pthread_mutex_lock(&g_dsv41_gpu_pool_mu);
+    for (uint32_t i = 0; i < g_dsv41_gpu_pool_n; i++) ds4_gpu_tensor_free(g_dsv41_gpu_pool[i].t);
+    g_dsv41_gpu_pool_n = 0;
+    pthread_mutex_unlock(&g_dsv41_gpu_pool_mu);
 }
 
 static bool dsv41_gpu_buf_put(dsv41_gpu_buf *b, const float *src, uint64_t n) {
@@ -69087,8 +69147,8 @@ static bool dsv41_gpu_moe_fused(const ds4_model *m, const ds4_layer_weights *l, 
     }
 
 done:
-    ds4_gpu_tensor_free(b_g.t); ds4_gpu_tensor_free(b_u.t); ds4_gpu_tensor_free(b_mid.t);
-    ds4_gpu_tensor_free(b_dn.t); ds4_gpu_tensor_free(b_sh.t); ds4_gpu_tensor_free(b_sa.t);
+    dsv41_gpu_buf_free(&b_g); dsv41_gpu_buf_free(&b_u); dsv41_gpu_buf_free(&b_mid);
+    dsv41_gpu_buf_free(&b_dn); dsv41_gpu_buf_free(&b_sh); dsv41_gpu_buf_free(&b_sa);
     return ok;
 }
 
@@ -69118,7 +69178,7 @@ static bool dsv41_gpu_moe_step(const ds4_model *m, const ds4_weights *w, uint32_
     float *wt_all = NULL;
 
     ok = ok && dsv41_gpu_buf_alloc(&b_log, (uint64_t)rows * n_exp);
-    ok = ok && dsv41_gpu_buf_alloc(&b_bias, n_exp);
+    ok = ok && dsv41_gpu_buf_alloc_host(&b_bias, n_exp);
     ok = ok && dsv41_gpu_buf_alloc(&b_w, (uint64_t)rows * topk);
     if (!fused) {
         idx_all = xmalloc((size_t)rows * topk * sizeof(int32_t));
@@ -69193,9 +69253,9 @@ static bool dsv41_gpu_moe_step(const ds4_model *m, const ds4_weights *w, uint32_
     }
 
 done:
-    ds4_gpu_tensor_free(b_log.t); ds4_gpu_tensor_free(b_bias.t); ds4_gpu_tensor_free(b_w.t);
-    ds4_gpu_tensor_free(b_g.t); ds4_gpu_tensor_free(b_u.t); ds4_gpu_tensor_free(b_act.t);
-    ds4_gpu_tensor_free(b_e.t);
+    dsv41_gpu_buf_free(&b_log); dsv41_gpu_buf_free(&b_bias); dsv41_gpu_buf_free(&b_w);
+    dsv41_gpu_buf_free(&b_g); dsv41_gpu_buf_free(&b_u); dsv41_gpu_buf_free(&b_act);
+    dsv41_gpu_buf_free(&b_e);
     if (t_idx) ds4_gpu_tensor_free(t_idx);
     free(idx_all); free(wt_all);
     if (replicated) ds4_gpu_tp_suspend_expert_sharding(0);
@@ -69255,6 +69315,26 @@ static bool dsv41_gpu_engram_open(dsv41_gpu_engram *g, const dsv41_ref_engram *e
  * dsv41_ref_engram_inject holds in the CPU reference.  The rows are gathered on the host
  * for every token, then wkv runs once over the chunk and the gate takes a token per
  * threadgroup row.  `stream` is updated in place. */
+struct dsv41_engram_gather {
+    const dsv41_ref_engram *eng;
+    uint32_t li, pos0, in_dim;
+    float *emb;
+};
+
+/* the rows of a chunk hash independently, so the gather spreads over the pool */
+static void dsv41_engram_gather_rows(void *ctx, uint64_t r0, uint64_t r1) {
+    const struct dsv41_engram_gather *g = ctx;
+    for (uint64_t t = r0; t < r1; t++) {
+        float *row = g->emb + (size_t)t * g->in_dim;
+        if (engram_table_owned(g->li)) {
+            engram_lookup(g->eng->m, g->eng->w, g->eng->h, g->li, g->eng->ids, g->eng->dead,
+                          g->pos0 + (uint32_t)t, row);
+        } else {
+            engram_peer_lookup(g->eng->h, g->li, g->pos0 + (uint32_t)t, row);
+        }
+    }
+}
+
 static bool dsv41_gpu_engram_step(const dsv41_ref_engram *eng, const dsv41_gpu_engram *g,
                                   uint32_t il, uint32_t pos0, uint32_t n_tok,
                                   ds4_gpu_tensor *stream) {
@@ -69267,18 +69347,12 @@ static bool dsv41_gpu_engram_step(const dsv41_ref_engram *eng, const dsv41_gpu_e
         dsv41_gpu_buf b_emb = {0}, b_kv = {0}, b_gate = {0};
         ds4_gpu_tensor *t_dead = ds4_gpu_tensor_alloc((uint64_t)n_tok * sizeof(int32_t));
         float *emb = xmalloc((size_t)n_tok * in_dim * sizeof(float));
-        for (uint32_t t = 0; t < n_tok; t++) {
-            if (engram_table_owned(li)) {
-                engram_lookup(eng->m, eng->w, eng->h, li, eng->ids, eng->dead, pos0 + t,
-                              emb + (size_t)t * in_dim);
-            } else {
-                engram_peer_lookup(eng->h, li, pos0 + t, emb + (size_t)t * in_dim);
-            }
-        }
+        struct dsv41_engram_gather gather = { eng, li, pos0, in_dim, emb };
+        ds4_parallel_for(n_tok, dsv41_engram_gather_rows, &gather);
         ok = t_dead != NULL &&
              ds4_gpu_tensor_write(t_dead, 0, eng->dead + pos0,
                                   (uint64_t)n_tok * sizeof(int32_t)) != 0 &&
-             dsv41_gpu_buf_alloc(&b_emb, (uint64_t)n_tok * in_dim) &&
+             dsv41_gpu_buf_alloc_host(&b_emb, (uint64_t)n_tok * in_dim) &&
              dsv41_gpu_buf_put(&b_emb, emb, (uint64_t)n_tok * in_dim) &&
              dsv41_gpu_buf_alloc(&b_kv, (uint64_t)n_tok * dim * (hc + 1u)) &&
              dsv41_gpu_buf_alloc(&b_gate, (uint64_t)n_tok * hc);
@@ -69288,8 +69362,8 @@ static bool dsv41_gpu_engram_step(const dsv41_ref_engram *eng, const dsv41_gpu_e
                                         g->wkv[li]) != 0;
         free(emb);
         ds4_gpu_tensor_free(t_dead);
-        ds4_gpu_tensor_free(b_emb.t); ds4_gpu_tensor_free(b_kv.t);
-        ds4_gpu_tensor_free(b_gate.t);
+        dsv41_gpu_buf_free(&b_emb); dsv41_gpu_buf_free(&b_kv);
+        dsv41_gpu_buf_free(&b_gate);
     }
     return ok;
 }
@@ -69598,8 +69672,8 @@ static bool dsv41_gpu_compress_chunk(const ds4_model *m, const ds4_layer_weights
                 }
             }
         } else {
-            ok = ok && dsv41_gpu_buf_alloc(&b_kv, (uint64_t)total * hd) &&
-                 dsv41_gpu_buf_alloc(&b_sc, (uint64_t)total * hd);
+            ok = ok && dsv41_gpu_buf_alloc_host(&b_kv, (uint64_t)total * hd) &&
+                 dsv41_gpu_buf_alloc_host(&b_sc, (uint64_t)total * hd);
             if (ok && lead) {
                 ok = dsv41_gpu_buf_put(&b_kv, kvs, (uint64_t)lead * hd) &&
                      dsv41_gpu_buf_put(&b_sc, scs, (uint64_t)lead * hd);
@@ -69656,8 +69730,8 @@ static bool dsv41_gpu_compress_chunk(const ds4_model *m, const ds4_layer_weights
         if (ok) st->n_comp[il] = g0 + n_lat;
     }
     if (win_gpu) { ds4_gpu_tensor_free(lat); ds4_gpu_tensor_free(ik); }
-    ds4_gpu_tensor_free(b_kv.t); ds4_gpu_tensor_free(b_sc.t);
-    ds4_gpu_tensor_free(b_lat.t); ds4_gpu_tensor_free(b_ik.t);
+    dsv41_gpu_buf_free(&b_kv); dsv41_gpu_buf_free(&b_sc);
+    dsv41_gpu_buf_free(&b_lat); dsv41_gpu_buf_free(&b_ik);
     return ok;
 }
 
@@ -69715,7 +69789,7 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
 
     bool ok = true;
     dsv41_gpu_buf b_x_all = {0}, b_qa = {0}, b_qr_all = {0}, b_q_all = {0}, b_kv_all = {0};
-    dsv41_gpu_buf b_low = {0}, b_out = {0}, b_stream = { stream_t, 0 }, b_mix = { mix_t, 0 };
+    dsv41_gpu_buf b_low = {0}, b_out = {0}, b_stream = { stream_t, 0, NULL }, b_mix = { mix_t, 0, NULL };
     dsv41_gpu_buf b_post = {0}, b_comb = {0}, b_attnpre = {0}, b_moe = {0};
     dsv41_gpu_buf b_iq_all = {0}, b_wts_all = {0}, b_join = {0}, b_ikall = {0}, b_sc = {0};
     ds4_gpu_tensor *t_widx = NULL, *t_idx = NULL;
@@ -69935,7 +70009,7 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
                                                      DS4_N_INDEXER_TOP_K, 0, 0, b_scores.t, t_keep,
                                                      v_pick, win_gpu->rstate, win_gpu->rhist) != 0;
             }
-            ds4_gpu_tensor_free(b_scores.t); ds4_gpu_tensor_free(t_keep);
+            dsv41_gpu_buf_free(&b_scores); ds4_gpu_tensor_free(t_keep);
             ds4_gpu_tensor_free(v_iq); ds4_gpu_tensor_free(v_wts); ds4_gpu_tensor_free(v_pick);
             ds4_gpu_tensor_free(v_bs); ds4_gpu_tensor_free(v_bk); ds4_gpu_tensor_free(v_cand);
         }
@@ -69953,9 +70027,9 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
     float *ring = st->window_kv + (size_t)il * win * hd;
     if (!ring_t) {
         dsv41_gpu_buf b_kv = { ds4_gpu_tensor_view(b_kv_all.t,
-                (uint64_t)t * hd * sizeof(float), (uint64_t)hd * sizeof(float)), 0 };
+                (uint64_t)t * hd * sizeof(float), (uint64_t)hd * sizeof(float)), 0, NULL };
         ok = b_kv.t && dsv41_gpu_buf_get(&b_kv, ring + (size_t)(pos % win) * hd, hd);
-        ds4_gpu_tensor_free(b_kv.t);
+        dsv41_gpu_buf_free(&b_kv);
         if (!ok) break;
     }
 
@@ -69965,16 +70039,16 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
         const uint32_t topk_i = DS4_N_INDEXER_TOP_K < clen ? DS4_N_INDEXER_TOP_K : clen;
         float *scores = xmalloc((size_t)clen * sizeof(float));
         dsv41_gpu_buf b_iq = { ds4_gpu_tensor_view(b_iq_all.t,
-                (uint64_t)t * ih * idim * sizeof(float), (uint64_t)ih * idim * sizeof(float)), 0 };
+                (uint64_t)t * ih * idim * sizeof(float), (uint64_t)ih * idim * sizeof(float)), 0, NULL };
         dsv41_gpu_buf b_wts = { ds4_gpu_tensor_view(b_wts_all.t,
-                (uint64_t)t * ih * sizeof(float), (uint64_t)ih * sizeof(float)), 0 };
+                (uint64_t)t * ih * sizeof(float), (uint64_t)ih * sizeof(float)), 0, NULL };
         ok = b_iq.t && b_wts.t;
         if (win_gpu) {
             b_sc = win_gpu->sc;
             b_ikall.t = win_gpu->ikey[src];     /* already on the device, nothing to copy */
         } else {
             ok = ok && dsv41_gpu_buf_alloc(&b_sc, clen);
-            ok = ok && dsv41_gpu_buf_alloc(&b_ikall, (uint64_t)clen * idim);
+            ok = ok && dsv41_gpu_buf_alloc_host(&b_ikall, (uint64_t)clen * idim);
             ok = ok && dsv41_gpu_buf_put(&b_ikall,
                     st->index_k + (size_t)src * st->max_pos * idim, (uint64_t)clen * idim);
         }
@@ -69991,10 +70065,10 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
                                    g_ds4_candidate_source_layer < il);
         }
         free(scores);
-        ds4_gpu_tensor_free(b_iq.t); ds4_gpu_tensor_free(b_wts.t);
+        dsv41_gpu_buf_free(&b_iq); dsv41_gpu_buf_free(&b_wts);
         if (!win_gpu) {
-            ds4_gpu_tensor_free(b_sc.t); b_sc.t = NULL;
-            ds4_gpu_tensor_free(b_ikall.t); b_ikall.t = NULL;
+            dsv41_gpu_buf_free(&b_sc); b_sc.t = NULL;
+            dsv41_gpu_buf_free(&b_ikall); b_ikall.t = NULL;
         }
         if (!ok) break;
     }
@@ -70012,7 +70086,7 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
     ds4_gpu_tensor *kv_win = ring_t;
     ds4_gpu_tensor *kv_cmp = (win_gpu && clen) ? win_gpu->ckv[src] : NULL;
     if (!win_gpu) {
-        ok = dsv41_gpu_buf_alloc(&b_join, (uint64_t)n_kv * hd);
+        ok = dsv41_gpu_buf_alloc_host(&b_join, (uint64_t)n_kv * hd);
         ok = ok && dsv41_gpu_buf_put(&b_join, ring, (uint64_t)win * hd);
         if (ok && clen) {
             ok = ds4_gpu_tensor_write(b_join.t, (uint64_t)win * hd * sizeof(float),
@@ -70023,7 +70097,7 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
         kv_cmp = NULL;      /* one contiguous array, so every id addresses it */
     }
     dsv41_gpu_buf b_q = { ds4_gpu_tensor_view(b_q_all.t,
-            (uint64_t)t * nh * hd * sizeof(float), (uint64_t)nh * hd * sizeof(float)), 0 };
+            (uint64_t)t * nh * hd * sizeof(float), (uint64_t)nh * hd * sizeof(float)), 0, NULL };
     t_idx = ds4_gpu_tensor_alloc((uint64_t)topk * sizeof(int32_t));
     ok = ok && b_q.t && t_idx != NULL &&
          ds4_gpu_tensor_write(t_idx, 0, idxs, (uint64_t)topk * sizeof(int32_t)) != 0;
@@ -70032,9 +70106,9 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
                                          1.0f / sqrtf((float)hd),
                                          b_q.t, kv_win, kv_cmp, k->sink, t_idx, topk, NULL,
                                          b_q.t) != 0;
-    ds4_gpu_tensor_free(b_q.t);
+    dsv41_gpu_buf_free(&b_q);
     ds4_gpu_tensor_free(t_idx); t_idx = NULL;
-    ds4_gpu_tensor_free(b_join.t); b_join.t = NULL;
+    dsv41_gpu_buf_free(&b_join); b_join.t = NULL;
     }
     if (!ok) goto done;
 
@@ -70110,15 +70184,15 @@ static bool dsv41_gpu_attn_step(const ds4_model *m, const ds4_weights *w, uint32
     if (ok && out) ok = dsv41_gpu_buf_get(&b_stream, out, (uint64_t)n_tok * hc_dim);
 
 done:
-    ds4_gpu_tensor_free(b_x_all.t); ds4_gpu_tensor_free(b_qa.t);
-    ds4_gpu_tensor_free(b_qr_all.t);
-    ds4_gpu_tensor_free(b_q_all.t); ds4_gpu_tensor_free(b_kv_all.t);
-    ds4_gpu_tensor_free(b_low.t); ds4_gpu_tensor_free(b_out.t);
-    if (!win_gpu) { ds4_gpu_tensor_free(b_join.t); ds4_gpu_tensor_free(b_ikall.t);
-                    ds4_gpu_tensor_free(b_sc.t); }
-    ds4_gpu_tensor_free(b_post.t); ds4_gpu_tensor_free(b_comb.t);
-    ds4_gpu_tensor_free(b_iq_all.t); ds4_gpu_tensor_free(b_wts_all.t);
-    ds4_gpu_tensor_free(b_moe.t); ds4_gpu_tensor_free(b_attnpre.t);
+    dsv41_gpu_buf_free(&b_x_all); dsv41_gpu_buf_free(&b_qa);
+    dsv41_gpu_buf_free(&b_qr_all);
+    dsv41_gpu_buf_free(&b_q_all); dsv41_gpu_buf_free(&b_kv_all);
+    dsv41_gpu_buf_free(&b_low); dsv41_gpu_buf_free(&b_out);
+    if (!win_gpu) { dsv41_gpu_buf_free(&b_join); dsv41_gpu_buf_free(&b_ikall);
+                    dsv41_gpu_buf_free(&b_sc); }
+    dsv41_gpu_buf_free(&b_post); dsv41_gpu_buf_free(&b_comb);
+    dsv41_gpu_buf_free(&b_iq_all); dsv41_gpu_buf_free(&b_wts_all);
+    dsv41_gpu_buf_free(&b_moe); dsv41_gpu_buf_free(&b_attnpre);
     ds4_gpu_tensor_free(t_widx); ds4_gpu_tensor_free(t_idx); ds4_gpu_tensor_free(kv_slot);
     free(widx);
     if (k == &own) {
@@ -70267,7 +70341,7 @@ static bool dsv41_gpu_draft_pending(const ds4_model *m, const ds4_weights *w,
              ds4_gpu_dsv41_rope(n_tok, 1, hd, rd, pos0, 0, v, rope0->cos, rope0->sin);
         ds4_gpu_tensor_free(v);
     }
-    ds4_gpu_tensor_free(b_mx.t); ds4_gpu_tensor_free(b_tmp.t);
+    dsv41_gpu_buf_free(&b_mx); dsv41_gpu_buf_free(&b_tmp);
     if (ok) { g->mh_pos0 = pos0; g->mh_rows = n_tok; }
     return ok;
 }
@@ -70335,8 +70409,8 @@ static bool dsv41_gpu_draft_propose(const ds4_model *m, const ds4_weights *w, ds
     const uint64_t al0 = trace ? ds4_gpu_tensor_alloc_count() : 0;
     const bool batched = ds4_gpu_begin_commands() != 0;
     bool ok = t_tok && ds4_gpu_tensor_write(t_tok, 0, &t0, sizeof(int32_t)) != 0 &&
-              dsv41_gpu_buf_alloc(&b_st, (uint64_t)B * hc_dim) && dsv41_gpu_buf_put(&b_st, stream, (uint64_t)B * hc_dim) &&
-              dsv41_gpu_buf_alloc(&b_mix, (uint64_t)B * hc) && dsv41_gpu_buf_put(&b_mix, mix, (uint64_t)B * hc) &&
+              dsv41_gpu_buf_alloc_host(&b_st, (uint64_t)B * hc_dim) && dsv41_gpu_buf_put(&b_st, stream, (uint64_t)B * hc_dim) &&
+              dsv41_gpu_buf_alloc_host(&b_mix, (uint64_t)B * hc) && dsv41_gpu_buf_put(&b_mix, mix, (uint64_t)B * hc) &&
               dsv41_gpu_buf_alloc(&b_x, (uint64_t)B * dim) && dsv41_gpu_buf_alloc(&b_xn, (uint64_t)B * dim) &&
               dsv41_gpu_buf_alloc(&b_lg, (uint64_t)B * vocab) && dsv41_gpu_buf_alloc(&b_conf, B) &&
               dsv41_gpu_buf_alloc(&b_parts, 2u * n_parts);
@@ -70363,9 +70437,9 @@ static bool dsv41_gpu_draft_propose(const ds4_model *m, const ds4_weights *w, ds
                 (unsigned long long)(ds4_gpu_tensor_alloc_count() - al0));
     }
     ds4_gpu_tensor_free(t_tok);
-    ds4_gpu_tensor_free(b_st.t); ds4_gpu_tensor_free(b_mix.t); ds4_gpu_tensor_free(b_x.t);
-    ds4_gpu_tensor_free(b_xn.t); ds4_gpu_tensor_free(b_lg.t); ds4_gpu_tensor_free(b_conf.t);
-    ds4_gpu_tensor_free(b_parts.t);
+    dsv41_gpu_buf_free(&b_st); dsv41_gpu_buf_free(&b_mix); dsv41_gpu_buf_free(&b_x);
+    dsv41_gpu_buf_free(&b_xn); dsv41_gpu_buf_free(&b_lg); dsv41_gpu_buf_free(&b_conf);
+    dsv41_gpu_buf_free(&b_parts);
     free(stream); free(mix);
     return ok;
 }
@@ -70373,6 +70447,10 @@ static bool dsv41_gpu_draft_propose(const ds4_model *m, const ds4_weights *w, ds
 /* `logits` receives the last `n_logit_rows` positions' rows.  With drafting on, the pass
  * also projects its positions' main_kv; `commit_draft` puts them in the stage rings now,
  * a verify pass commits only what it accepts. */
+/* Set by the prefill loop: a chunk without logits to read leaves its batch open and
+ * committed, so the host prepares the next chunk while the GPU is still on this one. */
+static bool g_dsv41_batch_carry;
+
 static bool dsv41_gpu_forward_rows(const ds4_model *m, const ds4_weights *w,
                                    dsv41_ref_state *st, const int *tokens,
                                    uint32_t n_tok, uint32_t pos0,
@@ -70392,8 +70470,8 @@ static bool dsv41_gpu_forward_rows(const ds4_model *m, const ds4_weights *w,
     float *stream = NULL, *pre_mix = NULL;
     dsv41_gpu_buf b_st = {0}, b_mix = {0};
 
-    ok = dsv41_gpu_buf_alloc(&b_st, (uint64_t)n_tok * hc_dim) &&
-         dsv41_gpu_buf_alloc(&b_mix, (uint64_t)n_tok * hc);
+    ok = dsv41_gpu_buf_alloc_host(&b_st, (uint64_t)n_tok * hc_dim) &&
+         dsv41_gpu_buf_alloc_host(&b_mix, (uint64_t)n_tok * hc);
     if (phase != DSV41_PHASE_DECODE) {
         stream = xmalloc((size_t)n_tok * hc_dim * sizeof(float));
         pre_mix = xmalloc((size_t)n_tok * hc * sizeof(float));
@@ -70428,7 +70506,7 @@ static bool dsv41_gpu_forward_rows(const ds4_model *m, const ds4_weights *w,
     static int flush_every = -1;
     if (flush_every < 0) {
         const char *env = getenv("DS4_DSV41_FLUSH_LAYERS");
-        flush_every = env && env[0] ? atoi(env) : 8;
+        flush_every = env && env[0] ? atoi(env) : 4;
     }
     for (uint32_t il = l0; il < l1 && ok; il++) {
         const dsv41_gpu_rope *r = ds4_layer_compress_ratio(il) ? ropec : rope0;
@@ -70440,7 +70518,7 @@ static bool dsv41_gpu_forward_rows(const ds4_model *m, const ds4_weights *w,
         ok = ok && dsv41_gpu_attn_step(m, w, il, st, b_st.t, b_mix.t, pos0, n_tok,
                                        r->cos, r->sin, NULL,
                                        (eng && eng->m) ? &gc : NULL, ge, win_gpu, mode);
-        if (ok && batched && flush_every > 0 && (il - l0 + 1u) % (uint32_t)flush_every == 0)
+        if (ok && ds4_gpu_commands_active() && flush_every > 0 && (il - l0 + 1u) % (uint32_t)flush_every == 0)
             (void)ds4_gpu_flush_commands();
     }
     if (phase == DSV41_PHASE_ENCODE) {
@@ -70474,20 +70552,21 @@ static bool dsv41_gpu_forward_rows(const ds4_model *m, const ds4_weights *w,
         ds4_gpu_tensor_free(v_st); ds4_gpu_tensor_free(v_mx);
         ok = ok && dsv41_gpu_matvec(m, w->output, w->output->abs_offset, dim, DS4_N_VOCAB,
                                     rows, b_x.t, b_lg.t);
-        ds4_gpu_tensor_free(b_x.t);
+        dsv41_gpu_buf_free(&b_x);
     }
     const double tr1 = trace ? now_sec() : 0.0;
     /* the batch ends once, and the logits are read after it rather than by draining and
      * reopening it, which committed an empty batch on top */
-    if (batched) ok = ds4_gpu_end_commands() != 0 && ok;
+    if (batched) ok = (g_dsv41_batch_carry && !b_lg.t ? ds4_gpu_flush_commands() : ds4_gpu_end_commands()) != 0 && ok;
+    else if (b_lg.t && ds4_gpu_commands_active()) ok = ds4_gpu_end_commands() != 0 && ok;
     if (ok && b_lg.t) ok = ds4_gpu_tensor_read(b_lg.t, 0, logits, (uint64_t)n_logit_rows_done * DS4_N_VOCAB * sizeof(float)) != 0;
-    ds4_gpu_tensor_free(b_lg.t);
+    dsv41_gpu_buf_free(&b_lg);
     if (trace) {
         fprintf(stderr, "ds4: V4.1 pass rows=%u encode %.1f ms head %.1f ms wait %.1f ms allocs %llu\n",
                 n_tok, (tr_head - tr0) * 1000.0, (tr1 - tr_head) * 1000.0, (now_sec() - tr1) * 1000.0,
                 (unsigned long long)(ds4_gpu_tensor_alloc_count() - al0));
     }
-    ds4_gpu_tensor_free(b_st.t); ds4_gpu_tensor_free(b_mix.t);
+    dsv41_gpu_buf_free(&b_st); dsv41_gpu_buf_free(&b_mix);
     free(stream);
     free(pre_mix);
     return ok;
@@ -70541,9 +70620,11 @@ static int dsv41_gpu_prefill(const ds4_model *m, const ds4_weights *w,
         if (!dsv41_gpu_ced_open(ced, replay)) split = false;
     }
 
+    const bool outer_batch = ds4_gpu_commands_active();
     for (uint32_t i = 0; i < n && status == DSV41_PREFILL_OK; i += chunk) {
         const uint32_t k = n - i < chunk ? n - i : chunk;
         const bool last = i + k == n;
+        g_dsv41_batch_carry = !outer_batch;
         if (!dsv41_gpu_forward_token(m, w, st, tokens + i, k, pos0 + i, eng, ge,
                                      rope0, ropec, win_gpu,
                                      (last && !split) ? logits : NULL,
@@ -70554,6 +70635,8 @@ static int dsv41_gpu_prefill(const ds4_model *m, const ds4_weights *w,
             status = DSV41_PREFILL_STOPPED;
         }
     }
+    g_dsv41_batch_carry = false;
+    if (!outer_batch && ds4_gpu_commands_active()) ds4_gpu_end_commands();
     if (split) {
         for (uint32_t i = n - replay; i < n && status == DSV41_PREFILL_OK; i += chunk) {
             const uint32_t k = n - i < chunk ? n - i : chunk;
@@ -74103,12 +74186,12 @@ after_cpu_done:;
         dsv41_gpu_rope rope = {0};
         dsv41_gpu_buf b_st = {0}, b_mx = {0};
         ok = dsv41_gpu_rope_open(&rope, f) &&
-             dsv41_gpu_buf_alloc(&b_st, hc_dim) && dsv41_gpu_buf_put(&b_st, gpu_in, hc_dim) &&
-             dsv41_gpu_buf_alloc(&b_mx, hc) && dsv41_gpu_buf_put(&b_mx, identity, hc) &&
+             dsv41_gpu_buf_alloc_host(&b_st, hc_dim) && dsv41_gpu_buf_put(&b_st, gpu_in, hc_dim) &&
+             dsv41_gpu_buf_alloc_host(&b_mx, hc) && dsv41_gpu_buf_put(&b_mx, identity, hc) &&
              dsv41_gpu_attn_step(&m, &w, il, &st, b_st.t, b_mx.t, pos, 1u,
                                  rope.cos, rope.sin, gpu,
                                  ec ? &gc : NULL, &ge, NULL, DSV41_BLOCK_FULL) ? 1 : 0;
-        ds4_gpu_tensor_free(b_st.t); ds4_gpu_tensor_free(b_mx.t);
+        dsv41_gpu_buf_free(&b_st); dsv41_gpu_buf_free(&b_mx);
         dsv41_gpu_rope_close(&rope);
         free(identity);
         if (ok && state_err) {
@@ -76932,6 +77015,7 @@ void ds4_engine_close(ds4_engine *e) {
     if (e->engram_model.map) model_close(&e->engram_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
+    dsv41_gpu_pool_drain();
     if (e->shared_prefill_workspace_ready) {
         metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
         e->shared_prefill_workspace_ready = false;
