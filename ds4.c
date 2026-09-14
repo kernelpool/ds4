@@ -7690,11 +7690,23 @@ static void engram_hash_rows(const dsv41_engram_hash *h, uint32_t li, const int3
 
 /* Dequantizes one f8_e4m3 table row.  This is the only read of the 100 GB mapping per
  * bucket, so it stays a direct page-cache read with no staging copy. */
+/* DS4_DSV41_TRACE counts the rows whose page was not resident before the read */
+static int g_engram_probe = -1;
+static uint64_t g_engram_rows, g_engram_cold;
+
 static void engram_gather_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out) {
     const uint32_t dim = DS4_N_ENGRAM_HEAD_DIM;
     if (row >= t->dim[1]) ds4_die("engram row index is outside the table");
     const uint64_t row_bytes = (uint64_t)(dim / QK_E4M3) * sizeof(block_e4m3);
     const uint8_t *base = (const uint8_t *)tensor_data(m, t) + row * row_bytes;
+    if (g_engram_probe < 0) g_engram_probe = getenv("DS4_DSV41_TRACE") != NULL;
+    if (g_engram_probe) {
+        char vec = 0;
+        const uintptr_t page = (uintptr_t)base & ~((uintptr_t)getpagesize() - 1u);
+        __atomic_fetch_add(&g_engram_rows, 1, __ATOMIC_RELAXED);
+        if (mincore((void *)page, 1, &vec) == 0 && !(vec & MINCORE_INCORE))
+            __atomic_fetch_add(&g_engram_cold, 1, __ATOMIC_RELAXED);
+    }
     ds4_dequant_e4m3_row((const block_e4m3 *)base, dim, out);
 }
 
@@ -69319,20 +69331,31 @@ struct dsv41_engram_gather {
     const dsv41_ref_engram *eng;
     uint32_t li, pos0, in_dim;
     float *emb;
+    int64_t *rows;              /* n_tok x n_bucket table rows, hashed up front */
 };
 
-/* the rows of a chunk hash independently, so the gather spreads over the pool */
-static void dsv41_engram_gather_rows(void *ctx, uint64_t r0, uint64_t r1) {
+/* one (token, bucket) row per item: a cold row is a page read, and a token's 24 rows
+ * are as independent as a chunk's tokens, so even a decode step spreads over the pool */
+static void dsv41_engram_gather_items(void *ctx, uint64_t i0, uint64_t i1) {
     const struct dsv41_engram_gather *g = ctx;
-    for (uint64_t t = r0; t < r1; t++) {
-        float *row = g->emb + (size_t)t * g->in_dim;
-        if (engram_table_owned(g->li)) {
-            engram_lookup(g->eng->m, g->eng->w, g->eng->h, g->li, g->eng->ids, g->eng->dead,
-                          g->pos0 + (uint32_t)t, row);
-        } else {
-            engram_peer_lookup(g->eng->h, g->li, g->pos0 + (uint32_t)t, row);
-        }
+    const uint32_t nb = g->eng->h->n_bucket;
+    for (uint64_t i = i0; i < i1; i++) {
+        const uint64_t t = i / nb, b = i % nb;
+        engram_gather_row(g->eng->m, g->eng->w->embed[g->li], (uint64_t)g->rows[i],
+                          g->emb + (size_t)t * g->in_dim + b * DS4_N_ENGRAM_HEAD_DIM);
     }
+}
+
+static void dsv41_engram_gather(struct dsv41_engram_gather *g, uint32_t n_tok) {
+    const dsv41_engram_hash *h = g->eng->h;
+    if (!engram_table_owned(g->li)) {
+        for (uint32_t t = 0; t < n_tok; t++)
+            engram_peer_lookup(h, g->li, g->pos0 + t, g->emb + (size_t)t * g->in_dim);
+        return;
+    }
+    for (uint32_t t = 0; t < n_tok; t++)
+        engram_hash_rows(h, g->li, g->eng->ids, g->eng->dead, g->pos0 + t, g->rows + (size_t)t * h->n_bucket);
+    ds4_parallel_for_min_rows((uint64_t)n_tok * h->n_bucket, dsv41_engram_gather_items, g, h->n_bucket);
 }
 
 static bool dsv41_gpu_engram_step(const dsv41_ref_engram *eng, const dsv41_gpu_engram *g,
@@ -69347,8 +69370,10 @@ static bool dsv41_gpu_engram_step(const dsv41_ref_engram *eng, const dsv41_gpu_e
         dsv41_gpu_buf b_emb = {0}, b_kv = {0}, b_gate = {0};
         ds4_gpu_tensor *t_dead = ds4_gpu_tensor_alloc((uint64_t)n_tok * sizeof(int32_t));
         float *emb = xmalloc((size_t)n_tok * in_dim * sizeof(float));
-        struct dsv41_engram_gather gather = { eng, li, pos0, in_dim, emb };
-        ds4_parallel_for(n_tok, dsv41_engram_gather_rows, &gather);
+        int64_t *rows = xmalloc((size_t)n_tok * eng->h->n_bucket * sizeof(int64_t));
+        struct dsv41_engram_gather gather = { eng, li, pos0, in_dim, emb, rows };
+        dsv41_engram_gather(&gather, n_tok);
+        free(rows);
         ok = t_dead != NULL &&
              ds4_gpu_tensor_write(t_dead, 0, eng->dead + pos0,
                                   (uint64_t)n_tok * sizeof(int32_t)) != 0 &&
@@ -70562,9 +70587,11 @@ static bool dsv41_gpu_forward_rows(const ds4_model *m, const ds4_weights *w,
     if (ok && b_lg.t) ok = ds4_gpu_tensor_read(b_lg.t, 0, logits, (uint64_t)n_logit_rows_done * DS4_N_VOCAB * sizeof(float)) != 0;
     dsv41_gpu_buf_free(&b_lg);
     if (trace) {
-        fprintf(stderr, "ds4: V4.1 pass rows=%u encode %.1f ms head %.1f ms wait %.1f ms allocs %llu\n",
+        fprintf(stderr, "ds4: V4.1 pass rows=%u encode %.1f ms head %.1f ms wait %.1f ms allocs %llu engram rows %llu cold %llu\n",
                 n_tok, (tr_head - tr0) * 1000.0, (tr1 - tr_head) * 1000.0, (now_sec() - tr1) * 1000.0,
-                (unsigned long long)(ds4_gpu_tensor_alloc_count() - al0));
+                (unsigned long long)(ds4_gpu_tensor_alloc_count() - al0),
+                (unsigned long long)g_engram_rows, (unsigned long long)g_engram_cold);
+        g_engram_rows = g_engram_cold = 0;
     }
     dsv41_gpu_buf_free(&b_st); dsv41_gpu_buf_free(&b_mix);
     free(stream);
@@ -74781,15 +74808,16 @@ static void engram_residency(ds4_engine *e, int policy) {
                 ds4_log(stderr, DS4_LOG_WARNING, "ds4: engram table %u: mlock failed (%s), keeping it mapped",
                         h->layer_id[li], strerror(errno));
             }
-#if defined(POSIX_MADV_WILLNEED)
-            (void)posix_madvise(p, n, POSIX_MADV_WILLNEED);
+            /* rows hash anywhere in the table: a fault brings its own page and nothing around it */
+#if defined(POSIX_MADV_RANDOM)
+            (void)posix_madvise(p, n, POSIX_MADV_RANDOM);
 #endif
         }
     }
     ds4_log(stderr, DS4_LOG_OK, "engram: rank %u of %u holds %.1f GiB of %u table%s, %s\n",
             g_engram_rank, g_engram_world, (double)owned / (1024.0 * 1024.0 * 1024.0),
             h->n_layer, h->n_layer == 1 ? "" : "s",
-            pinned ? "pinned" : "mapped with read-ahead");
+            pinned ? "pinned" : "rows read on demand");
     if (pinned) {
         ds4_log(stderr, DS4_LOG_OK, "engram: %.1f GiB pinned in %.1f s\n",
                 (double)pinned / (1024.0 * 1024.0 * 1024.0), now_sec() - t0);

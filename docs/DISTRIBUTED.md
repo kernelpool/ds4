@@ -100,7 +100,7 @@ the same options. The two engram tables are split by rank: each rank reads one
 table for both and swaps the rows with its peer before every pass, so a node
 touches half the sidecar. With `--engram-resident auto` (the default) a rank
 pins its table in memory when the node has room for it beside the model, and
-otherwise maps it with read-ahead; `on` and `off` force either. A DSpark block
+otherwise reads its rows on demand; `on` and `off` force either. A DSpark block
 is verified on both ranks in lockstep and the worker keeps the prefix the
 coordinator commits.
 
