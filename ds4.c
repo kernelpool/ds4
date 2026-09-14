@@ -68750,7 +68750,7 @@ static bool dsv41_env(const char *name, int *cache) {
     return *cache != 0;
 }
 static int g_dsv41_env_host_select = -1, g_dsv41_env_attn_only = -1;
-static int g_dsv41_env_moe_only = -1, g_dsv41_env_moe_grouped = -1;
+static int g_dsv41_env_moe_only = -1, g_dsv41_env_moe_exact = -1;
 static int g_dsv41_env_moe_per_token = -1, g_dsv41_env_moe_token_major = -1;
 
 /* A model-resident mat-vec at whatever precision the checkpoint stores: the mini model is
@@ -68996,14 +68996,13 @@ static bool dsv41_gpu_moe_fused(const ds4_model *m, const ds4_layer_weights *l, 
     const bool fold_shared = (topk == 6u) && shared_here;
 
     /* The grouped matmul launches a tile per (token, expert) pair where the decode kernels
-     * launch one thin row per token.  Opt-in for now: it stages the activations and the
-     * SwiGLU intermediate as half, which moves the released model's logits by ~5e-02
-     * relative against the per-token F32 path this chain is scored on, for 1.24x at chunk
-     * 512 and nothing at the default 64.  Above 1024 rows its scratch stops being
-     * allocatable. */
+     * launch one thin row per token.  It stages the activations and the SwiGLU intermediate
+     * as half, so decode, verify blocks and short appends keep the exact per-token paths
+     * below and prefill chunks take it from 256 rows, where the tiles fill (512 under the
+     * expert split, whose kernels start there); DS4_DSV41_MOE_EXACT keeps F32 throughout. */
     bool mid_f16 = false;
-    if (ok && rows > 1u && rows <= 1024u && !tp &&
-        dsv41_env("DS4_DSV41_MOE_GROUPED", &g_dsv41_env_moe_grouped) &&
+    if (ok && rows >= (tp ? 512u : 256u) && rows <= 8192u &&
+        !dsv41_env("DS4_DSV41_MOE_EXACT", &g_dsv41_env_moe_exact) &&
         ds4_gpu_routed_moe_batch_tensor(out, b_g.t, b_u.t, b_mid.t, b_dn.t,
                                         m->map, m->size,
                                         l->ffn_gate_exps->abs_offset,
@@ -70645,7 +70644,7 @@ static dsv41_session_state *dsv41_session_state_alloc(ds4_engine *e, uint32_t ct
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     const dsv41_draft_spec *dsp = dsv41_draft_spec_get(e);
     ss->cap = ctx + 1u;
-    ss->chunk = e->prefill_chunk ? e->prefill_chunk : 512u;
+    ss->chunk = e->prefill_chunk ? e->prefill_chunk : 4096u;
     if (ss->chunk > ctx) ss->chunk = ctx;
     dsv41_ref_state_init(&ss->st, n_trunk, ss->cap);
     ss->ids = xcalloc(ss->cap, sizeof(int32_t));

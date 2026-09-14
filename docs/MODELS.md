@@ -179,12 +179,14 @@ trunk's routed experts are split between the ranks and everything else is replic
 each rank holds half the experts plus the dense weights and the engram sidecar. Pass the
 same `--engram`, `--mtp-model` and DSpark options to the worker and the coordinator.
 
-Prefill runs in chunks of 512 tokens by default; `--prefill-chunk` changes it. A larger
+Prefill runs in chunks of 4096 tokens by default; `--prefill-chunk` changes it. A larger
 chunk helps very long prompts a little more, a smaller one trims the per-session scratch
-that scales with it, and the output does not depend on the choice. The
-compressed caches, index keys and selections stay on the GPU, so long contexts do not
-move data per token. Activations and the matrix kernels stay in F32 (`DS4_DSV41_HALF_MM=1`
-selects the half-precision tiles for comparison). Disk KV checkpoints and live prefix
+that scales with it. Chunks of 256 rows or more send the routed experts through the grouped
+matmul, which stages the activations and the SwiGLU intermediate as half; decode, the draft
+verify blocks and shorter appends keep the exact F32 kernels, and `DS4_DSV41_MOE_EXACT=1`
+keeps them for every chunk. The compressed caches, index keys and selections stay on the
+GPU, so long contexts do not move data per token. The other activations and matrix kernels
+stay in F32 (`DS4_DSV41_HALF_MM=1` selects the half-precision tiles for comparison). Disk KV checkpoints and live prefix
 reuse work as for the other models; a checkpoint carries the window, the compressed caches,
 the open compressor groups and the draft rings, and a session with another prefill chunk
 can load it.
