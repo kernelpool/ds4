@@ -9525,6 +9525,18 @@ int ds4_gpu_commands_active(void) {
     return g_batch_cb != nil;
 }
 
+void *ds4_gpu_commands_mark(void) {
+    id<MTLCommandBuffer> cb = [g_pending_cbs lastObject];
+    return cb ? (void *)CFBridgingRetain(cb) : NULL;
+}
+
+int ds4_gpu_commands_wait_mark(void *mark) {
+    if (!mark) return 1;
+    id<MTLCommandBuffer> cb = CFBridgingRelease(mark);
+    [cb waitUntilCompleted];
+    return cb.status == MTLCommandBufferStatusCompleted;
+}
+
 /* Exact M5 full-FFN overlap inside one concurrent compute encoder.  Shared
  * gate/up and routed IQ2 pair-SwiGLU launch together; explicit level barriers
  * precede the routed Q2 and shared Q8 down consumers. */

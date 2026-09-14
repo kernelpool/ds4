@@ -81,6 +81,10 @@ int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
+/* The command buffer a flush committed last; waiting on it covers everything committed
+ * before it.  A mark is released by the wait. */
+void *ds4_gpu_commands_mark(void);
+int ds4_gpu_commands_wait_mark(void *mark);
 #include "ds4_deepseek41_gpu.h"
 #ifdef __APPLE__
 int ds4_gpu_parallel_ffn_finish(void);

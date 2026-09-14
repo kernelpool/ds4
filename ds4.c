@@ -70647,7 +70647,13 @@ static int dsv41_gpu_prefill(const ds4_model *m, const ds4_weights *w,
         if (!dsv41_gpu_ced_open(ced, replay)) split = false;
     }
 
+    /* The batch carries across chunks, so a chunk's tick waits for the GPU to finish it
+     * while the next chunk is already queued: progress and cancellation follow the work,
+     * and the host stays at most one chunk ahead. */
     const bool outer_batch = ds4_gpu_commands_active();
+    void *mark = NULL;
+    uint32_t mark_end = 0;
+    bool mark_settled = false;
     for (uint32_t i = 0; i < n && status == DSV41_PREFILL_OK; i += chunk) {
         const uint32_t k = n - i < chunk ? n - i : chunk;
         const bool last = i + k == n;
@@ -70658,12 +70664,14 @@ static int dsv41_gpu_prefill(const ds4_model *m, const ds4_weights *w,
                                      split ? ced : NULL,
                                      split ? DSV41_PHASE_ENCODE : DSV41_PHASE_ALL)) {
             status = DSV41_PREFILL_FAIL;
-        } else if (tick && tick(ud, pos0 + i + k, total, !split)) {
-            status = DSV41_PREFILL_STOPPED;
+            break;
         }
+        void *next = ds4_gpu_commands_mark();
+        if (mark && !ds4_gpu_commands_wait_mark(mark)) status = DSV41_PREFILL_FAIL;
+        else if (mark && tick && tick(ud, mark_end, total, mark_settled)) status = DSV41_PREFILL_STOPPED;
+        mark = next; mark_end = pos0 + i + k; mark_settled = !split;
+        if (!mark && tick && tick(ud, mark_end, total, mark_settled)) status = DSV41_PREFILL_STOPPED;
     }
-    g_dsv41_batch_carry = false;
-    if (!outer_batch && ds4_gpu_commands_active()) ds4_gpu_end_commands();
     if (split) {
         for (uint32_t i = n - replay; i < n && status == DSV41_PREFILL_OK; i += chunk) {
             const uint32_t k = n - i < chunk ? n - i : chunk;
@@ -70672,10 +70680,22 @@ static int dsv41_gpu_prefill(const ds4_model *m, const ds4_weights *w,
                                          rope0, ropec, win_gpu, last ? logits : NULL,
                                          ced, DSV41_PHASE_DECODE)) {
                 status = DSV41_PREFILL_FAIL;
-            } else if (tick && tick(ud, pos0 + i + k, total, last)) {
-                status = DSV41_PREFILL_STOPPED;
+                break;
             }
+            void *next = ds4_gpu_commands_mark();
+            if (mark && !ds4_gpu_commands_wait_mark(mark)) status = DSV41_PREFILL_FAIL;
+            else if (mark && tick && tick(ud, mark_end, total, mark_settled)) status = DSV41_PREFILL_STOPPED;
+            mark = next; mark_end = pos0 + i + k; mark_settled = last;
+            if (!mark && tick && tick(ud, mark_end, total, mark_settled)) status = DSV41_PREFILL_STOPPED;
         }
+    }
+    g_dsv41_batch_carry = false;
+    if (!outer_batch && ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    if (mark) {
+        const bool done = ds4_gpu_commands_wait_mark(mark) != 0;
+        if (!done && status == DSV41_PREFILL_OK) status = DSV41_PREFILL_FAIL;
+        else if (status == DSV41_PREFILL_OK && tick && tick(ud, mark_end, total, mark_settled))
+            status = DSV41_PREFILL_STOPPED;
     }
     dsv41_gpu_ced_close(&local);
     return status;

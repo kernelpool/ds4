@@ -27419,6 +27419,9 @@ extern "C" bool ds4_gpu_commands_active(void) {
     return false;
 }
 
+extern "C" void *ds4_gpu_commands_mark(void) { return NULL; }
+extern "C" int ds4_gpu_commands_wait_mark(void *mark) { (void)mark; return 1; }
+
 __global__ static void glm_embed_token_q8_0_kernel(
         float *out,
         const unsigned char *w,
