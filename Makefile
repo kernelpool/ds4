@@ -1099,3 +1099,14 @@ clean:
 
 # The active tokenizer includes generated Unicode classes.
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc
+
+tests/test_v41_spec_rewind: tests/test_v41_spec_rewind.c ds4.c $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -o $@ $< $(filter-out ds4.o,$(CORE_OBJS)) $(METAL_LDLIBS)
+
+tests/test_v41_markov_post: tests/test_v41_markov_post.c ds4_gpu_args.o $(CORE_OBJS)
+	$(CC) -O2 -g -mcpu=native -Wall -Wextra -std=c99 -I. -o $@ $^ $(METAL_LDLIBS)
+
+tests/test_ds41_dspark_adaptive: tests/test_ds41_dspark_adaptive.c ds4_ds41_dspark_adaptive.h
+	$(CC) -O2 -g -Wall -Wextra -std=c99 -o $@ $< -lm
+
+ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_ds41_dspark_adaptive.h ds4_dspark_controller.h ds4_ds41_dspark_fault.h
