@@ -86,3 +86,8 @@ __pycache__/
 
 /tests/test_qwen4_conv_parallel
 /tests/test_q8_prefill_variants
+
+# V4.1 qualification executables
+/tests/test_v41_embed_batch
+/tests/test_v41_prefill_attention
+/tests/test_v41_prefill_folds
