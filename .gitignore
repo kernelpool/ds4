@@ -86,3 +86,11 @@ __pycache__/
 
 /tests/test_qwen4_conv_parallel
 /tests/test_q8_prefill_variants
+
+# V4.1 qualification executables
+/tests/test_v41_deferred_ffn_hc
+/tests/test_v41_deferred_hc
+/tests/test_v41_index_masked
+/tests/test_v41_q8_short
+/tests/test_v41_q8_short_fused
+/tests/test_v41_router_hier

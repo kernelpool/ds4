@@ -40233,7 +40233,7 @@ typedef struct {
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
-    bool tp_gate_fused, shared_done;
+    bool tp_gate_fused, shared_done, hc_attn_deferred, hc_ffn_deferred, scalar_decode, kv_stored;
     ds4_gpu_tensor *tp_logits_half, *selected_half, *route_weights_half;
     ds4_gpu_tensor **tp_out, **tp_in;
     ds4_gpu_tensor **tp_batch_out, **tp_batch_in;   /* verify-block row partials, two slots per layer */
@@ -40750,6 +40750,37 @@ static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
     const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
     const ds4_tensor *norm = ffn ? l->ffn_norm : l->attn_norm;
     ds4_gpu_tensor *split = ffn ? g->ffn_split : g->attn_split;
+#ifdef __APPLE__
+    if (ffn) {
+        g->hc_ffn_deferred = false;
+        if (g->scalar_decode && g->tp_world == 1 && !g->quality && !g->streaming && !g->imatrix &&
+            fn->type == DS4_TENSOR_F16 && norm->type == DS4_TENSOR_F32 &&
+            l->ffn_gate_inp->type == DS4_TENSOR_F32 && l->ffn_gate_inp->dim[0] == 5120 &&
+            l->ffn_gate_inp->dim[1] == 384 &&
+            !getenv("DS4_METAL_DISABLE_V41_DEFERRED_FFN_HC") &&
+            !getenv("DS4_METAL_PLAIN_MV_NR0") &&
+            ds4_gpu_dsv41_deferred_collapse(g->x, g->norm, residual, pre,
+                m->map, m->size, norm->abs_offset, DS4_RMS_EPS)) {
+            g->hc_ffn_deferred = true;
+            return true;
+        }
+    } else {
+        g->hc_attn_deferred = false;
+        /* Only the single-node scalar path has a whole 1280->32768 query.
+         * Its mixer output is not needed until after that query's attention. */
+        if (g->scalar_decode && g->tp_world == 1 && !g->quality && !g->streaming && !g->imatrix &&
+            fn->type == DS4_TENSOR_F16 && norm->type == DS4_TENSOR_F32 &&
+            l->attn_q_b->type == DS4_TENSOR_Q8_0 && l->attn_q_b->dim[0] == 1280 &&
+            l->attn_q_b->dim[1] == 32768 &&
+            !getenv("DS4_METAL_DISABLE_V41_DEFERRED_HC") &&
+            !getenv("DS4_METAL_Q8_MV_NSG") &&
+            ds4_gpu_dsv41_deferred_collapse(g->x, g->norm, residual, pre,
+                m->map, m->size, norm->abs_offset, DS4_RMS_EPS)) {
+            g->hc_attn_deferred = true;
+            return true;
+        }
+    }
+#endif
     if (fn->type == DS4_TENSOR_F16 && !ds41_hc_block_input_off() &&
         ds4_gpu_dsv41_hc_block_input(g->mix, g->x, g->norm, split, residual, pre, m->map, m->size,
                                      fn->abs_offset, scale->abs_offset, base->abs_offset, norm->abs_offset,
@@ -40900,8 +40931,11 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
             !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
             !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true) ||
 #ifdef __APPLE__
-            !ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
-                g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
+            !((il > 20u && n_comp > 16384u && DS4_N_INDEXER_HEAD == 32u &&
+               ds4_gpu_dsv41_indexer_score_masked(g->index_scores,g->index_q,g->index_weights,
+                   g->index_cache[owner],g->block_mask,n_comp)) ||
+              ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
+                g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false))) return false;
 #else
             !ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, 1, pos, ratio)) return false;
@@ -40934,6 +40968,23 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
                                  m->map, m->size, DS4_RMS_EPS) &&
         !(ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
           ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm))) return false;
+#ifdef __APPLE__
+    if (g->hc_attn_deferred) {
+        const bool store_kv = !getenv("DS4_METAL_DISABLE_V41_QUERY_KV");
+        if (rope_il < 0 || !ds4_gpu_dsv41_query_deferred_hc(g->q, g->mix, g->attn_split,
+                g->qr, g->residual, m->map, m->size, l->attn_q_b->abs_offset,
+                l->hc_attn_fn->abs_offset, l->hc_attn_scale->abs_offset, l->hc_attn_base->abs_offset,
+                g->pos, ds4_layer_compress_ratio((uint32_t)rope_il) != 0,
+                DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS,
+                g->x, g->norm, rope_il ? g->ffn_split : g->pre, l->attn_norm->abs_offset,
+                store_kv ? g->kv : NULL, store_kv ? g->window[rope_il] : NULL,
+                (uint64_t)(g->pos % 128u) * 512u * 4u)) return false;
+        g->kv_stored = store_kv;
+        g->hc_attn_deferred = false;
+        if (roped) *roped = true;
+        return true;
+    }
+#endif
     if (rope_il >= 0 && l->attn_q_b->type == DS4_TENSOR_Q8_0 &&
         tensor_nbytes(l->attn_q_b->type, l->attn_q_b->dim[0], &q_row) &&
         ds4_gpu_dsv41_project_q(g->q, m->map, m->size,
@@ -40954,10 +41005,11 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
     bool q_roped = false;
+    g->kv_stored = false;
     if (!projected && !ds41_attention_project(g, m, l, (int)il, &q_roped)) return false;
     if ((!q_roped && !ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false)) ||
-        !ds41_rope_store(g->kv, g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
-                         DS4_N_HEAD_DIM, il, pos, DS4_V41_FP8_E8M0) ||
+        (!g->kv_stored && !ds41_rope_store(g->kv, g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
+                         DS4_N_HEAD_DIM, il, pos, DS4_V41_FP8_E8M0)) ||
         !ds41_attention_select(g, m, l, il)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
@@ -41085,6 +41137,20 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
             l->ffn_down_shexp->abs_offset, DS4_N_EMBD, DS4_N_FF_EXP, g->norm, DS4_SWIGLU_CLAMP_EXP);
     if (concurrent) shared_queued = true;
+    if (g->hc_ffn_deferred) {
+        /* HC is independent of routing and both experts. Put the original
+         * kernel in the concurrent gate/up level, using dead norm scratch
+         * so every expert continues reading the first normalized collapse. */
+        if (!ds4_gpu_dsv41_hc_block_input(g->mix, g->x, g->flat_norm, g->ffn_split,
+                g->after_attn, g->attn_split, m->map, m->size,
+                l->hc_ffn_fn->abs_offset, l->hc_ffn_scale->abs_offset, l->hc_ffn_base->abs_offset,
+                l->ffn_norm->abs_offset, DS4_N_HC * DS4_N_EMBD, 24u, DS4_N_EMBD, DS4_N_HC,
+                DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS)) {
+            if (concurrent) ds4_gpu_parallel_ffn_abort();
+            return false;
+        }
+        g->hc_ffn_deferred = false;
+    }
 #endif
     const bool shared_fused = shared_here && !shared_queued &&
         l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
@@ -42108,6 +42174,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         g->draft->mh_pos0 = g->pos;
         g->draft->mh_rows = 1;
     }
+    g->scalar_decode = true;
     g->tp_gate_fused = g->tp_world == 2 && !ds41_tp_gate_expand_off() &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -42149,6 +42216,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             (il == 0 || (il + 1u) % flush_layers == 0))
             ok = ds4_gpu_flush_commands() != 0;
     }
+    g->scalar_decode = false;
     g->tp_gate_fused = false;
     for (uint32_t i = 0; i < 2; i++)
         if (rows[i]) ds4_engram_read_batch_finish(rows[i]);   /* a failure before layer 1 */
