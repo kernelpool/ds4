@@ -40753,11 +40753,6 @@ static bool ds41_queued_head_off(void) {
     return metal_graph_env_flag("DS4_METAL_DISABLE_V41_QUEUED_HEAD", &cache);
 }
 
-static bool ds41_short_sweep_off(void) {
-    static int cache = -1;
-    return metal_graph_env_flag("DS4_METAL_DISABLE_V41_SHORT_SWEEP", &cache);
-}
-
 /* One block's HC input: the mixer projection, then split, weighted sum with
  * the previous block's pre weights and norm; each half fused where the fused
  * kernel reproduces the separate ones. */
@@ -42237,11 +42232,10 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
         !getenv("DS4_CUDA_DISABLE_SSD_MEDIUM_SWEEP") &&
         !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) return remaining;
 #endif
-    if (g->carry_cap && remaining >= (ds41_short_sweep_off() ? 4096u : 3072u) &&
+    if (g->carry_cap && remaining >= 4096u &&
         !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) {
         const uint32_t count = remaining < g->carry_cap ? remaining : g->carry_cap;
-        /* a short sweep keeps its final partial tile instead of a second decoder pass */
-        return remaining < 8192u && !ds41_short_sweep_off() ? count : count - count % 2048u;
+        return count - count % 2048u;
     }
     const uint32_t tail_cap = g->prefill_cap < 2048u ? g->prefill_cap : 2048u;
     return remaining < tail_cap ? remaining : tail_cap;
@@ -42504,11 +42498,9 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     const bool batch_core = batch_attention && !getenv("DS4_METAL_DISABLE_V41_BATCH_CORE");
     const bool batch_hc = batch_attention && batch_moe &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC");
-    /* Layer 20 keeps 1 + (n_layer - 21) * 127 rows and replays the 127 before them. */
     /* Drafting needs the last window of every layer's stream. */
     const uint32_t kept = g->draft ? DS41_DRAFT_WINDOW : 1u;
-    const uint32_t suffix_rows = kept + (DS4_N_LAYER - 20u) * 127u;
-    const bool decoder_suffix = wide && total_count >= suffix_rows &&
+    const bool decoder_suffix = wide && total_count >= 8192u &&
         !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
     if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
     uint32_t (*ids)[2][DS4_ENGRAM_COLS] = g->prefill_ids;
@@ -42589,13 +42581,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
             const uint32_t needed = kept + (DS4_N_LAYER - 1u - il) * 127u;
             first = total_count - needed;
-            /* short sweeps prune whole tiles and warm a complete one, keeping
-             * the partitions the plain schedule would have used */
-            const bool short_sweep = total_count < 8192u && !ds41_short_sweep_off();
-            if (short_sweep) first -= first % 2048u;
-            const uint32_t warm = short_sweep ? 128u : 127u;
-            if (ok && first) ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
-                first - warm, warm, false, batch_hc, batch_attention, cancel, cancel_ud);
+            if (ok) ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
+                first - 127u, 127u, false, batch_hc, batch_attention, cancel, cancel_ud);
         }
         /* Keep the decoder suffix's established matrix partitions; unlike
          * the encoder, its shrinking tail is not aligned to large tiles. */
