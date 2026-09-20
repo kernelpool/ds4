@@ -71,7 +71,10 @@ kernel void kernel_dsv41_router_one(
     shmem_i32[col] = (int)col;
     if ((int)col < width) {
         const float x = logits[col];
-        const float sp = select(log(1 + exp(x)), x, x > 20);
+        const float ex = exp(x);
+        const float em = min(ex, 0.03125f);
+        const float poly = em*(1.0f - em*(0.5f - em*(1.0f/3.0f - 0.25f*em)));
+        const float sp = select(select(log(1.0f + ex), poly, ex < 0.03125f), x, x > 20.0f);
         const float p = sqrt(sp);
         probs[col] = p;
         prob[col] = p;

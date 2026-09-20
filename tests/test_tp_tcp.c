@@ -64,10 +64,21 @@ static void pair(int fd[2], bool tcp) {
             .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
         socklen_t len = sizeof(addr);
         assert(listener >= 0 && bind(listener, (struct sockaddr *)&addr, len) == 0);
+#ifdef __linux__
+        /* Loopback's 32 KiB segments exceed the tiny receive window below.
+         * Use small segments to test backpressure without zero-window probes
+         * throttling a 16 MiB transfer for minutes. Set this before SYN. */
+        const int mss = 512;
+        assert(setsockopt(listener, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss)) == 0);
+#endif
         assert(getsockname(listener, (struct sockaddr *)&addr, &len) == 0);
         assert(listen(listener, 1) == 0);
         fd[0] = socket(AF_INET, SOCK_STREAM, 0);
-        assert(fd[0] >= 0 && connect(fd[0], (struct sockaddr *)&addr, len) == 0);
+        assert(fd[0] >= 0);
+#ifdef __linux__
+        assert(setsockopt(fd[0], IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss)) == 0);
+#endif
+        assert(connect(fd[0], (struct sockaddr *)&addr, len) == 0);
         fd[1] = accept(listener, NULL, NULL);
         assert(fd[1] >= 0);
         close(listener);

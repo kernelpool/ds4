@@ -71,6 +71,52 @@ static void test_vision_prefix(void) {
     free(s);
 }
 
+/* Fingerprint-prefix reuse: positions may differ (hidden reasoning shifts them
+ * and rebase repairs them), appended images are allowed, but a fingerprint or
+ * row-count change is never reusable.  This predicate gates the server's live
+ * reuse probe, so a mismatch must never look reusable. */
+static void test_vision_fingerprint_prefix(void) {
+    ds4_session *s = calloc(1, sizeof(*s));
+    assert(s);
+    s->checkpoint_valid = true;
+    s->checkpoint.len = 100;
+    ds4_vision_identity ckpt = {.token_start = 50, .token_count = 10,
+                                .fingerprint = {1}};
+    s->checkpoint_images = &ckpt;
+    s->checkpoint_image_count = 1;
+
+    ds4_vision_span images[2] = {
+        {.token_start = 50, .embedding = {.token_count = 10, .fingerprint = {1}}},
+        {.token_start = 90, .embedding = {.token_count = 10, .fingerprint = {2}}},
+    };
+    assert(ds4_session_vision_fingerprint_prefix_matches(s, images, 1));
+    /* Appended image: allowed, as long as the historical one still matches. */
+    assert(ds4_session_vision_fingerprint_prefix_matches(s, images, 2));
+    /* Shifted historical position (rebase's job), same identity: still reusable. */
+    images[0].token_start = 7;
+    assert(ds4_session_vision_fingerprint_prefix_matches(s, images, 1));
+    assert(ds4_session_vision_fingerprint_prefix_matches(s, images, 2));
+    /* Different pixels: never reusable. */
+    images[0].embedding.fingerprint[0] ^= 1;
+    assert(!ds4_session_vision_fingerprint_prefix_matches(s, images, 1));
+    assert(!ds4_session_vision_fingerprint_prefix_matches(s, images, 2));
+    images[0].embedding.fingerprint[0] ^= 1;
+    /* Different row count is a different image to the model. */
+    images[0].embedding.token_count++;
+    assert(!ds4_session_vision_fingerprint_prefix_matches(s, images, 1));
+    images[0].embedding.token_count--;
+    /* Dropping the historical image (or any image) is not a prefix extension. */
+    assert(!ds4_session_vision_fingerprint_prefix_matches(s, NULL, 0));
+    assert(!ds4_session_vision_fingerprint_prefix_matches(s, images + 1, 1));
+    /* A text-only request cannot reuse an image-conditioned checkpoint. */
+    assert(!ds4_session_vision_fingerprint_prefix_matches(s, images, 0));
+    /* Invalid checkpoints never match. */
+    s->checkpoint_valid = false;
+    assert(!ds4_session_vision_fingerprint_prefix_matches(s, images, 2));
+    assert(!ds4_session_vision_fingerprint_prefix_matches(NULL, images, 2));
+    free(s);
+}
+
 static void test_rewind(void) {
     ds4_engine e = { .backend = DS4_BACKEND_CPU };
     ds4_session *s = calloc(1, sizeof(*s));
@@ -485,6 +531,7 @@ static void test_glm_spec_rollback(void) {
 
 int main(void) {
     test_vision_prefix();
+    test_vision_fingerprint_prefix();
     test_rewind();
     test_session_memory();
     test_payload_tokens();

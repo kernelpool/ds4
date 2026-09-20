@@ -1352,6 +1352,8 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
     free(gq_w); free(gk_w); free(giq_w); free(gik_w);
 }
 
+#ifdef __APPLE__
+/* Native cross-session row kernels are Metal-only; CUDA uses ordered rows. */
 static void same_bytes(const char *what, uint32_t row, const ds4_gpu_tensor *ta, uint64_t offa,
                        const ds4_gpu_tensor *tb, uint64_t offb, uint64_t bytes) {
     uint8_t *a = malloc(bytes), *b = malloc(bytes);
@@ -1525,6 +1527,8 @@ static void test_attention_rows(arena_t *a) {
     free(ik); free(iq); free(vp); free(kp); free(qg);
     free(gq_w); free(gk_w); free(giq_w); free(gik_w);
 }
+
+#endif
 
 /* ---- routed experts ---- */
 
@@ -2041,6 +2045,7 @@ static void test_mv_ext_groups(arena_t *a) {
     printf("few-row matvec simdgroup counts: Q8 and F16 verify-row shapes exact at 1/2/4/8 groups\n");
 }
 
+#ifdef __APPLE__
 /* The grouped decode-batch kernels must reproduce the per-token kernels bit
  * for bit under heavy expert reuse (sixteen rows over eight experts). */
 static void test_moe_grouped(arena_t *a) {
@@ -2081,6 +2086,8 @@ static void test_moe_grouped(arena_t *a) {
     ds4_gpu_tensor_free(gcounts); ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
     free(sel); free(x);
 }
+
+#endif
 
 static void test_hc_pair_groups(arena_t *a) {
     const uint32_t types[] = {1u, 0u, 8u}, widths[] = {9u, 64u, 2560u};
@@ -3421,7 +3428,7 @@ static void test_half_expert_tiles(arena_t *a, uint32_t T, uint32_t type, uint32
 }
 #endif
 
-/* dense tiled GEMM against a double reference for f32, f16 and q8_0 rows */
+#ifdef __APPLE__
 /* The decode-batch Q8 GEMM: reference in double, and the same sums the
  * per-token matvec finds, to rounding. */
 static void test_batch_mm_q8(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T) {
@@ -3454,6 +3461,9 @@ static void test_batch_mm_q8(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_
     ds4_gpu_tensor_free(gmv); ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
 }
 
+#endif
+
+/* dense tiled GEMM against a double reference for f32, f16 and q8_0 rows */
 static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T, uint32_t wtype) {
     double *sh;
     uint64_t off = wtype == 8u ? arena_q8_0(a, rows, in_dim, &sh, 0.05f)
@@ -3590,7 +3600,9 @@ int main(void) {
     test_qwen4_argmax();
     test_hc_pair_groups(&arena);
     test_mv_ext_groups(&arena);
+#ifdef __APPLE__
     test_moe_grouped(&arena);
+#endif
     test_hc_mix_prefetch(&arena);
     test_hc(&arena, 2560, 320, 3, 1u);
     test_hc(&arena, 2560, 320, 2, 1u);
@@ -3632,7 +3644,9 @@ int main(void) {
     printf("attention\n");
     test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
+#ifdef __APPLE__
     test_attention_rows(&arena);
+#endif
     printf("routed experts\n");
     test_moe(&arena, 16, 10, 2560, 640, 2, 8u);
     test_moe(&arena, 16, 10, 2560, 640, 1, 12u);
@@ -3657,9 +3671,11 @@ int main(void) {
     test_moe_mm_tiles_iq2(&arena);
     printf("dense mm\n");
     test_dense_mm(&arena, 2560, 512, 37, 0u);
+#ifdef __APPLE__
     test_batch_mm_q8(&arena, 2560, 640, 16);
     test_batch_mm_q8(&arena, 6144, 2560, 16);
     test_batch_mm_q8(&arena, 2560, 128, 8);
+#endif
     test_dense_mm(&arena, 10240, 320, 33, 1u);
     test_dense_mm(&arena, 320, 10240, 40, 1u);
     test_dense_mm(&arena, 2560, 100, 9, 8u);

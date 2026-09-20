@@ -335,6 +335,16 @@ or backend fallback selection changes.
   the shared expert, but still runs attention, routed experts, shared down, and
   the output head per session. Treat flat aggregate scaling as unfinished
   implementation work, not evidence that Metal cannot benefit from batching.
+- Before physical Metal TP, check both hosts against the link and memory setup
+  in [the distributed guide](docs/DISTRIBUTED.md). Reboots can reset
+  member-interface IPv4 aliases and `iogpu.wired_limit_mb`. An active port is not
+  enough, and a shard above the effective GPU residency limit may page heavily.
+  Preserve OS headroom; do not bypass the memory guard to make a test fit.
+  Match explicit `--prefill-chunk` overrides on both ranks. A different chunk
+  schedule can fail during prefill synchronization rather than at the handshake.
+  The batch oracle needs extra sessions for mixed prefill and serial controls.
+  Use an admitted context for its short-prompt checks, then test long contexts
+  separately rather than skipping the mixed checks.
 - On `mac-m5max-it` and `mac-m5max-us`, run the same oracle in physical TP mode
   over explicit `tcp` and `rdma` transports. Set `DS4_TEST_TP_MODE=leader` on
   the leader and `DS4_TEST_TP_MODE=worker DS4_TEST_TP_LEADER_HOST=HOST` on the
@@ -1519,8 +1529,12 @@ the long sparse-boundary tests; neither substitutes for the other.
   prompts and row order, checks complete target logits exactly, tests invalid
   batches without advancing state, and resumes after a mixed prefill/decode call.
   Isolation does not establish equivalence to serial inference: separately run
-  `score_official --session-batch N` on the short and long manifests. Measure
-  aggregate throughput without Metal validation, including two-session cases.
+  `score_official --session-batch N` on the short and long manifests. Test
+  physical Metal TP native batches with at least three rows: two rows use
+  ordered execution by design. Confirm dispatch in the log instead of assuming
+  that `--session-batch` selects the native path.
+  Measure aggregate throughput without Metal validation, including two-session
+  cases.
   Require the `native_ds41=1` trace for admitted native shapes, including mixed
   batches with nonzero `prefill_rows`; a passing ordered fallback is not evidence
   for the native path. Image-bearing sessions currently use that fallback.

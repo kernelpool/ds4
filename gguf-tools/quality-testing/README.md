@@ -3,7 +3,7 @@
 This directory contains the prompts, tracked official fixtures, and scripts used
 to compare local GGUF variants against hosted-model continuations.
 
-The metric is target-token negative log likelihood: collect a deterministic
+The main metric is target-token negative log likelihood: collect an
 official continuation, then ask each local GGUF how much probability it assigns
 to that exact continuation token by token.  This avoids judging quality from one
 sampled answer.
@@ -31,6 +31,10 @@ calling hosted APIs:
   continuations from Alibaba through OpenRouter, with top-five logprobs.
 - `data/qwen38-flash-alibaba-long`: 12 archive/code continuations from the
   same endpoint, with prompts from 2K to 24K tokens.
+- [deepseek-v4.1-flash-20260919-router](deepseek-v4.1-flash-20260919-router/README.md):
+  112 fresh official V4.1 Flash continuations, including 12 longer prompts up
+  to 23K tokens. Temperature-1 samples with top-20 logprobs, intended for
+  paired numerical comparisons. These are not V4 Flash or Vision-Exp vectors.
 
 DeepSeek V4 Flash also has tracked official smoke vectors in
 `tests/test-vectors/`.  Those vectors drive `./ds4_test --logprob-vectors` and
@@ -47,15 +51,17 @@ may have been lost by the provider.
 
 ## 2. Collect Official Continuations
 
-For the tracked DeepSeek V4 Flash 0731 fixture:
+The Flash 0731 fixture is historical. The official API now redirects the old
+Flash names to V4.1; do not overwrite `data/flash` with new calls. Collect
+current V4.1 references in a separate directory:
 
 ```sh
 export DEEPSEEK_API_KEY=...
 python3 gguf-tools/quality-testing/collect_official.py \
-  --model deepseek-v4-flash \
+  --model deepseek-flash \
   --endpoint https://api.deepseek.com/chat/completions \
   --prompts gguf-tools/quality-testing/prompts.jsonl \
-  --out gguf-tools/quality-testing/data/flash \
+  --out /tmp/deepseek-v4.1-flash-new \
   --count 100 \
   --max-tokens 24 \
   --top-logprobs 20 \
@@ -320,7 +326,10 @@ Output fields:
 - `first_token_matches`: how often the local greedy first token matches the
   official first token.
 - `avg_greedy_lcp`: average greedy longest common prefix against the official
-  continuation.
+  continuation. This measures exact agreement, not general answer quality;
+  one early mismatch discards all later agreement. Do not use it alone as a
+  quality gate, especially for sampled references. Compare paired NLL and
+  API probability agreement under matching execution settings as well.
 - `api_target_mae`: when the manifest includes `response_file`, absolute
   local-vs-API logprob delta for aligned official output tokens.
 - `api_top_coverage`: fraction of API top-logprob alternatives that map exactly
