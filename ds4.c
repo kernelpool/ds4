@@ -40633,10 +40633,12 @@ static bool ds41_hc_block_input_off(void) {
     return metal_graph_env_flag("DS4_METAL_DISABLE_V41_HC_BLOCK_INPUT", &cache);
 }
 
+#ifdef __APPLE__
 static bool ds41_router_one_off(void) {
     static int cache = -1;
     return metal_graph_env_flag("DS4_METAL_DISABLE_V41_ROUTER_ONE", &cache);
 }
+#endif
 
 static bool ds41_tp_slab_off(void) {
 #ifdef __APPLE__
@@ -40659,6 +40661,7 @@ static bool ds41_tp_balanced_route(void) {
 #endif
 }
 
+#ifdef __APPLE__
 static bool ds41_tp_balanced_views(ds41_gpu_graph *g) {
     if (!ds41_tp_balanced_route()) return false;
     const uint64_t bytes = (uint64_t)(DS4_N_EXPERT_USED / 2u) * sizeof(float);
@@ -40666,6 +40669,7 @@ static bool ds41_tp_balanced_views(ds41_gpu_graph *g) {
     if (!g->route_weights_half) g->route_weights_half = ds4_gpu_tensor_view(g->route_weights, g->tp_rank * bytes, bytes);
     return g->selected_half && g->route_weights_half;
 }
+#endif
 
 static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
                              uint32_t il, uint32_t gate) {
@@ -40722,6 +40726,8 @@ static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
             ds4_gpu_tp_batch_gate_encode_kind(il, gate, count, out) &&
             ds4_gpu_add_tensor(x, g->tp_rank ? in : out, g->tp_rank ? out : in, count * DS4_N_EMBD) != 0;
     }
+#else
+    (void)gate;
 #endif
     /* Q is dead after attention; its expert-output alias is dead after the
      * routed reduction. Reuse it for the peer, without another large buffer. */
@@ -41014,14 +41020,12 @@ static bool ds41_shared_down(ds41_gpu_graph *g, const ds4_model *m,
 
 /* The shared expert rides the routed experts' concurrent encoder: its
  * gate/up beside their pair kernel, its down beside their sum. */
-static bool ds41_concurrent_ffn_on(void) {
 #ifdef __APPLE__
+static bool ds41_concurrent_ffn_on(void) {
     static int c = -1;
     return !metal_graph_env_flag("DS4_METAL_DISABLE_V41_CONCURRENT_FFN", &c);
-#else
-    return false;
-#endif
 }
+#endif
 
 static bool ds41_tp_shared_split(void) {
 #ifdef __APPLE__
