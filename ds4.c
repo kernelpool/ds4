@@ -40509,9 +40509,11 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
         outputs != DS4_N_VOCAB &&
 #endif
         weight->type == DS4_TENSOR_Q8_0) {
+#ifdef __APPLE__
         if (round)
             return ds4_gpu_matmul_q8_0_bf16_tensor(out, m->map, m->size, weight->abs_offset,
                                                    width, outputs, in, count) != 0;
+#endif
         ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, m->map, m->size,
             weight->abs_offset, width, outputs, in, count);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F16) {
@@ -42938,9 +42940,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ok = ds41_draft_capture(g, il, g->batch.residual, positions[0], rows);
         if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
             ds41_attention_project_batch(g, model, l, rows);
-        /* One session's consecutive rows publish, index and attend as a batch. */
-        if (ok && prefill_only) ok = ds41_attention_batch(g, model, l, il, rows);
-        const bool batch_output = prefill_only && g->tp_world != 2 &&
+        /* One session's consecutive rows publish, index and attend as a batch
+         * on Metal; the CUDA row batches keep the per-row decode kernels. */
+#ifdef __APPLE__
+        const bool batch_attention = prefill_only;
+#else
+        const bool batch_attention = false;
+#endif
+        if (ok && batch_attention) ok = ds41_attention_batch(g, model, l, il, rows);
+        const bool batch_output = batch_attention && g->tp_world != 2 &&
             l->attn_output_b->type == DS4_TENSOR_Q8_0;
         /* a few single-node rows: the output projections expand straight into the streams */
         const bool fused_tail = batch_output && !shared_owner &&
@@ -42959,7 +42967,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #undef DS41_SESSION_ROW
             row.q = queries[i];
             row.heads = heads[i];
-            ok = (prefill_only || ds41_attention(&row, model, l, il, true)) &&
+            ok = (batch_attention || ds41_attention(&row, model, l, il, true)) &&
                 ds41_attention_output(&row, model, l, -1, row.block);
         }
         if (ok && !expanded) ok = ds41_sum_partial_batch(g, active.block, il, DS4_TP_GATE_ATTN, rows) &&
