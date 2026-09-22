@@ -3151,6 +3151,112 @@ kernel void kernel_qwen4_moe_down_mxfp4_pf(
     }
 }
 
+/* MXFP4 gate/up rows with the token's input staged once per threadgroup and
+ * both projections walked together per row.  Same lane map and pinned chain
+ * as kernel_qwen4_moe_down_mxfp4_pf, and the generic kernel's silu(g) * u
+ * compiles to (g * u) * sigmoid(g), so every mid value equals the generic
+ * kernel bit for bit (tests/test_qwen4_kernels.c pins it); the input
+ * previously came from device memory per row and projection.  The shared
+ * slot keeps the generic row dot. */
+kernel void kernel_qwen4_moe_mid_mxfp4_pf(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *gate_base,
+        device const char    *up_base,
+        device const int32_t *selected,
+        device const float   *x,
+        device float         *mid,
+        device const char    *sh_gate,
+        device const char    *sh_up,
+        threadgroup float    *xs [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    const uint nr = is_function_constant_defined(qwen4_mv_rows) ? qwen4_mv_rows : 1u;
+    const uint dim = is_function_constant_defined(qwen4_mv_dim) ? qwen4_mv_dim : args.in_dim;
+    const uint st = is_function_constant_defined(qwen4_mv_shared_type) ? qwen4_mv_shared_type : args.shared_type;
+    if (slot >= n_out || tok >= args.n_tokens) return;
+    device const float *xt = x + (uint64_t)tok * args.in_dim;
+    for (uint i = tid; i < dim; i += ntg.x) xs[i] = xt[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * nr;
+    if (row0 >= args.out_rows) return;
+    const uint64_t mid_base = ((uint64_t)tok * n_out + slot) * args.out_rows;
+    if (slot == args.n_slots) {
+        for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
+            const uint64_t off = (uint64_t)r * args.shared_row_bytes;
+            const float g = qwen4_row_dot(sh_gate + off, xt, st, dim, tiisg);
+            const float u = qwen4_row_dot(sh_up + off, xt, st, dim, tiisg);
+            if (tiisg == 0) mid[mid_base + r] = qwen4_silu(g) * u;
+        }
+        return;
+    }
+    const int32_t expert = selected[(uint64_t)tok * args.n_slots + slot];
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tiisg == 0) {
+            for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) mid[mid_base + r] = 0.0f;
+        }
+        return;
+    }
+    const uint64_t ebase = (uint64_t)(uint)expert * args.expert_bytes;
+    const uint ix = tiisg / 8, it = tiisg % 8;
+    const uint nb = dim / 32;
+    for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+        device const uchar *grow = (device const uchar *)(gate_base + ebase + (uint64_t)r * args.row_bytes);
+        device const uchar *urow = (device const uchar *)(up_base + ebase + (uint64_t)r * args.row_bytes);
+        float accg = 0.0f, accu = 0.0f;
+        uint ib = ix;
+        for (; ib + 12u < nb; ib += 16u) {
+            device const uchar *g0 = grow + (uint64_t)ib * 17u;
+            device const uchar *g1 = g0 + 4u * 17u, *g2 = g0 + 8u * 17u, *g3 = g0 + 12u * 17u;
+            device const uchar *u0 = urow + (uint64_t)ib * 17u;
+            device const uchar *u1 = u0 + 4u * 17u, *u2 = u0 + 8u * 17u, *u3 = u0 + 12u * 17u;
+            threadgroup const float *y0 = xs + ib * 32u + it * 2u;
+            threadgroup const float *y1 = y0 + 128u, *y2 = y0 + 256u, *y3 = y0 + 384u;
+            const uchar e0 = g0[0], e1 = g1[0], e2 = g2[0], e3 = g3[0];
+            const uint p0 = g0[1 + it * 2u], q0 = g0[2 + it * 2u];
+            const uint p1 = g1[1 + it * 2u], q1 = g1[2 + it * 2u];
+            const uint p2 = g2[1 + it * 2u], q2 = g2[2 + it * 2u];
+            const uint p3 = g3[1 + it * 2u], q3 = g3[2 + it * 2u];
+            const uchar f0 = u0[0], f1 = u1[0], f2 = u2[0], f3 = u3[0];
+            const uint s0 = u0[1 + it * 2u], t0 = u0[2 + it * 2u];
+            const uint s1 = u1[1 + it * 2u], t1 = u1[2 + it * 2u];
+            const uint s2 = u2[1 + it * 2u], t2 = u2[2 + it * 2u];
+            const uint s3 = u3[1 + it * 2u], t3 = u3[2 + it * 2u];
+            const float y0a = y0[0], y0b = y0[1], y0c = y0[16], y0d = y0[17];
+            const float y1a = y1[0], y1b = y1[1], y1c = y1[16], y1d = y1[17];
+            const float y2a = y2[0], y2b = y2[1], y2c = y2[16], y2d = y2[17];
+            const float y3a = y3[0], y3b = y3[1], y3c = y3[16], y3d = y3[17];
+            QWEN4_MXFP4_PF_ACC_TO(accg, e0, p0, q0, y0a, y0b, y0c, y0d);
+            QWEN4_MXFP4_PF_ACC_TO(accg, e1, p1, q1, y1a, y1b, y1c, y1d);
+            QWEN4_MXFP4_PF_ACC_TO(accg, e2, p2, q2, y2a, y2b, y2c, y2d);
+            QWEN4_MXFP4_PF_ACC_TO(accg, e3, p3, q3, y3a, y3b, y3c, y3d);
+            QWEN4_MXFP4_PF_ACC_TO(accu, f0, s0, t0, y0a, y0b, y0c, y0d);
+            QWEN4_MXFP4_PF_ACC_TO(accu, f1, s1, t1, y1a, y1b, y1c, y1d);
+            QWEN4_MXFP4_PF_ACC_TO(accu, f2, s2, t2, y2a, y2b, y2c, y2d);
+            QWEN4_MXFP4_PF_ACC_TO(accu, f3, s3, t3, y3a, y3b, y3c, y3d);
+        }
+        for (; ib < nb; ib += 4u) {
+            device const uchar *g0 = grow + (uint64_t)ib * 17u;
+            device const uchar *u0 = urow + (uint64_t)ib * 17u;
+            threadgroup const float *y0 = xs + ib * 32u + it * 2u;
+            const uchar e0 = g0[0], f0 = u0[0];
+            const uint p0 = g0[1 + it * 2u], q0 = g0[2 + it * 2u];
+            const uint s0 = u0[1 + it * 2u], t0 = u0[2 + it * 2u];
+            const float y0a = y0[0], y0b = y0[1], y0c = y0[16], y0d = y0[17];
+            QWEN4_MXFP4_PF_ACC_TO(accg, e0, p0, q0, y0a, y0b, y0c, y0d);
+            QWEN4_MXFP4_PF_ACC_TO(accu, f0, s0, t0, y0a, y0b, y0c, y0d);
+        }
+        const float g = simd_sum(accg), u = simd_sum(accu);
+        if (tiisg == 0) mid[mid_base + r] = (g * u) * qwen4_sigmoid(g);
+    }
+}
+
 #define QWEN4_MXFP4_GROUPED_ROWS(ACC_, M_, IB_) do { \
     device const float *y0 = (M_) + (IB_) * 32u + it * 2u; \
     device const float *y1 = y0 + 128u, *y2 = y0 + 256u, *y3 = y0 + 384u; \
@@ -3255,6 +3361,126 @@ static inline void qwen4_moe_down_mxfp4_pass(
 }
 #undef QWEN4_MXFP4_GROUPED_ROWS
 #undef QWEN4_MXFP4_GROUPED_TAIL
+
+/* One pass of the grouped gate/up kernel over NJ pairs of one expert: the
+ * staged kernel's chain and epilogue per row and pair, so each pair's mid
+ * values are the per-token kernel's bit for bit. */
+template <uint NJ>
+static inline void qwen4_moe_mid_mxfp4_pass(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char *gate_base, device const char *up_base, device const float *x, device float *mid,
+        device const int32_t *list, uint64_t ebase, uint row, uint nb, uint ix, uint it, ushort tiisg) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+    uint pairs[NJ];
+    device const float *xs[NJ];
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) {
+        pairs[j] = (uint)list[j];
+        xs[j] = x + (uint64_t)(pairs[j] / args.n_slots) * args.in_dim;
+    }
+    device const uchar *grow = (device const uchar *)(gate_base + ebase + (uint64_t)row * args.row_bytes);
+    device const uchar *urow = (device const uchar *)(up_base + ebase + (uint64_t)row * args.row_bytes);
+    float accg[NJ], accu[NJ];
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) { accg[j] = 0.0f; accu[j] = 0.0f; }
+    uint ib = ix;
+    for (; ib + 12u < nb; ib += 16u) {
+        device const uchar *g0 = grow + (uint64_t)ib * 17u;
+        device const uchar *g1 = g0 + 4u * 17u, *g2 = g0 + 8u * 17u, *g3 = g0 + 12u * 17u;
+        device const uchar *u0 = urow + (uint64_t)ib * 17u;
+        device const uchar *u1 = u0 + 4u * 17u, *u2 = u0 + 8u * 17u, *u3 = u0 + 12u * 17u;
+        const uchar e0 = g0[0], e1 = g1[0], e2 = g2[0], e3 = g3[0];
+        const uint p0 = g0[1 + it * 2u], q0 = g0[2 + it * 2u];
+        const uint p1 = g1[1 + it * 2u], q1 = g1[2 + it * 2u];
+        const uint p2 = g2[1 + it * 2u], q2 = g2[2 + it * 2u];
+        const uint p3 = g3[1 + it * 2u], q3 = g3[2 + it * 2u];
+        const uchar f0 = u0[0], f1 = u1[0], f2 = u2[0], f3 = u3[0];
+        const uint s0 = u0[1 + it * 2u], t0 = u0[2 + it * 2u];
+        const uint s1 = u1[1 + it * 2u], t1 = u1[2 + it * 2u];
+        const uint s2 = u2[1 + it * 2u], t2 = u2[2 + it * 2u];
+        const uint s3 = u3[1 + it * 2u], t3 = u3[2 + it * 2u];
+#pragma unroll
+        for (uint j = 0; j < NJ; j++) {
+            device const float *y0 = xs[j] + ib * 32u + it * 2u;
+            device const float *y1 = y0 + 128u, *y2 = y0 + 256u, *y3 = y0 + 384u;
+            const float y0a = y0[0], y0b = y0[1], y0c = y0[16], y0d = y0[17];
+            const float y1a = y1[0], y1b = y1[1], y1c = y1[16], y1d = y1[17];
+            const float y2a = y2[0], y2b = y2[1], y2c = y2[16], y2d = y2[17];
+            const float y3a = y3[0], y3b = y3[1], y3c = y3[16], y3d = y3[17];
+            QWEN4_MXFP4_PF_ACC_TO(accg[j], e0, p0, q0, y0a, y0b, y0c, y0d);
+            QWEN4_MXFP4_PF_ACC_TO(accg[j], e1, p1, q1, y1a, y1b, y1c, y1d);
+            QWEN4_MXFP4_PF_ACC_TO(accg[j], e2, p2, q2, y2a, y2b, y2c, y2d);
+            QWEN4_MXFP4_PF_ACC_TO(accg[j], e3, p3, q3, y3a, y3b, y3c, y3d);
+            QWEN4_MXFP4_PF_ACC_TO(accu[j], f0, s0, t0, y0a, y0b, y0c, y0d);
+            QWEN4_MXFP4_PF_ACC_TO(accu[j], f1, s1, t1, y1a, y1b, y1c, y1d);
+            QWEN4_MXFP4_PF_ACC_TO(accu[j], f2, s2, t2, y2a, y2b, y2c, y2d);
+            QWEN4_MXFP4_PF_ACC_TO(accu[j], f3, s3, t3, y3a, y3b, y3c, y3d);
+        }
+    }
+    for (; ib < nb; ib += 4u) {
+        device const uchar *g0 = grow + (uint64_t)ib * 17u;
+        device const uchar *u0 = urow + (uint64_t)ib * 17u;
+        const uchar e0 = g0[0], f0 = u0[0];
+        const uint p0 = g0[1 + it * 2u], q0 = g0[2 + it * 2u];
+        const uint s0 = u0[1 + it * 2u], t0 = u0[2 + it * 2u];
+#pragma unroll
+        for (uint j = 0; j < NJ; j++) {
+            device const float *y0 = xs[j] + ib * 32u + it * 2u;
+            const float y0a = y0[0], y0b = y0[1], y0c = y0[16], y0d = y0[17];
+            QWEN4_MXFP4_PF_ACC_TO(accg[j], e0, p0, q0, y0a, y0b, y0c, y0d);
+            QWEN4_MXFP4_PF_ACC_TO(accu[j], f0, s0, t0, y0a, y0b, y0c, y0d);
+        }
+    }
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) {
+        const float g = simd_sum(accg[j]), u = simd_sum(accu[j]);
+        if (tiisg == 0) mid[(uint64_t)pairs[j] * args.out_rows + row] = (g * u) * qwen4_sigmoid(g);
+    }
+}
+
+/* kernel_qwen4_moe_mid_mxfp4_pf over the batch's distinct experts, on the
+ * list ownership of kernel_qwen4_moe_down_mxfp4_grouped: one row per
+ * simdgroup, up to four pairs per pass, each pair's input read from its
+ * own row. */
+kernel void kernel_qwen4_moe_mid_mxfp4_grouped(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *gate_base,
+        device const char    *up_base,
+        device const int32_t *selected,
+        device const float   *x,
+        device float         *mid,
+        device const int32_t *lists,
+        device const int32_t *counts,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint row = tgpig.x * (ntg.x / 32u) + (uint)sgitg;
+    if (row >= args.out_rows || slot >= args.n_slots || tok >= args.n_tokens) return;
+    const uint pair = tok * args.n_slots + slot;
+    const int32_t expert = selected[pair];
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tiisg == 0) mid[(uint64_t)pair * args.out_rows + row] = 0.0f;
+        return;
+    }
+    device const int32_t *list = lists + (uint64_t)(uint)expert * args.list_cap;
+    const uint count = min((uint)counts[expert], args.list_cap);
+    if (count == 0 || (uint)list[0] != pair) return;
+    const uint64_t ebase = (uint64_t)(uint)expert * args.expert_bytes;
+    const uint ix = tiisg / 8, it = tiisg % 8;
+    const uint nb = args.in_dim / 32;
+    for (uint j0 = 0; j0 < count; j0 += 4u) {
+        const uint nj = min(4u, count - j0);
+        switch (nj) {
+        case 1u: qwen4_moe_mid_mxfp4_pass<1>(args, gate_base, up_base, x, mid, list + j0, ebase, row, nb, ix, it, tiisg); break;
+        case 2u: qwen4_moe_mid_mxfp4_pass<2>(args, gate_base, up_base, x, mid, list + j0, ebase, row, nb, ix, it, tiisg); break;
+        case 3u: qwen4_moe_mid_mxfp4_pass<3>(args, gate_base, up_base, x, mid, list + j0, ebase, row, nb, ix, it, tiisg); break;
+        default: qwen4_moe_mid_mxfp4_pass<4>(args, gate_base, up_base, x, mid, list + j0, ebase, row, nb, ix, it, tiisg); break;
+        }
+    }
+}
 
 /* kernel_qwen4_moe_down_mxfp4_pf over the batch's distinct experts, on the
  * same list ownership as kernel_qwen4_moe_mid_q4k_grouped: the owning

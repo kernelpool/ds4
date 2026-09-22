@@ -59622,6 +59622,12 @@ static bool mimo_graph_moe(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_
     const bool mm = T > 64u && (E % 64u) == 0 && (FF % 64u) == 0 &&
         qwen4_expert_type_has_mm(l->ffn_gate_exps->type) && l->ffn_up_exps->type == l->ffn_gate_exps->type &&
         qwen4_expert_type_has_mm(l->ffn_down_exps->type);
+    /* Verify rows share experts: the grouped kernels read each expert once
+     * per four rows that chose it, every row's arithmetic unchanged
+     * (DS4_QWEN4_MOE_NO_GROUP=1 keeps the per-row kernels for A/B). */
+    const bool grouped = !mm && T > 1u && l->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
+        l->ffn_up_exps->type == DS4_TENSOR_MXFP4 && l->ffn_down_exps->type == DS4_TENSOR_MXFP4 &&
+        getenv("DS4_QWEN4_MOE_NO_GROUP") == NULL;
     if (ok && mm) {
         ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, K, NE, g->cap_tokens) &&
              ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->xn, g->moe_lists, g->moe_counts, m->map, m->size,
@@ -59630,6 +59636,14 @@ static bool mimo_graph_moe(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_
              ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->moe_lists, g->moe_counts, m->map, m->size,
                                               l->ffn_down_exps->abs_offset, l->ffn_down_exps->type, NE, T, K, K,
                                               FF, E, g->cap_tokens);
+    } else if (ok && grouped) {
+        ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, K, NE, g->cap_tokens) &&
+             ds4_gpu_qwen4_moe_mid_grouped_tensor(g->mid, g->xn, g->selected, g->moe_lists, g->moe_counts, g->cap_tokens,
+                                                  m->map, m->size, l->ffn_gate_exps->abs_offset,
+                                                  l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, NE, T, K, E, FF) &&
+             ds4_gpu_qwen4_moe_down_grouped_tensor(g->part, g->mid, g->selected, g->moe_lists, g->moe_counts,
+                                                   g->cap_tokens, m->map, m->size, l->ffn_down_exps->abs_offset,
+                                                   l->ffn_down_exps->type, NE, T, K, FF, E);
     } else if (ok) {
         ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->xn, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
                                           l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, NE, T, K, E, FF,

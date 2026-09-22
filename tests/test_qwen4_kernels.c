@@ -1746,6 +1746,26 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
         unsetenv("DS4_QWEN4_MOE_MV_NSG");
         free(bm); free(bp); free(am); free(ap);
     }
+    if (wtype == 39u && getenv("DS4_TEST_QWEN4_MV_EXACT")) {
+        /* The staged-input MXFP4 gate/up rows must match the generic kernel
+         * byte for bit, shared Q8 slot included, specialized or not. */
+        const uint64_t nm = (uint64_t)T * n_out * F;
+        float *bm = malloc(nm * sizeof(float)), *am = malloc(nm * sizeof(float));
+        require_ok(bm && am, "mid mxfp4 allocation");
+        for (uint32_t spec = 0; spec < 2u; spec++) {
+            setenv("DS4_QWEN4_MOE_MV_SPECIALIZE", spec ? "1" : "0", 1);
+            for (uint32_t mode = 0; mode < 2u; mode++) {
+                setenv("DS4_QWEN4_MOE_MID_MXFP4", mode ? "1" : "0", 1);
+                require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid, gx, gsel, a->base, a->size,
+                    gate_off, up_off, wtype, NE, T, slots, E, F, sg_off, su_off, shared_type), "mid mxfp4 dispatch");
+                require_ok(ds4_gpu_tensor_read(gmid, 0, mode ? am : bm, nm * sizeof(float)), "mid mxfp4 read");
+            }
+            check_exact_f32(spec ? "staged MXFP4 mid, specialized" : "staged MXFP4 mid, generic", am, bm, nm);
+        }
+        unsetenv("DS4_QWEN4_MOE_MV_SPECIALIZE");
+        unsetenv("DS4_QWEN4_MOE_MID_MXFP4");
+        free(bm); free(am);
+    }
     if (dtype == 39u && getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         /* The prefetched MXFP4 down rows must match the plain kernel byte for
          * bit, shared Q8 slot included, at the default and generic geometries. */
@@ -2080,6 +2100,16 @@ static void test_moe_grouped(arena_t *a) {
     float *ap = download(gpart[0], np), *bp = download(gpart[1], np);
     check_exact_f32("grouped Q4_K mid", bm, am, nm);
     check_exact_f32("grouped MXFP4 down", bp, ap, np);
+    free(bm); free(am);
+    const uint64_t mx_gate_off = arena_mxfp4(a, (uint64_t)NE * F, E, &gate_w);
+    const uint64_t mx_up_off = arena_mxfp4(a, (uint64_t)NE * F, E, &up_w);
+    free(gate_w); free(up_w);
+    require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid[0], gx, gsel, a->base, a->size, mx_gate_off, mx_up_off, 39u, NE, T, slots,
+                                            E, F, 0, 0, UINT32_MAX), "grouped: per-token MXFP4 mid");
+    require_ok(ds4_gpu_qwen4_moe_mid_grouped_tensor(gmid[1], gx, gsel, glists, gcounts, cap, a->base, a->size, mx_gate_off,
+                                                    mx_up_off, 39u, NE, T, slots, E, F), "grouped: MXFP4 mid");
+    am = download(gmid[0], nm); bm = download(gmid[1], nm);
+    check_exact_f32("grouped MXFP4 mid", bm, am, nm);
     printf("  MoE grouped kernels: mid and down byte-exact against the per-token kernels under expert reuse\n");
     free(bp); free(ap); free(bm); free(am);
     for (int i = 0; i < 2; i++) { ds4_gpu_tensor_free(gpart[i]); ds4_gpu_tensor_free(gmid[i]); }
@@ -3567,6 +3597,10 @@ int main(void) {
         test_moe_types(&arena, 8, 6, 2560, 640, 2, 12u, 39u);
         test_moe_types(&arena, 8, 6, 256, 256, 9, 12u, 39u);
         test_moe_types(&arena, 8, 6, 256, 672, 3, 12u, 39u);
+        test_moe_types(&arena, 8, 6, 2560, 640, 1, 39u, 39u);
+        test_moe_types(&arena, 8, 6, 2560, 640, 2, 39u, 39u);
+        test_moe_types(&arena, 8, 6, 256, 256, 9, 39u, 39u);
+        test_moe_types(&arena, 8, 6, 256, 672, 3, 39u, 39u);
         printf("all Qwen MoE decode specialization tests passed\n");
         return 0;
     }
@@ -3652,6 +3686,8 @@ int main(void) {
     test_moe(&arena, 16, 10, 2560, 640, 1, 12u);
     test_moe(&arena, 16, 10, 2560, 640, 2, 12u);
     test_moe_types(&arena, 16, 10, 2560, 640, 2, 12u, 39u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 1, 39u, 39u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 2, 39u, 39u);
     test_moe_types(&arena, 16, 10, 2560, 640, 1, 16u, 10u);
     test_moe_types(&arena, 16, 10, 2560, 640, 37, 16u, 10u);
     test_moe_types(&arena, 8, 6, 256, 256, 9, 16u, 10u);
