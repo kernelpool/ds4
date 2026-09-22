@@ -59415,6 +59415,9 @@ typedef struct ds4_mimo_gpu_graph {
     float *host_logits;
     uint32_t verify_pos, verify_rows;
     ds4_gpu_tensor *argmax, *argmax_tmp;   /* GPU argmax of a draft row */
+    ds4_gpu_tensor *tok_id;                /* the verify row's first token, for the GPU gather */
+    bool mtp_draft_gpu;                    /* the draft's argmax waits on the GPU until the verify reads it */
+    bool rows_ready;                       /* the next forward's input rows are already in h */
     /* image spans of the prompt being prefilled: their rows replace token embeddings */
     const ds4_vision_span *vis_spans;
     size_t vis_span_count;
@@ -59426,6 +59429,8 @@ typedef struct ds4_mimo_gpu_graph {
     ds4_gpu_tensor *df_k_cache[DS4_DFLASH_MAX_LAYER];
     ds4_gpu_tensor *df_v_cache[DS4_DFLASH_MAX_LAYER];
 } ds4_mimo_gpu_graph;
+
+static bool mimo_graph_flush_draft(ds4_mimo_gpu_graph *g);
 
 static uint32_t mimo_layer_kv(uint32_t il) {
     return ds4_mimo_layer_is_swa(il) ? DS4_N_HEAD_KV_SWA : DS4_N_HEAD_KV;
@@ -59454,10 +59459,11 @@ static bool mimo_graph_weights_supported(const ds4_weights *w) {
 }
 
 static void mimo_graph_free(ds4_mimo_gpu_graph *g) {
+    if (g->mtp_draft_gpu) (void)glm_graph_end_commands_if_active();
     ds4_gpu_tensor *fields[] = { g->h, g->xn, g->qkv, g->q, g->attn_o, g->blk, g->attn_part, g->router,
                                  g->selected, g->weights, g->mid, g->part, g->moe_lists, g->moe_counts,
                                  g->ffn_g, g->ffn_u, g->ffn_m, g->logits,
-                                 g->mtp_a, g->mtp_b, g->mtp_e, g->mtp_cat, g->mtp_carry, g->argmax, g->argmax_tmp,
+                                 g->mtp_a, g->mtp_b, g->mtp_e, g->mtp_cat, g->mtp_carry, g->argmax, g->argmax_tmp, g->tok_id,
                                  g->df_feat, g->df_c, g->df_cn, g->df_x, g->df_xn, g->df_blk, g->df_q, g->df_qo, g->df_k,
                                  g->df_v, g->df_o, g->df_g, g->df_u, g->df_m, g->df_part };
     for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) ds4_gpu_tensor_free(fields[i]);
@@ -59527,7 +59533,8 @@ static bool mimo_graph_alloc(ds4_mimo_gpu_graph *g, const ds4_weights *w, uint32
         g->host_logits = xmalloc((uint64_t)(g->n_verify + 1u + DS4_DFLASH_BLOCK) * DS4_N_VOCAB * sizeof(float));
         g->argmax = ds4_gpu_tensor_alloc(sizeof(int32_t));
         g->argmax_tmp = ds4_gpu_tensor_alloc(((uint64_t)DS4_N_VOCAB / 4096u + 1u) * 8u);
-        ok = ok && g->argmax && g->argmax_tmp;
+        g->tok_id = ds4_gpu_tensor_alloc(sizeof(int32_t));
+        ok = ok && g->argmax && g->argmax_tmp && g->tok_id;
     }
     if (df) {
         const uint64_t B = df->block, Hk = (uint64_t)df->n_head * df->head_dim, Hv = (uint64_t)df->n_head * df->value_dim;
@@ -59578,6 +59585,7 @@ static bool mimo_graph_alloc(ds4_mimo_gpu_graph *g, const ds4_weights *w, uint32
 
 /* MTP depth k first sees position k + 1; its ring holds nothing below */
 static void mimo_graph_reset(ds4_mimo_gpu_graph *g) {
+    (void)mimo_graph_flush_draft(g);
     (void)ds4_gpu_synchronize();
     g->pos = 0;
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
@@ -59685,21 +59693,37 @@ static bool mimo_graph_head(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4
 /* Forward T tokens at g->pos..; logits (optional) receive the last token's
  * row, or all T rows with all_rows (T <= n_logit_rows).  h keeps the
  * post-trunk residual of every row afterwards. */
+/* A pending draft (its argmax and MTP rows still queued on the GPU) must
+ * finish before the host writes graph buffers; the verify reads the id. */
+static bool mimo_graph_flush_draft(ds4_mimo_gpu_graph *g) {
+    int32_t idx = 0;
+    if (!g->mtp_draft_gpu) return true;
+    g->mtp_draft_gpu = false;
+    if (!glm_graph_end_commands_if_active() || !ds4_gpu_tensor_read(g->argmax, 0, &idx, sizeof(idx))) return false;
+    g->mtp_draft[0] = (int)idx;
+    return true;
+}
+
 static bool mimo_graph_forward_tokens(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                       const int *tokens, uint32_t T, float *logits_out, bool all_rows) {
+    const bool rows_ready = g && g->rows_ready;
+    if (g) g->rows_ready = false;
     if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
     if (all_rows && T > g->n_logit_rows) return false;
     const uint32_t E = DS4_N_EMBD, n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
-    for (uint32_t t = 0; t < T; t++) {
-        if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
-            fprintf(stderr, "ds4: MiMo token id %d is outside the vocabulary\n", tokens[t]);
-            return false;
+    if (!rows_ready) {
+        if (!mimo_graph_flush_draft(g)) return false;
+        for (uint32_t t = 0; t < T; t++) {
+            if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
+                fprintf(stderr, "ds4: MiMo token id %d is outside the vocabulary\n", tokens[t]);
+                return false;
+            }
+            const float *img = g->vis_span_count ? qwen4_span_row(g->vis_spans, g->vis_span_count, g->pos + t) : NULL;
+            if (img) memcpy(g->host_row + (uint64_t)t * E, img, E * sizeof(float));
+            else qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], g->host_row + (uint64_t)t * E);
         }
-        const float *img = g->vis_span_count ? qwen4_span_row(g->vis_spans, g->vis_span_count, g->pos + t) : NULL;
-        if (img) memcpy(g->host_row + (uint64_t)t * E, img, E * sizeof(float));
-        else qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], g->host_row + (uint64_t)t * E);
+        if (!ds4_gpu_tensor_write(g->h, 0, g->host_row, (uint64_t)T * E * sizeof(float))) return false;
     }
-    if (!ds4_gpu_tensor_write(g->h, 0, g->host_row, (uint64_t)T * E * sizeof(float))) return false;
     if (!glm_graph_begin_commands_if_needed()) return false;
     const uint32_t pos0 = g->pos;
     g->verify_rows = 0;
@@ -59835,11 +59859,18 @@ static bool mimo_graph_mtp_rows(ds4_mimo_gpu_graph *g, const ds4_model *m, const
             ok = last &&
                  ds4_gpu_rms_norm_weight_rows_tensor(g->xn, last, m->map, m->size, l->nextn_shared_head_norm->abs_offset,
                                                      E, 1u, DS4_RMS_EPS) &&
-                 qwen4_gemv_rows(g->logits, m, w->output, g->xn, 1u, rows) &&
-                 mimo_graph_draft_argmax(g, rows, &drafts[k]);
+                 qwen4_gemv_rows(g->logits, m, w->output, g->xn, 1u, rows);
             ds4_gpu_tensor_free(last);
+            if (ok && n_draft == 1u && !rows_logits && w->token_embd->type == DS4_TENSOR_BF16) {
+                /* a single draft stays on the GPU: the verify gathers its row and reads the id */
+                ok = ds4_gpu_qwen4_argmax_tensor(g->argmax, g->argmax_tmp, g->logits, rows) != 0;
+                g->mtp_draft_gpu = ok;
+                drafts[k] = -1;
+            } else if (ok) {
+                ok = mimo_graph_draft_argmax(g, rows, &drafts[k]);
+            }
             if (ok) {
-                ok = (k + 1u >= K || mimo_graph_mtp_row_write(g, m, w, T + k + 2u, drafts[k])) &&
+                ok = (k + 1u >= n_draft || mimo_graph_mtp_row_write(g, m, w, T + k + 2u, drafts[k])) &&
                      glm_graph_begin_commands_if_needed();
             }
         }
@@ -59847,7 +59878,7 @@ static bool mimo_graph_mtp_rows(ds4_mimo_gpu_graph *g, const ds4_model *m, const
         ds4_gpu_tensor_free(h_rows);
         ds4_gpu_tensor_free(r);
     }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (ok && !g->mtp_draft_gpu) ok = ds4_gpu_end_commands() != 0;
     if (ok && n_draft) {
         g->mtp_parent = parent;
         g->mtp_n_draft = n_draft;
@@ -76242,6 +76273,7 @@ static void mimo_spec_oracle_drafts(ds4_mimo_gpu_graph *g) {
             fclose(f);
         }
     }
+    if (!mimo_graph_flush_draft(g)) return;
     for (uint32_t j = 0; g->mtp_draft_valid && j < g->mtp_n_draft; j++) {
         const uint32_t pos = g->pos + 1u + j;
         if (pos < (uint32_t)n) g->mtp_draft[j] = ids[pos];
@@ -76320,9 +76352,34 @@ static int ds4_session_mimo_spec_cycle(ds4_session *s, int first_token, float te
     for (uint32_t j = 0; j < D; j++) toks[1u + j] = g->mtp_draft[j];
     g->pos = n;
     s->checkpoint_valid = false;
+    if (g->mtp_draft_gpu) {
+        /* the rows come from the GPU: the first token by id, the draft by its argmax */
+        const uint32_t E = DS4_N_EMBD;
+        const int32_t id0 = first_token;
+        ds4_gpu_tensor *r0 = ds4_gpu_tensor_view(g->h, 0, (uint64_t)E * sizeof(float));
+        ds4_gpu_tensor *r1 = ds4_gpu_tensor_view(g->h, (uint64_t)E * sizeof(float), (uint64_t)E * sizeof(float));
+        const bool ok = D == 1u && r0 && r1 && ds4_gpu_tensor_write(g->tok_id, 0, &id0, sizeof(id0)) &&
+            glm_graph_begin_commands_if_needed() &&
+            ds4_gpu_glm53_embedding_bf16(r0, m->map, m->size, w->token_embd->abs_offset, g->tok_id, 1u, E, V) &&
+            ds4_gpu_glm53_embedding_bf16(r1, m->map, m->size, w->token_embd->abs_offset, g->argmax, 1u, E, V);
+        ds4_gpu_tensor_free(r1);
+        ds4_gpu_tensor_free(r0);
+        if (!ok) {
+            if (errlen) snprintf(err, errlen, "MiMo mtp: verify rows failed");
+            return -1;
+        }
+        g->rows_ready = true;
+    }
     if (!mimo_graph_forward_tokens(g, m, w, toks, D + 1u, rows, true)) {
         if (errlen) snprintf(err, errlen, "MiMo mtp: verify failed");
         return -1;
+    }
+    if (g->mtp_draft_gpu) {
+        if (!mimo_graph_flush_draft(g)) {
+            if (errlen) snprintf(err, errlen, "MiMo mtp: draft id read failed");
+            return -1;
+        }
+        toks[1] = g->mtp_draft[0];
     }
     g->verify_pos = n;
     g->verify_rows = D + 1u;
