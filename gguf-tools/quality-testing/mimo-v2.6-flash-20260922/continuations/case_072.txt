@@ -1,0 +1,1 @@
+Certamente. Spiego il concetto di **consistenza eventuale** (in inglese, *event

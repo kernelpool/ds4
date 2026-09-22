@@ -1,0 +1,28 @@
+{
+  "id": "cb5b563c-ced0-4a4b-a34f-936f491a9ba1_60bf5443181e4c68aab294e96e8f2a46",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Sorted arrays make membership tests faster because they allow the algorithm to use **Binary Search**, which reduces the time complexity from **",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052221,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 22,
+    "total_tokens": 46,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

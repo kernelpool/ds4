@@ -1,0 +1,1 @@
+A trie (pronounced "try," short for **re**trieval) represents a set of strings by organizing them

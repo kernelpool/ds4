@@ -1,0 +1,28 @@
+{
+  "id": "12d198ab-353d-4e0c-983b-dcda35c00c94_d8d757bd27f642c6a387ea9e11519296",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Ecco un progetto conciso e strutturato per un server TCP Echo che gestisce client lenti (",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052140,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 26,
+    "total_tokens": 50,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "f587639b-80e5-4853-ac50-1a1d80ae46dc_82b18ed1aeca47819e42a466f9b17637",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Of course. This is an excellent question that gets to the heart of how modern AI models, especially Large Language Models (",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052135,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 25,
+    "total_tokens": 49,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

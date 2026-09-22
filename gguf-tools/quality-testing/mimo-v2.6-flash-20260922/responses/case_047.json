@@ -1,0 +1,28 @@
+{
+  "id": "678eb768-92f3-4e41-b151-b38c02923954_2598a2ab87284a5bb19866cb937e1903",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Of course. Here is a detailed description of the difference between raw and compressed KV (Key-Value) rows, broken",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052201,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 21,
+    "total_tokens": 45,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

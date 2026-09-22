@@ -1,0 +1,28 @@
+{
+  "id": "c43e7f00-40f2-495f-93a5-cc469f0f46bf_3e40b18978bd4002b2add561196ad499",
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "17 per 23 fa **391**.",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052281,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 14,
+    "prompt_tokens": 27,
+    "total_tokens": 41,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

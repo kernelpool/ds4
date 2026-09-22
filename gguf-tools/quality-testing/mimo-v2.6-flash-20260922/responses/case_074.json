@@ -1,0 +1,28 @@
+{
+  "id": "3e061452-af38-4229-a1b3-68232c1f93ca_bc629233fed04a9fa8a9547aecb70d7f",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. Spiego la differenza tra latenza e throughput, due concetti fondamentali per misurare",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052243,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 21,
+    "total_tokens": 45,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

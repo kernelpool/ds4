@@ -1,0 +1,28 @@
+{
+  "id": "81f6b06a-9e0a-42db-9f9a-8a2681f0d0aa_b9daca89c0b74d298068c46ec2d6f0fa",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Of course. Here is a detailed explanation of why grouped MoE expert execution can improve the prefill phase of a transformer",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052171,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 22,
+    "total_tokens": 46,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

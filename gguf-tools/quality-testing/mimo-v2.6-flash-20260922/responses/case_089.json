@@ -1,0 +1,28 @@
+{
+  "id": "f8b13d09-91a5-47c7-b695-6f544bd2716c_5ce2944bbeaf4ac9aa719426bf9112a1",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "# How a Hash Table Handles Collisions\n\n## What Is a Collision?\n\nA collision occurs when **two different keys**",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052268,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 18,
+    "total_tokens": 42,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

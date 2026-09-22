@@ -1,0 +1,28 @@
+{
+  "id": "c8496be4-8102-4a2b-97cd-b6570bf7444f_ebdc852d5fbe4b3fa631bea3d4279e4e",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. Spiego in dettaglio perché un array ordinato rende la ricerca di appartenenza (cio",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052237,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 30,
+    "total_tokens": 54,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

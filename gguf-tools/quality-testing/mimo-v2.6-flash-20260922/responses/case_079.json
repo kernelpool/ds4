@@ -1,0 +1,28 @@
+{
+  "id": "cc6b93c7-a6d0-4c41-ab42-2cdc0a34663b_65853952a4ee47bd828ae8e7e5eb342b",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. Ecco una breve checklist per revisionare i lifetime di memoria in una Pull Request, pensata per essere",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052252,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 24,
+    "total_tokens": 48,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

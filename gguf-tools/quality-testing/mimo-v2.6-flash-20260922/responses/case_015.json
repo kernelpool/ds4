@@ -1,0 +1,28 @@
+{
+  "id": "af45ac76-f84e-4484-a1e6-d0f050343279_94c97c98277b42088bb694b074796664",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Ecco il pseudocodice per l'inserimento di un elemento in un **Heap Binario Minimo**",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052147,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 26,
+    "total_tokens": 50,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

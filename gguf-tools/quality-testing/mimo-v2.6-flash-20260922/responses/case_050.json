@@ -1,0 +1,28 @@
+{
+  "id": "41c33721-35ca-43b5-8008-b502dda116e1_0722b8d07e39418eb27dea8842545cef",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. Ecco cinque misure iniziali da prendere in considerazione per diagnosticare e risolver",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052205,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 35,
+    "total_tokens": 59,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

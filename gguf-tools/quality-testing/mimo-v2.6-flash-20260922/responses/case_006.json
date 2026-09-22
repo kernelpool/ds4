@@ -1,0 +1,28 @@
+{
+  "id": "161ec479-541d-4ef7-afce-afa020100381_9c656b5c6723416092674be73fb2f69a",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Of course. This is an excellent question that gets to the heart of how we control the output of language models.\n\nThe",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052131,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 23,
+    "total_tokens": 47,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

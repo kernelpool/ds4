@@ -1,0 +1,28 @@
+{
+  "id": "b114c597-bba0-493a-a446-20ef75dcd629_7972018dfc354c7fbedb2c142767c7fb",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Here are several ways to complete that sentence, depending on the specific context (business, technology, or general performance):\n\n**",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052253,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 18,
+    "total_tokens": 42,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

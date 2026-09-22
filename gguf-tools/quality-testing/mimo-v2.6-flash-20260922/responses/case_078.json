@@ -1,0 +1,28 @@
+{
+  "id": "29b2266b-7050-4e4b-9af1-3b5c2ea82ebf_045c92b7483b476792cef56dcebaa0a9",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. L'errore di quantizzazione può colpire più gli esperti rari per una ragione fond",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052250,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 33,
+    "total_tokens": 57,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

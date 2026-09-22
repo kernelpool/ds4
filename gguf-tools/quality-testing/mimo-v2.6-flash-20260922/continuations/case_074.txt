@@ -1,0 +1,1 @@
+Certamente. Spiego la differenza tra latenza e throughput, due concetti fondamentali per misurare

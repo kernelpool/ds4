@@ -1,0 +1,1 @@
+In computer graphics (specifically using Apple’s Metal API), the choice between a **single large buffer** and **multiple

@@ -1,0 +1,28 @@
+{
+  "id": "f405c7b1-17dd-4699-92c5-b9c38c889cc6_aa19f7bef5f54ecea05197f4a7fa6ba4",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Ecco uno schema JSON minimo e standard per una tool call, tipicamente usato nei modelli di linguaggio",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052210,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 27,
+    "total_tokens": 51,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

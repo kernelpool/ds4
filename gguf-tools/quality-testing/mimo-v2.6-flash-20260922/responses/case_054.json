@@ -1,0 +1,28 @@
+{
+  "id": "daba97f5-c54b-4302-be5c-dd0710051550_71862a02120e45f8bd2acc867c284b72",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Per testare che un `mmap` su file **non venga rimappato ripetutamente** (",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052211,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 28,
+    "total_tokens": 52,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

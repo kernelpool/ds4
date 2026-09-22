@@ -1,0 +1,3 @@
+Of course. Here is a comprehensive checklist for validating that a quantized model still follows instructions effectively.
+
+This checklist is designed

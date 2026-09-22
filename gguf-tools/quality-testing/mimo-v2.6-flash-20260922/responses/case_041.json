@@ -1,0 +1,28 @@
+{
+  "id": "828c2227-4bf5-4cfd-b557-82d2747f73e9_7e3e33dac16342fbbc1d44311c500fc6",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Of course. This is a fantastic question that gets to the heart of how language models make decisions.\n\nThe short answer is",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052191,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 20,
+    "total_tokens": 44,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

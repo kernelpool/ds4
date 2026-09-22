@@ -1,0 +1,28 @@
+{
+  "id": "46d3061a-e7b7-45c9-a36a-d826dbceecfc_c892cf679ef94a0ba3a3d6960425683b",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. Spiego il concetto di **consistenza eventuale** (in inglese, *event",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052239,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 22,
+    "total_tokens": 46,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

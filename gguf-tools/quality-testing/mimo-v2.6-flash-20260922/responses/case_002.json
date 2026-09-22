@@ -1,0 +1,28 @@
+{
+  "id": "243cd758-48fd-42d8-b7cf-b2872ef03f58_b19d7d7e81bc4946bf35a8e0fe7169e0",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Of course. This is an excellent question that gets to the heart of how modern operating systems manage memory and how it impacts",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052124,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 24,
+    "total_tokens": 48,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

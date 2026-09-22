@@ -1,0 +1,28 @@
+{
+  "id": "2c16427f-bdcd-4286-9b74-8fb6157b6366_5c5c4726f6bb4bb095cf20cb8e54d9d0",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. La derivazione della RMSNorm (Root Mean Square Normalization) è un'ottima esercit",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052144,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 28,
+    "total_tokens": 52,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

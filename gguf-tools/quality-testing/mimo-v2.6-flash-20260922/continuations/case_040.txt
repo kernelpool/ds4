@@ -1,0 +1,1 @@
+Here are the first five measurements to take, ordered to quickly isolate whether the slowdown is caused by the model architecture, the

@@ -1,0 +1,28 @@
+{
+  "id": "c326e007-533d-4bf7-8924-6cf407a1778c_f5f0e4e3963e4d049965ce2ec1631831",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Per salvare in modo sicuro l'header di un checkpoint (che contiene metadati come la versione del",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052181,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 28,
+    "total_tokens": 52,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

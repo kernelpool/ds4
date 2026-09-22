@@ -1,0 +1,28 @@
+{
+  "id": "807e6da8-2807-4fd6-ba7f-b2c2402701e0_ffe954b0bef046c89f7fcdc4b5a6ddfa",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Here are a few ways to complete that comment, depending on what the lock is actually protecting:\n\n**Option 1:",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052255,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 18,
+    "total_tokens": 42,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

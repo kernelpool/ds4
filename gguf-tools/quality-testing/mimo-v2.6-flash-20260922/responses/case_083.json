@@ -1,0 +1,28 @@
+{
+  "id": "09e54ffa-e41f-40c9-93b4-f6c88e3e954e_67485dd6b7b544f584dbfba4c7422a2a",
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "Il modello dovrebbe rispondere solo dopo aver letto l'intero prompt.",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052258,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 19,
+    "prompt_tokens": 24,
+    "total_tokens": 43,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

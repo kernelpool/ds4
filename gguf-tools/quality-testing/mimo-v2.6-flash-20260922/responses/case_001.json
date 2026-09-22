@@ -1,0 +1,28 @@
+{
+  "id": "c0ea419b-04be-44ef-a802-d33c63e75aaa_e0efee25a7f64af9af06ceadc09440a7",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Here is a concise design for a TCP echo server optimized to handle slow clients without blocking the entire system.\n\n### Core Strategy",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052123,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 23,
+    "total_tokens": 47,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

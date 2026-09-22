@@ -1,0 +1,28 @@
+{
+  "id": "07500ac5-9ae6-4ca7-bf92-bff3760cbe7a_0ac04d3f0f794f8d96b3cae1e55ef6bf",
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "Dante Alighieri.",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052279,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 7,
+    "prompt_tokens": 20,
+    "total_tokens": 27,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

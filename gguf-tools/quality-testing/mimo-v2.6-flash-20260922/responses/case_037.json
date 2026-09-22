@@ -1,0 +1,28 @@
+{
+  "id": "c88d14a1-d595-43c7-904d-d196bee5dc4b_0c84ef14617144c49b45b4e57c9b6ae0",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. Spieghiamo cos'è una matrice di importanza nel contesto della quantizzazione a bass",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052185,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 24,
+    "total_tokens": 48,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

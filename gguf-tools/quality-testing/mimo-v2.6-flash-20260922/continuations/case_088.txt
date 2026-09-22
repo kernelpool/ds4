@@ -1,0 +1,1 @@
+Of course. A tokenizer should treat special tags carefully because these tags are not just regular words; they are **structural instructions

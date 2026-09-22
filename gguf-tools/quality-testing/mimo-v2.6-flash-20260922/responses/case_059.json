@@ -1,0 +1,28 @@
+{
+  "id": "2a8528b6-1618-419f-8159-80875d78ea6d_ef2c91afb94a47ce96378c01af5dcbb5",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Valutare 50 prompt (o un set ampio) è infinitamente più utile di un singolo",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052218,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 31,
+    "total_tokens": 55,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

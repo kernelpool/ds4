@@ -1,0 +1,28 @@
+{
+  "id": "256dea10-48a2-4c91-9cf0-0e5d29dcf420_cb4f27896fc540b0bcb1617f6cdc1368",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Here are three examples of useful server metrics, ranging from hardware health to application performance:\n\n### 1. CPU Utilization",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052265,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 17,
+    "total_tokens": 41,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

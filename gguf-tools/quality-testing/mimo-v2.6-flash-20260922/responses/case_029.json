@@ -1,0 +1,28 @@
+{
+  "id": "de5bba96-df8a-4f79-91af-8919c58eb84e_e540bf045c664831a6dcea28bc370ed0",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Of course. Comparing two model quantizations without relying on a single answer is a crucial skill for deploying models efficiently.",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052172,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 23,
+    "total_tokens": 47,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

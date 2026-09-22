@@ -1,0 +1,28 @@
+{
+  "id": "3b76bfce-766e-4ed2-8929-ca8b3048b85f_442fc5f9a73b415fb8390fd7b214398c",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. Ecco una descrizione dettagliata della ricerca binaria del punto di inserimento, spieg",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052175,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 27,
+    "total_tokens": 51,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

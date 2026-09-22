@@ -1,0 +1,28 @@
+{
+  "id": "826bcd7b-370f-47d2-ae6d-4c7d856e0b91_9798713bfb014cd8aeeec925180d2e93",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "# B-Tree Insertion\n\n## B-Tree Basics\n\nA B-tree of order **m** (maximum children",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052121,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 23,
+    "total_tokens": 47,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

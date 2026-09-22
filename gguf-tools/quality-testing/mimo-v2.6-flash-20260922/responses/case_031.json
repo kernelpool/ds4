@@ -1,0 +1,28 @@
+{
+  "id": "2ed6c4b6-aa3a-46a6-ac24-d1b15be191f3_3187829ef6484334ad4bc5cca53f41d2",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Ecco una funzione C semplice ed efficace per limitare un intero (`int`) all'interno di",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052176,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 27,
+    "total_tokens": 51,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

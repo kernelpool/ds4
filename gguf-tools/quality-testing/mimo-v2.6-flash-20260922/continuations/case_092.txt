@@ -1,0 +1,3 @@
+Here is the standard SQL query to count rows per category.
+
+Assuming your table is named `products` and the column

@@ -1,0 +1,28 @@
+{
+  "id": "eca4ba97-5344-427d-934d-9ca9da63cfd2_da46bcfa9e2642aeb85381d458197084",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "- [ ] Ownership and lifetimes are explicit (no dangling references or use-after-free).\n- [ ] Aliasing is",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052233,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 24,
+    "total_tokens": 48,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

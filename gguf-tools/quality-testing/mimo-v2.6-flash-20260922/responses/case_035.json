@@ -1,0 +1,28 @@
+{
+  "id": "fe085aa6-9c2a-4e49-a956-079f3f8fae3d_68783a7c05c44f72b26ab01e88cccf92",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente! Ecco una spiegazione dettagliata di come funziona un ring buffer e le strateg",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052182,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 30,
+    "total_tokens": 54,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "ac5e07a7-9ae4-4db7-b268-ce2f9992eb5d_82c7c4a0cf7847c7a726a95d30330937",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Of course. Here is a comprehensive checklist for validating that a quantized model still follows instructions effectively.\n\nThis checklist is designed",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052202,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 23,
+    "total_tokens": 47,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

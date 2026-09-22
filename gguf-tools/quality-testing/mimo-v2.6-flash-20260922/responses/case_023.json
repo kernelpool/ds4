@@ -1,0 +1,28 @@
+{
+  "id": "155b12be-e244-4bc4-abd8-47d189d2c717_9bda60d74acd42aab4eef0c7003e9674",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "In a network server, **backpressure** is a mechanism used to protect a system from being overwhelmed by too much incoming",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052161,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 19,
+    "total_tokens": 43,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,6 @@
+Here is a concise C function to clamp an integer.
+
+```c
+#include <stdio.h>
+
+// Clamps 'value

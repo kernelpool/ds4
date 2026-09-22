@@ -1,0 +1,28 @@
+{
+  "id": "de6708a6-17cf-4fbc-963f-799a13cdcb44_1a159c1e26d143079b0b9fd8c75c7f88",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Here are a few ways to complete that sentence, depending on the specific context you want to emphasize:\n\n**The most common",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052257,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 22,
+    "total_tokens": 46,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "f98dc4b8-d865-498e-ae09-b5cca324ec59_cd685056d4124325a6c7c96d760ee8d0",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "```python\ndef median_of_three(a, b, c):\n    return sorted([a, b, c])[1",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052219,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 22,
+    "total_tokens": 46,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "20a4f821-7b1d-42f3-9e4d-14db35951a9b_cb983e0baeba4695a4ef45ea730cca0c",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. Ecco una descrizione dettagliata della differenza tra righe KV raw e righe KV",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052215,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 27,
+    "total_tokens": 51,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

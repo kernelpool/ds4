@@ -1,0 +1,28 @@
+{
+  "id": "5f5e9dea-c7cc-41a0-94d7-52aebec93d68_5b86df29cd98457bb5c3eb6fffa58e6c",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. Spieghiamo il concetto di **backpressure** (o \"contropressione\" in italiano",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052179,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 21,
+    "total_tokens": 45,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "dab24a0e-8189-461e-8807-9b8d322a813b_9d45ce7c74934c89876ccc6a2d6053f9",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Here are the first five measurements to take, ordered to quickly isolate whether the slowdown is caused by the model architecture, the",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052190,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 26,
+    "total_tokens": 50,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

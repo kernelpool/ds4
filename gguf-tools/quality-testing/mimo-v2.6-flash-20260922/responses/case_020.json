@@ -1,0 +1,28 @@
+{
+  "id": "1da60ad9-62e3-471f-a51e-df92d237946d_0b6c9faa44ce4c56b07697fd61cde236",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "# Binary Search for Insertion Point\n\n## Core Idea\n\nGiven a **sorted array** and a **target value**,",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052155,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 23,
+    "total_tokens": 47,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

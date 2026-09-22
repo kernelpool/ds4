@@ -1,0 +1,5 @@
+# Ring Buffer: Wrapping and Data Safety
+
+## What Is a Ring Buffer?
+
+A ring buffer (circular buffer

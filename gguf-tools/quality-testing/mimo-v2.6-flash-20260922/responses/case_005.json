@@ -1,0 +1,28 @@
+{
+  "id": "c7def9ab-a1fa-4742-90f1-03d5893c22c9_d2ee2874fbbf4f70ab9fddd8124bc070",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Here is the pseudocode for a **push** (also known as **insert**) operation on a binary heap.\n\n###",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052129,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 19,
+    "total_tokens": 43,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

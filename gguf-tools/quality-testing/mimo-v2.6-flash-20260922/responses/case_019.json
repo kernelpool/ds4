@@ -1,0 +1,28 @@
+{
+  "id": "b600123d-8c86-4728-98ce-2d3937a5b3ce_9aee1d8fcd5b4a2b863ff3fc679274dc",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Ecco tre invarianti fondamentali per una tabella di token speciali (spesso chiamata *Special",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052154,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 23,
+    "total_tokens": 47,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

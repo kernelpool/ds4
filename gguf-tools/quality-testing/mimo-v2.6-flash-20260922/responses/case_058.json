@@ -1,0 +1,28 @@
+{
+  "id": "ba61f9a9-1d3b-4d63-a371-33c9e7429037_cb6bf7aee1fd46a19e272846c02207c6",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. Ecco una checklist dettagliata e strutturata per validare che un modello quant",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052216,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 30,
+    "total_tokens": 54,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

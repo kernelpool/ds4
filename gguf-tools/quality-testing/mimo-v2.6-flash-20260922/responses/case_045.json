@@ -1,0 +1,28 @@
+{
+  "id": "59c85f00-3323-4334-a1ad-5648e5875260_b11bedad63864d3c91cd77e99f19eca1",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "In computer graphics (specifically using Apple’s Metal API), the choice between a **single large buffer** and **multiple",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052197,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 24,
+    "total_tokens": 48,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

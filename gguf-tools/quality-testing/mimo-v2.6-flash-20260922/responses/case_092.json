@@ -1,0 +1,28 @@
+{
+  "id": "180a2bd7-978b-4294-a881-a671695a89e6_7e88e65fba9f4435840f481ce25934fc",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Here is the standard SQL query to count rows per category.\n\nAssuming your table is named `products` and the column",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052273,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 20,
+    "total_tokens": 44,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

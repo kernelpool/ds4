@@ -1,0 +1,28 @@
+{
+  "id": "fdfa49fa-43c8-4d06-9b78-588da66619a6_90e9098b28dd46d29f13989163dbd32b",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "To test that a file-backed `mmap` is not repeatedly remapped (i.e., that the kernel is re",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052195,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 24,
+    "total_tokens": 48,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

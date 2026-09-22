@@ -1,0 +1,28 @@
+{
+  "id": "fda1b31b-3e88-46ee-b648-d0b3fd019e54_c556e9fecef64c5c88f1584f7f7b59be",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. Ecco un piano breve e strutturato per testare l'efficacia del chunking",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052184,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 25,
+    "total_tokens": 49,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

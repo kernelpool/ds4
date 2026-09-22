@@ -1,0 +1,1 @@
+Certamente! Ecco una spiegazione dettagliata di come funziona un ring buffer e le strateg

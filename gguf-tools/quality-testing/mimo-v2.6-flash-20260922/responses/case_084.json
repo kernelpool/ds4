@@ -1,0 +1,28 @@
+{
+  "id": "e935477f-33c2-4207-8a40-578c6e6582f0_e3da80fcf75f4851b0e20e7a86d06ed6",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Here are a few ways to translate this, depending on the desired level of technicality:\n\n**Most direct/technical:",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052259,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 28,
+    "total_tokens": 52,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

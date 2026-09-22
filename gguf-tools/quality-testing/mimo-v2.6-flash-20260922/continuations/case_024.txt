@@ -1,0 +1,3 @@
+Of course. Here is a detailed description of a safe and robust format for storing a model checkpoint header.
+
+### Core Principles

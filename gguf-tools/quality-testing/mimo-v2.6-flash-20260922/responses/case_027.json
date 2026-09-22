@@ -1,0 +1,28 @@
+{
+  "id": "331efe3c-3f83-4529-b230-635815adbabd_e2a931fd33a34c59939ee2c3acb8facb",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "In the context of low-bit quantization (reducing the precision of neural network weights and activations from 32",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052169,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 20,
+    "total_tokens": 44,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

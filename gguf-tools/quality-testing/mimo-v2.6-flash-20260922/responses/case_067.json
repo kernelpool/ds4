@@ -1,0 +1,28 @@
+{
+  "id": "54a953ae-ce00-46ee-9343-b3e636830bf7_8296bd6b6587404a8934cee4a0c6aea3",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "The discrepancy between **virtual address space size** (the range of addresses allocated) and **page residency** (the amount",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052231,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 21,
+    "total_tokens": 45,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

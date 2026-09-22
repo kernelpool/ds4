@@ -1,0 +1,3 @@
+Here are three robust invariants for a tokenizer special-token table, ranging from structural integrity to semantic consistency.
+
+### 1

@@ -1,0 +1,28 @@
+{
+  "id": "9f859d55-6c4b-4c86-8142-ec59403d31c8_312d82ba1934433caacf0c37bb27ef1d",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Of course! This is a fundamental concept in computing, networking, and many other fields. The difference between latency and throughput",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052226,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 18,
+    "total_tokens": 42,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

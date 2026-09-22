@@ -1,0 +1,28 @@
+{
+  "id": "07e0783a-fb63-4327-91f5-ca3eeebb7a42_6df355223a1e4172945e92d788e2fe1d",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "**Eventual consistency** is a consistency model used in distributed databases (like Cassandra, DynamoDB, or Riak)",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052223,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 19,
+    "total_tokens": 43,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

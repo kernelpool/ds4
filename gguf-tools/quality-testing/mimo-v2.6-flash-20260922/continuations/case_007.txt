@@ -1,0 +1,5 @@
+Of course. Here is a summary of how speculative decoding preserves the exact greedy output.
+
+### The Core Idea
+
+Speculative

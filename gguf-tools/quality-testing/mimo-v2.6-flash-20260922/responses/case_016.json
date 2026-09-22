@@ -1,0 +1,28 @@
+{
+  "id": "01a3084b-334e-4d57-b099-e612b6e26b9f_b69b3d6c8d50472db3842012dd13d046",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. È un'ottima domanda che tocca il cuore di come i modelli di linguaggio",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052149,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 25,
+    "total_tokens": 49,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

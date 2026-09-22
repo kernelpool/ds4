@@ -1,0 +1,1 @@
+Certamente. Spiegare perché un grande buffer Metal può essere peggiore di viste sovrapposte (

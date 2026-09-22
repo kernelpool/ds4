@@ -1,0 +1,28 @@
+{
+  "id": "2906ba08-c3c3-49f5-b013-3a96679d88e6_eb331fe42e76494db431489eff8a051d",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Here is an explanation of **Online Softmax** in the context of Attention, using simple variables.\n\n### The Problem:",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052193,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 19,
+    "total_tokens": 43,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

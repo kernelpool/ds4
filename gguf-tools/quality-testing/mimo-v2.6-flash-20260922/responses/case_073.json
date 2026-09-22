@@ -1,0 +1,28 @@
+{
+  "id": "c6f2fc53-a70e-4fa3-86e8-a265ede9c4ce_7d16d2f0f6e84b9488ffa625b90a1009",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Ecco un esempio classico e semplice di **Race Condition** in C.\n\nIn questo esempio",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052241,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 22,
+    "total_tokens": 46,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

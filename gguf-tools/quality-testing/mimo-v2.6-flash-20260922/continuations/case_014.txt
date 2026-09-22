@@ -1,0 +1,1 @@
+Certamente. Spiego in dettaglio perché la cache KV su disco è un'innovazione cruciale per

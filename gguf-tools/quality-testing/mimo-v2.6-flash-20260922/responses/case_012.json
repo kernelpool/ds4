@@ -1,0 +1,28 @@
+{
+  "id": "14c123b3-00b0-43c6-8026-ba743073cc5a_95541103c740420581a0306a9535cab0",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Ecco un confronto dettagliato tra l'uso di `mmap` (Memory Mapping) e la",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052142,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 26,
+    "total_tokens": 50,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

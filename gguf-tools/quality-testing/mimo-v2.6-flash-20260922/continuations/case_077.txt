@@ -1,0 +1,1 @@
+Certamente. La differenza tra la dimensione virtuale di una regione di memoria `mmap` e la

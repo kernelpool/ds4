@@ -1,0 +1,28 @@
+{
+  "id": "c71383ec-8fcd-483f-bd1c-9cddaa4f4a3b_b63cb344e68142a592ac3b15a99a559e",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Testare un parser da riga di comando (CLI) con i casi limite è fondamentale per garantire robust",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052247,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 26,
+    "total_tokens": 50,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

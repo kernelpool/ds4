@@ -1,0 +1,28 @@
+{
+  "id": "9e6ca5f4-c858-4fdb-9f64-c550a23fcefc_90f4360d83194288aec47d519889d98c",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "In the context of quantizing a neural network (converting floating-point weights and activations to lower-precision integers like INT",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052270,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 22,
+    "total_tokens": 46,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

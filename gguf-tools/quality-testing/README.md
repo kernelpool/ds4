@@ -31,6 +31,9 @@ calling hosted APIs:
   continuations from Alibaba through OpenRouter, with top-five logprobs.
 - `data/qwen38-flash-alibaba-long`: 12 archive/code continuations from the
   same endpoint, with prompts from 2K to 24K tokens.
+- [mimo-v2.6-flash-20260922](mimo-v2.6-flash-20260922/README.md): 100
+  non-thinking MiMo-V2.6 Flash continuations from the Xiaomi platform, no
+  logprobs, with the Metal MXFP4 reference scores.
 - [deepseek-v4.1-flash-20260919-router](deepseek-v4.1-flash-20260919-router/README.md):
   112 fresh official V4.1 Flash continuations, including 12 longer prompts up
   to 23K tokens. Temperature-1 samples with top-20 logprobs, intended for

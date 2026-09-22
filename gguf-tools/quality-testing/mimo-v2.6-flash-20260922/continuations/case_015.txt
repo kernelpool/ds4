@@ -1,0 +1,1 @@
+Ecco il pseudocodice per l'inserimento di un elemento in un **Heap Binario Minimo**

@@ -1,0 +1,1 @@
+Of course. Here is a detailed explanation of why grouped MoE expert execution can improve the prefill phase of a transformer

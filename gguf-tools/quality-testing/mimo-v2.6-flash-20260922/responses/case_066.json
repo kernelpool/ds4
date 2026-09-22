@@ -1,0 +1,28 @@
+{
+  "id": "0b7566f1-ad3f-4b2b-999f-8c4af9073e5a_c53e6d8e6f3b454291c468c11122fa6c",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Testing a command-line parser requires a shift in mindset from testing standard functions. You are not just testing logic; you are",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052229,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 21,
+    "total_tokens": 45,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

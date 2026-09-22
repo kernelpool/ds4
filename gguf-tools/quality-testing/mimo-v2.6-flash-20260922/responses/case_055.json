@@ -1,0 +1,28 @@
+{
+  "id": "b53a7456-b43b-451b-8d31-d65e146635f3_c90968881f31444e91f3d1ecc09654db",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. Spiegare perché un grande buffer Metal può essere peggiore di viste sovrapposte (",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052212,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 32,
+    "total_tokens": 56,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

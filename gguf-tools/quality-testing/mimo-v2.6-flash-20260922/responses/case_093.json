@@ -1,0 +1,28 @@
+{
+  "id": "7e84b5e4-b30e-4b87-8ffa-5547ead28065_64ed016132e84c70ac7112d022ee4f5e",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "A page cache makes a second file read faster primarily because it eliminates the need to access the physical storage device (HDD",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052275,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 23,
+    "total_tokens": 47,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

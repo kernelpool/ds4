@@ -1,0 +1,1 @@
+Certamente! Ecco una spiegazione dettagliata di come un trie rappresenta un insieme di

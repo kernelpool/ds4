@@ -1,0 +1,28 @@
+{
+  "id": "d6fe9e5e-4ca4-44f3-8a77-41fdf543e614_83468e567c354fc0bfabccb27fe4ea0d",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Per confrontare due quantizzazioni (ad esempio due modelli di compressione audio, due algoritmi",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052188,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 28,
+    "total_tokens": 52,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

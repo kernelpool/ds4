@@ -137,6 +137,8 @@ def request_one(
     provider_require_parameters: bool,
     temperature: float = 0,
     system: str | None = None,
+    api_key_header: str = "Authorization",
+    chat_template_kwargs: dict | None = None,
 ) -> dict:
     payload = {
         "model": model,
@@ -146,6 +148,8 @@ def request_one(
     }
     if system is not None:
         payload["messages"].insert(0, {"role": "system", "content": system})
+    if chat_template_kwargs:
+        payload["chat_template_kwargs"] = chat_template_kwargs
     if top_logprobs > 0:
         payload["logprobs"] = True
         payload["top_logprobs"] = top_logprobs
@@ -164,7 +168,7 @@ def request_one(
         endpoint,
         data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {api_key}",
+            api_key_header: f"Bearer {api_key}" if api_key_header == "Authorization" else api_key,
             "Content-Type": "application/json",
         },
         method="POST",
@@ -188,6 +192,8 @@ def fetch_with_retry(
     provider_require_parameters: bool,
     temperature: float = 0,
     system: str | None = None,
+    api_key_header: str = "Authorization",
+    chat_template_kwargs: dict | None = None,
 ) -> dict:
     delay = 1.0
     for attempt in range(6):
@@ -207,6 +213,8 @@ def fetch_with_retry(
                 provider_require_parameters,
                 temperature,
                 system,
+                api_key_header,
+                chat_template_kwargs,
             )
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "replace")
@@ -232,6 +240,10 @@ def main() -> int:
                          "some providers insert a default when this is omitted")
     ap.add_argument("--endpoint", default=ENDPOINT)
     ap.add_argument("--api-key-env", default=None)
+    ap.add_argument("--api-key-header", default="Authorization",
+                    help="header carrying the key; anything but Authorization sends it verbatim")
+    ap.add_argument("--chat-template-kwargs", default=None,
+                    help="JSON object sent as chat_template_kwargs (e.g. enable_thinking=false)")
     ap.add_argument("--count", type=int, default=100)
     ap.add_argument("--max-tokens", type=int, default=24)
     ap.add_argument("--top-logprobs", type=int, default=5)
@@ -337,6 +349,8 @@ def main() -> int:
                     provider_require_parameters,
                     args.temperature,
                     args.system,
+                    args.api_key_header,
+                    json.loads(args.chat_template_kwargs) if args.chat_template_kwargs else None,
                 )
                 choice = response["choices"][0]
                 content = choice.get("message", {}).get("content")

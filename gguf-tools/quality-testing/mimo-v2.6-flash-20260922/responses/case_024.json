@@ -1,0 +1,28 @@
+{
+  "id": "3a5ad93c-1004-42d7-baf4-b9c810f8bacc_03314455bcd648ab896686f8c98d10b9",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Of course. Here is a detailed description of a safe and robust format for storing a model checkpoint header.\n\n### Core Principles",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052163,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 20,
+    "total_tokens": 44,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

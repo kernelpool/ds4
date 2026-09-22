@@ -1,0 +1,28 @@
+{
+  "id": "bfca2fff-b3dd-407d-b741-efbd384ef50b_0e5c069700224f0d83587a9896cf3bb3",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "# Ring Buffer: Wrapping and Data Safety\n\n## What Is a Ring Buffer?\n\nA ring buffer (circular buffer",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052164,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 25,
+    "total_tokens": 49,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

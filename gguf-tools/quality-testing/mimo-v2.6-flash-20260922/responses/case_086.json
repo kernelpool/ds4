@@ -1,0 +1,28 @@
+{
+  "id": "d5b5cfeb-7975-4f37-b2ee-acc75abf0ff6_0e753b0bd1d64f1b8434f16ea3f4816c",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Checksums catch accidental corruption because they act as a mathematical fingerprint of the original data, calculated using a specific algorithm that is",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052263,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 21,
+    "total_tokens": 45,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

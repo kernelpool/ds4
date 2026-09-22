@@ -1,0 +1,28 @@
+{
+  "id": "f4e2c9e4-201f-4910-a782-b997d49d8e40_70f32d7b982e4bdd876322ad2fba7600",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente! Ecco una spiegazione dettagliata di come funziona l'inserimento in un",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052138,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 32,
+    "total_tokens": 56,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

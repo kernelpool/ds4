@@ -1,0 +1,28 @@
+{
+  "id": "f05c79cb-f9e0-4e2b-a349-b2c851b79dbc_57d6b69a1df744c6bf02947c41c3cc3c",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Of course. A tokenizer should treat special tags carefully because these tags are not just regular words; they are **structural instructions",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052267,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 18,
+    "total_tokens": 42,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

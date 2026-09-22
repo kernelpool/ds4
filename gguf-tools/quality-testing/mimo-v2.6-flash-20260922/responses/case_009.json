@@ -1,0 +1,28 @@
+{
+  "id": "6599aa8b-4cde-44e4-a4fc-bd0eb38f1a53_16c05d513a464b749e15f3f7a29da4fd",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Here are three robust invariants for a tokenizer special-token table, ranging from structural integrity to semantic consistency.\n\n### 1",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052137,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 20,
+    "total_tokens": 44,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

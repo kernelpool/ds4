@@ -1,0 +1,1 @@
+Sorted arrays make membership tests faster because they allow the algorithm to use **Binary Search**, which reduces the time complexity from **

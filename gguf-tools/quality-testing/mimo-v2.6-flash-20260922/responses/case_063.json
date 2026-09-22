@@ -1,0 +1,28 @@
+{
+  "id": "bcd2e5e8-9073-4a81-9d56-c7268e3f9fef_95da9f5e7131432a97a0ea804d38fa28",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Here is a classic, short example of a race condition using two threads incrementing a shared global variable.\n\n### The Code",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052225,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 20,
+    "total_tokens": 44,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

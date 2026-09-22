@@ -1,0 +1,3 @@
+Here is an explanation of **Online Softmax** in the context of Attention, using simple variables.
+
+### The Problem:

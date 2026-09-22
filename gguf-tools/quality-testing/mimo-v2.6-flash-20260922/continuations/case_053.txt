@@ -1,0 +1,1 @@
+Ecco uno schema JSON minimo e standard per una tool call, tipicamente usato nei modelli di linguaggio

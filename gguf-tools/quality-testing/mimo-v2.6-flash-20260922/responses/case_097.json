@@ -1,0 +1,28 @@
+{
+  "id": "de6feca6-0adc-4c7f-825c-61c1467aad81_10227ca2c8054cefab46ab4b54986b87",
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "La capitale del Giappone è **Tokyo**.",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052280,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 14,
+    "prompt_tokens": 27,
+    "total_tokens": 41,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

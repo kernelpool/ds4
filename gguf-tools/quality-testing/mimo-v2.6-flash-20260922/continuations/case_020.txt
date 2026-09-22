@@ -1,0 +1,5 @@
+# Binary Search for Insertion Point
+
+## Core Idea
+
+Given a **sorted array** and a **target value**,

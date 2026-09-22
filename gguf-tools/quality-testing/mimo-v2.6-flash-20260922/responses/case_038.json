@@ -1,0 +1,28 @@
+{
+  "id": "b7b282da-1591-4f54-a313-70295669c215_56b206cfe37a47b783fa8ce35d3a9a1c",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. Spieghiamo perché raggruppare gli esperti (MoE) può accelerare la fase",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052186,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 31,
+    "total_tokens": 55,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "944e550d-87ca-4c53-b6b8-e93378b10ff4_723383a6a0d74422bc993df8bc37a067",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Ecco una funzione semplice e diretta per ottenere la mediana di tre numeri.\n\nIl modo",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052236,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 30,
+    "total_tokens": 54,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

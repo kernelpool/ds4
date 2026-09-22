@@ -354,3 +354,32 @@ pre-tokenizer from a current `regex` release.
 `make test-qwen4-kernels` runs the Metal kernel tests and
 `make test-qwen4-vision` checks the vision tower against the HF implementation
 (`tests/qwen4_vision_ref.py`).
+
+## MiMo-V2.6 Flash
+
+`mimo26_quantize.py` converts the released checkpoint (fp8 attention with
+per-chunk scales, MXFP4 experts) into the llama.cpp `mimo2` layout DS4
+loads, plus the `dflash` drafter sidecar with the DS4 extras
+(`mask_embd.weight`, `dflash.attention.value_scale`):
+
+```sh
+python3 gguf-tools/mimo26_quantize.py --hf /path/to/MiMo-V2.6-Flash-RL \
+  --out /path/to/MiMo-V2.6-Flash-MXFP4.gguf --quant mxfp4 \
+  --dflash-out /path/to/MiMo-V2.6-Flash-DFlash-Q8_0.gguf
+```
+
+`--quant mxfp4` repacks the experts into ggml MXFP4 blocks bit for bit and
+stores the dequantized fp8 attention/dense weights as Q8_0; `--quant q8`
+and `--quant f32` dequantize the experts too. The fused QKV projection is
+de-interleaved from its tensor-parallel chunks. `--resume` continues an
+interrupted run and `--dry-run` prints the plan.
+
+`mimo26_vision.py` writes the vision tower as a llama.cpp clip mmproj
+(`mimovl`), splitting the Conv3D patch embedding into its two temporal taps:
+
+```sh
+python3 gguf-tools/mimo26_vision.py --hf /path/to/MiMo-V2.6-Flash-RL \
+  --source-revision <commit> --out /path/to/MiMo-V2.6-Flash-Vision-F32.gguf --quant f32
+```
+
+`--quant f32` keeps the BF16 tower exactly; `--quant q8` writes Q8_0 matrices.

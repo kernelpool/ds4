@@ -1,0 +1,28 @@
+{
+  "id": "7e660055-da0c-4035-b344-e8da2889f337_e7882a1ff0464554899b37c87ba73f52",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. La differenza tra la dimensione virtuale di una regione di memoria `mmap` e la",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052249,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 29,
+    "total_tokens": 53,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "2b11e321-ee06-4957-81d6-c847fbe65d1a_6d34e2cbf612484fbc62d68f2c893a20",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Of course. Evaluating 50 prompts is vastly more informative than relying on a single favorite prompt because it shifts your",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052204,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 25,
+    "total_tokens": 49,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

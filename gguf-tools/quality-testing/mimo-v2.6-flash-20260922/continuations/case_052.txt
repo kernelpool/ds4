@@ -1,0 +1,1 @@
+Certamente! Spieghiamo l'**Online Softmax** nell'attenzione usando un'analogia molto

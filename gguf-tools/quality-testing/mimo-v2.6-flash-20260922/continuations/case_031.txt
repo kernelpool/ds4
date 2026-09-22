@@ -1,0 +1,1 @@
+Ecco una funzione C semplice ed efficace per limitare un intero (`int`) all'interno di

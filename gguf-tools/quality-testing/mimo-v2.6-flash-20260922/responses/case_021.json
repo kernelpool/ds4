@@ -1,0 +1,28 @@
+{
+  "id": "2a932989-5f75-4fd8-b8a9-5794c5b43916_2ceaf7476680467d8b554446ef26699c",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Here is a concise C function to clamp an integer.\n\n```c\n#include <stdio.h>\n\n// Clamps 'value",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790052157,
+  "model": "mimo-v2.6-flash",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 23,
+    "total_tokens": 47,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

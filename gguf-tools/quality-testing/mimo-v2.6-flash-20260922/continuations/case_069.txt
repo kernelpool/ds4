@@ -1,0 +1,2 @@
+- [ ] Ownership and lifetimes are explicit (no dangling references or use-after-free).
+- [ ] Aliasing is

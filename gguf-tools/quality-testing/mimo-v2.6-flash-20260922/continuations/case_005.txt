@@ -1,0 +1,3 @@
+Here is the pseudocode for a **push** (also known as **insert**) operation on a binary heap.
+
+###
