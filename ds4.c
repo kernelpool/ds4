@@ -59593,15 +59593,18 @@ static bool mimo_graph_attention(ds4_mimo_gpu_graph *g, const ds4_model *m, cons
     const bool swa = ds4_mimo_layer_is_swa(il);
     const uint32_t kv = mimo_layer_kv(il);
     const float base = swa ? DS4_ROPE_FREQ_BASE_SWA : DS4_ROPE_FREQ_BASE;
+    /* a single token lets the attention kernel do the prep itself */
     return qwen4_gemv(g->qkv, m, l->attn_qkv, g->xn, T) &&
-           ds4_gpu_mimo_attn_prep_tensor(g->q, g->k_cache[il], g->v_cache[il], g->qkv, T, DS4_N_HEAD, kv,
-                                         DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, DS4_N_ROT, pos0, g->ring[il], base,
-                                         DS4_ATTN_VALUE_SCALE) &&
+           (T == 1u ||
+            ds4_gpu_mimo_attn_prep_tensor(g->q, g->k_cache[il], g->v_cache[il], g->qkv, T, DS4_N_HEAD, kv,
+                                          DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, DS4_N_ROT, pos0, g->ring[il], base,
+                                          DS4_ATTN_VALUE_SCALE)) &&
            ds4_gpu_mimo_attn_tensor(g->attn_o, g->q, g->k_cache[il], g->v_cache[il], m->map, m->size,
                                     swa ? l->attn_sinks->abs_offset : 0u, swa,
                                     T <= DS4_MIMO_PART_ROWS ? g->attn_part : NULL, T, DS4_N_HEAD, kv,
                                     DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, pos0, g->ring[il], swa ? DS4_N_SWA : 0u,
-                                    g->first[il], 0u, 1.0f / sqrtf((float)DS4_N_HEAD_DIM)) &&
+                                    g->first[il], 0u, 1.0f / sqrtf((float)DS4_N_HEAD_DIM),
+                                    T == 1u ? g->qkv : NULL, DS4_N_ROT, base, DS4_ATTN_VALUE_SCALE) &&
            qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
 }
 
@@ -59614,7 +59617,8 @@ static bool mimo_graph_dense_ffn(ds4_mimo_gpu_graph *g, const ds4_model *m, cons
 
 /* router GEMV + sigmoid top-k, experts per (token, slot) rows or, for
  * prefill-sized batches, the expert-grouped tiled GEMMs, weighted reduce */
-static bool mimo_graph_moe(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
+static bool mimo_graph_moe(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, ds4_gpu_tensor *h,
+                           uint32_t T) {
     const uint32_t NE = DS4_N_EXPERT, K = DS4_N_EXPERT_USED, E = DS4_N_EMBD, FF = DS4_N_FF_EXP;
     bool ok = qwen4_gemv(g->router, m, l->ffn_gate_inp, g->xn, T) &&
               ds4_gpu_mimo_router_tensor(g->selected, g->weights, g->router, m->map, m->size,
@@ -59651,8 +59655,7 @@ static bool mimo_graph_moe(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_
              ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
                                            l->ffn_down_exps->type, NE, T, K, FF, E, 0u, UINT32_MAX) != 0;
     }
-    return ok && ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, NULL, NULL, NULL, NULL,
-                                                 T, K, K, E, 0u) != 0;
+    return ok && ds4_gpu_qwen4_moe_reduce_add_tensor(h, g->part, g->weights, T, K, E) != 0;
 }
 
 /* pre-norm block on the T rows of residual h at pos0.. */
@@ -59661,10 +59664,10 @@ static bool mimo_graph_layer(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds
     const uint32_t E = DS4_N_EMBD;
     return ds4_gpu_rms_norm_weight_rows_tensor(g->xn, h, m->map, m->size, l->attn_norm->abs_offset, E, T, DS4_RMS_EPS) &&
            mimo_graph_attention(g, m, l, il, pos0, T) &&
-           ds4_gpu_add_tensor(h, h, g->blk, T * E) &&
-           ds4_gpu_rms_norm_weight_rows_tensor(g->xn, h, m->map, m->size, l->ffn_norm->abs_offset, E, T, DS4_RMS_EPS) &&
-           (ds4_mimo_layer_is_dense(il) ? mimo_graph_dense_ffn(g, m, l, T) : mimo_graph_moe(g, m, l, T)) &&
-           ds4_gpu_add_tensor(h, h, g->blk, T * E);
+           ds4_gpu_add_rms_norm_weight_rows_tensor(g->xn, h, h, g->blk, m->map, m->size, l->ffn_norm->abs_offset, E, T,
+                                                   DS4_RMS_EPS) &&
+           (ds4_mimo_layer_is_dense(il) ? mimo_graph_dense_ffn(g, m, l, T) && ds4_gpu_add_tensor(h, h, g->blk, T * E)
+                                        : mimo_graph_moe(g, m, l, h, T));
 }
 
 /* norm + head over rows [row0, row0 + n) of h into logit rows 0..n-1 */
@@ -59907,7 +59910,7 @@ static bool mimo_graph_dflash_draft(ds4_mimo_gpu_graph *g, const ds4_model *m, c
                                              g->df_ring, d->rope_base, d->value_scale, d->eps) &&
              ds4_gpu_mimo_attn_tensor(g->df_o, g->df_qo, g->df_k_cache[il], g->df_v_cache[il], dm->map, dm->size,
                                       l->sinks->abs_offset, true, g->df_part, B, d->n_head, d->n_head_kv, d->head_dim,
-                                      d->value_dim, s, g->df_ring, d->window, 0u, s + B, scale) &&
+                                      d->value_dim, s, g->df_ring, d->window, 0u, s + B, scale, NULL, 0u, 0.0f, 0.0f) &&
              qwen4_gemv(g->df_blk, dm, l->o, g->df_o, B) &&
              ds4_gpu_add_tensor(g->df_x, g->df_x, g->df_blk, B * E) &&
              ds4_gpu_rms_norm_weight_rows_tensor(g->df_xn, g->df_x, dm->map, dm->size, l->ffn_norm->abs_offset, E, B, d->eps) &&

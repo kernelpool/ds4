@@ -22372,8 +22372,22 @@ int ds4_gpu_add_rms_norm_weight_tensor(
         uint64_t                weight_offset,
         uint32_t                n,
         float                   eps) {
+    return ds4_gpu_add_rms_norm_weight_rows_tensor(norm_out, sum_out, a, b, model_map, model_size, weight_offset, n, 1u, eps);
+}
+
+int ds4_gpu_add_rms_norm_weight_rows_tensor(
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *sum_out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!norm_out || !sum_out || !a || !b || n == 0 || (n & 3u) != 0) return 0;
+    if (!norm_out || !sum_out || !a || !b || n == 0 || rows == 0 || (n & 3u) != 0) return 0;
 
     @autoreleasepool {
         id<MTLBuffer> abuf = ds4_gpu_tensor_buffer(a);
@@ -22381,11 +22395,12 @@ int ds4_gpu_add_rms_norm_weight_tensor(
         id<MTLBuffer> sumbuf = ds4_gpu_tensor_buffer(sum_out);
         id<MTLBuffer> normbuf = ds4_gpu_tensor_buffer(norm_out);
         const uint64_t row_bytes = (uint64_t)n * sizeof(float);
+        const uint64_t bytes = row_bytes * rows;
         if (!abuf || !bbuf || !sumbuf || !normbuf ||
-            ds4_gpu_tensor_bytes(a) < row_bytes ||
-            ds4_gpu_tensor_bytes(b) < row_bytes ||
-            ds4_gpu_tensor_bytes(sum_out) < row_bytes ||
-            ds4_gpu_tensor_bytes(norm_out) < row_bytes) {
+            ds4_gpu_tensor_bytes(a) < bytes ||
+            ds4_gpu_tensor_bytes(b) < bytes ||
+            ds4_gpu_tensor_bytes(sum_out) < bytes ||
+            ds4_gpu_tensor_bytes(norm_out) < bytes) {
             fprintf(stderr, "ds4: Metal add+RMS norm received undersized activation buffers\n");
             return 0;
         }
@@ -22395,14 +22410,10 @@ int ds4_gpu_add_rms_norm_weight_tensor(
         }
 
         uint64_t inner_offset = 0;
-        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map,
-                                                       model_size,
-                                                       weight_offset,
-                                                       row_bytes,
-                                                       &inner_offset);
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight_offset, row_bytes, &inner_offset);
         if (!wbuf) return 0;
 
-        ds4_gpu_rms_norm_args args = ds4_gpu_make_rms_norm_args(n, 1, eps);
+        ds4_gpu_rms_norm_args args = ds4_gpu_make_rms_norm_args(n, rows, eps);
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
@@ -22416,11 +22427,11 @@ int ds4_gpu_add_rms_norm_weight_tensor(
         [enc setBuffer:sumbuf offset:ds4_gpu_tensor_offset(sum_out) atIndex:4];
         [enc setBuffer:normbuf offset:ds4_gpu_tensor_offset(norm_out) atIndex:5];
         [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+        [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(ds4_gpu_rms_norm_threads(n), 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
-        if (!ds4_gpu_finish_command_buffer(cb, owned, "add+RMS norm")) return 0;
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "add+RMS norm rows")) return 0;
     }
 
     return 1;
@@ -49697,13 +49708,13 @@ int ds4_gpu_qwen4_moe_down_grouped_tensor(
                           MTLSizeMake(32u * nsg, 1, 1), 0);
 }
 
-int ds4_gpu_qwen4_moe_reduce_tensor(
+static int qwen4_moe_reduce(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *shared_gate, const ds4_gpu_tensor *shared, ds4_gpu_tensor *R, const ds4_gpu_tensor *inj,
-        uint32_t n_tokens, uint32_t n_slots, uint32_t part_stride, uint32_t dim, uint32_t n_hc) {
+        uint32_t n_tokens, uint32_t n_slots, uint32_t part_stride, uint32_t dim, uint32_t n_hc, uint32_t accumulate) {
     const uint32_t shared_src = !shared_gate ? 0u : shared ? 2u : 1u;
-    struct { uint32_t n_tokens, n_slots, dim, shared_src, n_hc, part_stride, pad1, pad2; } args =
-        { n_tokens, n_slots, dim, shared_src, R ? n_hc : 0u, part_stride, 0, 0 };
+    struct { uint32_t n_tokens, n_slots, dim, shared_src, n_hc, part_stride, accumulate, pad2; } args =
+        { n_tokens, n_slots, dim, shared_src, R ? n_hc : 0u, part_stride, accumulate, 0 };
     qwen4_bind b[7];
     if (n_tokens == 0 || n_slots == 0 || dim == 0 || (R && n_hc == 0) || n_hc > 8 || part_stride < n_slots ||
         (shared_src == 1u && part_stride < n_slots + 1u) ||
@@ -49736,6 +49747,20 @@ int ds4_gpu_qwen4_moe_reduce_tensor(
     }
     return qwen4_dispatch(QWEN4_K_MOE_REDUCE, &args, sizeof(args), b, 7,
                           MTLSizeMake((dim + 255) / 256, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
+}
+
+int ds4_gpu_qwen4_moe_reduce_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *shared_gate, const ds4_gpu_tensor *shared, ds4_gpu_tensor *R, const ds4_gpu_tensor *inj,
+        uint32_t n_tokens, uint32_t n_slots, uint32_t part_stride, uint32_t dim, uint32_t n_hc) {
+    return qwen4_moe_reduce(out, part, weights, shared_gate, shared, R, inj, n_tokens, n_slots, part_stride, dim, n_hc, 0u);
+}
+
+/* h += sum_s weights[s] * part[s]: the residual add folded into the reduce */
+int ds4_gpu_qwen4_moe_reduce_add_tensor(
+        ds4_gpu_tensor *h, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
+        uint32_t n_tokens, uint32_t n_slots, uint32_t dim) {
+    return qwen4_moe_reduce(h, part, weights, NULL, NULL, NULL, NULL, n_tokens, n_slots, n_slots, dim, 0u, 1u);
 }
 
 int ds4_gpu_qwen4_moe_build_lists_tensor(
@@ -50329,10 +50354,15 @@ uint64_t ds4_gpu_mimo_attn_part_floats(uint32_t n_tokens, uint32_t n_head, uint3
 }
 
 int ds4_gpu_mimo_attn_tensor(
-        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
         const void *model_map, uint64_t model_size, uint64_t sinks_offset, bool has_sink, ds4_gpu_tensor *part,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t value_dim,
-        uint32_t pos0, uint32_t ring, uint32_t n_swa, uint32_t first, uint32_t hi_end, float scale) {
+        uint32_t pos0, uint32_t ring, uint32_t n_swa, uint32_t first, uint32_t hi_end, float scale,
+        const ds4_gpu_tensor *qkv, uint32_t n_rot, float rope_base, float v_scale) {
+    /* one token: the kernel does the prep itself from the qkv projection */
+    const bool fuse = qkv && n_tokens == 1u;
+    if (fuse && (n_rot > 64 || (n_rot % 2) != 0 || n_rot > head_dim || (head_dim % 32) != 0 || (value_dim % 32) != 0))
+        return 0;
     int kd, km;
     if (head_dim == 192u && value_dim == 128u) { kd = MIMO_K_ATTN_K6V4; km = MIMO_K_MERGE_V4; }
     else if (head_dim == 96u && value_dim == 64u) { kd = MIMO_K_ATTN_K3V2; km = MIMO_K_MERGE_V2; }
@@ -50357,12 +50387,16 @@ int ds4_gpu_mimo_attn_tensor(
     }
     const uint32_t keys_per_split = (n_keys + n_splits - 1) / n_splits;
     struct { uint32_t n_tokens, n_head, n_head_kv, head_dim, value_dim, pos0, ring, n_swa, first, has_sink,
-             n_splits, keys_per_split; float scale; uint32_t hi_end, pad1, pad2; } args =
+             n_splits, keys_per_split; float scale; uint32_t hi_end, fuse_prep, n_rot; float v_scale; uint32_t pad3;
+             float rope_freq[32]; } args =
         { n_tokens, n_head, n_head_kv, head_dim, value_dim, pos0, ring, n_swa, first, has_sink ? 1u : 0u,
-          n_splits, keys_per_split, scale, hi_end, 0, 0 };
+          n_splits, keys_per_split, scale, hi_end, fuse ? 1u : 0u, fuse ? n_rot : 0u, v_scale, 0, { 0 } };
+    for (uint32_t i = 0; fuse && i < n_rot / 2u && i < 32u; i++) {
+        args.rope_freq[i] = 1.0f / powf(rope_base, (float)(2u * i) / (float)n_rot);
+    }
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t o_bytes = (uint64_t)n_tokens * n_head * value_dim * sizeof(float);
-    qwen4_bind b[6];
+    qwen4_bind b[7];
     if (!qwen4_bind_tensor(&b[0], q, q_bytes, "MiMo attn q") ||
         !qwen4_bind_tensor(&b[1], k_cache, (uint64_t)ring * n_head_kv * head_dim * 2u, "MiMo k cache") ||
         !qwen4_bind_tensor(&b[2], v_cache, (uint64_t)ring * n_head_kv * value_dim * 2u, "MiMo v cache") ||
@@ -50381,7 +50415,13 @@ int ds4_gpu_mimo_attn_tensor(
     } else {
         b[5] = b[4];
     }
-    if (!mimo_dispatch(kd, &args, sizeof(args), b, 6,
+    if (fuse) {
+        const uint64_t width = (uint64_t)n_head * head_dim + (uint64_t)n_head_kv * (head_dim + value_dim);
+        if (!qwen4_bind_tensor(&b[6], qkv, width * sizeof(float), "MiMo qkv projection")) return 0;
+    } else {
+        b[6] = b[0];
+    }
+    if (!mimo_dispatch(kd, &args, sizeof(args), b, 7,
                        MTLSizeMake(n_splits, n_head_kv, n_tokens), MTLSizeMake(32 * 4, 1, 1))) {
         return 0;
     }

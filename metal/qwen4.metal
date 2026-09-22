@@ -3536,7 +3536,7 @@ struct ds4_metal_args_qwen4_moe_reduce {
     uint32_t shared_src;    /* 0 none, 1 part slot n_slots, 2 shared buffer */
     uint32_t n_hc;          /* > 0: also R[s][d] += 2*sigmoid(inj[s]/hc) * out[d] */
     uint32_t part_stride;   /* slots per token in part */
-    uint32_t pad1;
+    uint32_t accumulate;    /* 1: out += sum (the residual add folded in) */
     uint32_t pad2;
 };
 
@@ -3573,7 +3573,8 @@ kernel void kernel_qwen4_moe_reduce(
     } else if (args.shared_src == 2) {
         acc += qwen4_sigmoid(shared_gate[tok]) * shared[(uint64_t)tok * args.dim + d];
     }
-    out[(uint64_t)tok * args.dim + d] = acc;
+    if (args.accumulate) out[(uint64_t)tok * args.dim + d] += acc;
+    else out[(uint64_t)tok * args.dim + d] = acc;
     if (args.n_hc) {
         device float *r = R + (uint64_t)tok * args.dim * args.n_hc;
         for (uint s = 0; s < args.n_hc; s++) r[s * args.dim + d] += wgt[s] * acc;

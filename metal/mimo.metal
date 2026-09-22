@@ -104,8 +104,11 @@ struct ds4_metal_args_mimo_attn {
     uint32_t keys_per_split;
     float    scale;
     uint32_t hi_end;         /* 0: causal (keys <= the query); else keys below hi_end (DFlash block) */
-    uint32_t pad1;
-    uint32_t pad2;
+    uint32_t fuse_prep;      /* one token: the kernel ropes q and writes the K/V row itself */
+    uint32_t n_rot;
+    float    v_scale;
+    uint32_t pad3;
+    float    rope_freq[32];
 };
 
 #define MIMO_ATTN_NSG 4          /* simdgroups per threadgroup */
@@ -196,15 +199,34 @@ static inline void mimo_attn_tile(
     }
 }
 
+/* One head's prep as kernel_mimo_attn_prep does it, one rope pair per lane
+ * (the pairs are independent, so the arithmetic is the same); every split
+ * threadgroup of a kv head writes the same values, so the duplicate writes
+ * are harmless. */
+template <typename T>
+static inline void mimo_prep_head(device const float *src, device T *dst, uint dim, uint n_rot, uint pos,
+                                  constant float *freq, float scale, ushort tiisg) {
+    const uint nh = n_rot / 2;
+    if (tiisg < nh) {
+        const float theta = (float)pos * freq[tiisg];
+        const float c = cos(theta), s = sin(theta);
+        const float x0 = src[tiisg], x1 = src[tiisg + nh];
+        dst[tiisg] = (T)(x0 * c - x1 * s);
+        dst[tiisg + nh] = (T)(x0 * s + x1 * c);
+    }
+    for (uint i = n_rot + tiisg; i < dim; i += 32) dst[i] = (T)(src[i] * scale);
+}
+
 template <uint NPTK, uint NPTV>
 kernel void kernel_mimo_attn(
         constant ds4_metal_args_mimo_attn & args,
-        device const float *q,          /* [T][H*Dk] */
-        device const half  *k_cache,    /* [ring][Hkv*Dk] */
-        device const half  *v_cache,    /* [ring][Hkv*Dv] */
+        device float       *q,          /* [T][H*Dk] */
+        device half        *k_cache,    /* [ring][Hkv*Dk] */
+        device half        *v_cache,    /* [ring][Hkv*Dv] */
         device const float *sinks,      /* [H] */
         device float       *out,        /* [T][H*Dv] */
         device float       *part,       /* [T][Hkv][n_splits][group][2+Dv] */
+        device const float *qkv,        /* [1][H*Dk + Hkv*Dk + Hkv*Dv] when fuse_prep */
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]]) {
@@ -212,6 +234,23 @@ kernel void kernel_mimo_attn(
     const uint kvh = tgpig.y;
     const uint tok = tgpig.z;
     if (split >= args.n_splits || kvh >= args.n_head_kv || tok >= args.n_tokens) return;
+    if (args.fuse_prep) {
+        const uint H = args.n_head, Hkv = args.n_head_kv, Dk = args.head_dim, Dv = args.value_dim;
+        const uint group = H / Hkv, pos = args.pos0, row = pos % args.ring;
+        for (uint g = sgitg; g < group; g += MIMO_ATTN_NSG) {
+            const uint h = kvh * group + g;
+            mimo_prep_head<float>(qkv + h * Dk, q + h * Dk, Dk, args.n_rot, pos, args.rope_freq, 1.0f, tiisg);
+        }
+        if (sgitg == 0) {
+            mimo_prep_head<half>(qkv + H * Dk + kvh * Dk, k_cache + ((uint64_t)row * Hkv + kvh) * Dk, Dk, args.n_rot,
+                                 pos, args.rope_freq, 1.0f, tiisg);
+        } else if (sgitg == 1) {
+            device const float *vs = qkv + H * Dk + Hkv * Dk + kvh * Dv;
+            device half *dv = v_cache + ((uint64_t)row * Hkv + kvh) * Dv;
+            for (uint i = tiisg; i < Dv; i += 32) dv[i] = (half)(vs[i] * args.v_scale);
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
     mimo_attn_tile<NPTK, NPTV>(args, split, kvh, tok, q, k_cache, v_cache, sinks, out, part, sgitg, tiisg);
 }
 
@@ -253,9 +292,9 @@ kernel void kernel_mimo_attn_merge(
 
 #define MIMO_ATTN_INSTANCE(NPTK_, NPTV_) \
 template [[host_name("kernel_mimo_attn_k" #NPTK_ "v" #NPTV_)]] \
-kernel void kernel_mimo_attn<NPTK_, NPTV_>(constant ds4_metal_args_mimo_attn &, device const float *, \
-        device const half *, device const half *, device const float *, device float *, device float *, \
-        uint3, ushort, ushort);
+kernel void kernel_mimo_attn<NPTK_, NPTV_>(constant ds4_metal_args_mimo_attn &, device float *, \
+        device half *, device half *, device const float *, device float *, device float *, \
+        device const float *, uint3, ushort, ushort);
 MIMO_ATTN_INSTANCE(6, 4)   /* MiMo-V2.6: qk 192, value 128 */
 MIMO_ATTN_INSTANCE(3, 2)   /* mini: qk 96, value 64 */
 MIMO_ATTN_INSTANCE(4, 4)   /* DFlash drafter: 128/128 */

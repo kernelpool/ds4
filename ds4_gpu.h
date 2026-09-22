@@ -1143,6 +1143,18 @@ int ds4_gpu_add_rms_norm_weight_tensor(
         uint32_t                n,
         float                   eps);
 
+int ds4_gpu_add_rms_norm_weight_rows_tensor(
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *sum_out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps);
+
 int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         ds4_gpu_tensor       *q_out,
         const ds4_gpu_tensor *q,
@@ -3493,6 +3505,9 @@ int ds4_gpu_qwen4_moe_reduce_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *shared_gate, const ds4_gpu_tensor *shared, ds4_gpu_tensor *R, const ds4_gpu_tensor *inj,
         uint32_t n_tokens, uint32_t n_slots, uint32_t part_stride, uint32_t dim, uint32_t n_hc);
+int ds4_gpu_qwen4_moe_reduce_add_tensor(
+        ds4_gpu_tensor *h, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
+        uint32_t n_tokens, uint32_t n_slots, uint32_t dim);
 /* prefill experts: per-expert token lists, then expert-grouped tiled GEMMs
  * (q8_0/mxfp4/q4_K/q2_K/iq2_xxs) */
 int ds4_gpu_qwen4_moe_build_lists_tensor(
@@ -3550,10 +3565,11 @@ int ds4_gpu_mimo_attn_prep_tensor(
         uint32_t n_rot, uint32_t pos0, uint32_t ring, float rope_base, float v_scale);
 uint64_t ds4_gpu_mimo_attn_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t value_dim);
 int ds4_gpu_mimo_attn_tensor(
-        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        ds4_gpu_tensor *out, ds4_gpu_tensor *q, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
         const void *model_map, uint64_t model_size, uint64_t sinks_offset, bool has_sink, ds4_gpu_tensor *part,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t value_dim,
-        uint32_t pos0, uint32_t ring, uint32_t n_swa, uint32_t first, uint32_t hi_end, float scale);
+        uint32_t pos0, uint32_t ring, uint32_t n_swa, uint32_t first, uint32_t hi_end, float scale,
+        const ds4_gpu_tensor *qkv, uint32_t n_rot, float rope_base, float v_scale);
 /* DFlash attention inputs from separate q/k/v rows: per-head q/k norm, rope,
  * K/V ring writes (n_head 0: context rows, no q) */
 int ds4_gpu_mimo_dflash_prep_tensor(
