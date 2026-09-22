@@ -75,7 +75,7 @@ The startup line reports both figures.
 | Metal, GLM 5.2 | Ordered fallback |
 | Metal, GLM 5.3 | Native batching through 2051 visible tokens; ordered fallback afterward |
 | Metal, Qwen3.8 Flash Next | Native batching of the shared work; recurrent state, caches and PLE history stay per session |
-| Metal, MiMo-V2.6 Flash | Ordered fallback |
+| Metal, MiMo-V2.6 Flash | Native batching of the experts and head, bit-identical to single-session decoding by default (`DS4_MIMO_BATCH_MM=1` for the faster multi-row projections); attention and caches stay per session |
 | CUDA, supported multi-GPU Flash TP layout | Native grouped decode and mixed prefill/decode |
 | Single-GPU CUDA, including Spark | Ordered fallback |
 

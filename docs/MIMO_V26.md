@@ -88,9 +88,17 @@ the reference prompts must stay identical to plain decoding.
 
 ## Limits
 
-Tensor parallelism, SSD streaming, DSpark, CUDA, native session batching
-and disk KV checkpoints are not supported yet; the server decodes MiMo
-slots in order. There is no Q2 release yet.
+Tensor parallelism, SSD streaming, DSpark, CUDA and disk KV checkpoints are
+not supported yet. `ds4-server --batched-session N` decodes the slots
+together on shared transients, reading the experts once per batch; the
+drafters stay off while batching, as for the other families. Each slot's
+logits equal its single-session decode bit for bit, because the batched Q8
+projections keep the single-row kernel; `DS4_MIMO_BATCH_MM=1` uses the
+multi-row kernels instead for more throughput at the cost of that identity.
+Prefill is not chunk-invariant at the last bit, so two identical prompts
+whose prefills were split differently (the server interleaves 128-token
+quanta while other slots generate) can part at a near tie;
+`--mixed-prefill-quantum` sets that split. There is no Q2 release yet.
 
 ## Conversion
 

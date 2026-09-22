@@ -42699,6 +42699,8 @@ struct ds4_engine {
      * allocates the arena and hands ownership here. */
     struct ds4_qwen4_gpu_graph *qwen4_shared_workspace;
     uint32_t qwen4_arena_users;   /* live sessions borrowing the shared workspace */
+    struct ds4_mimo_gpu_graph *mimo_shared_workspace;
+    uint32_t mimo_arena_users;
     /* batched speculative policy: the drafts' measured acceptance and the
      * wall time of a plain and of a speculative batched cycle */
     float qwen4_batch_p, qwen4_batch_ms[2];
@@ -59388,6 +59390,13 @@ static bool qwen4_graph_forward_token(ds4_qwen4_gpu_graph *g, const ds4_model *m
 #define DS4_MIMO_PART_ROWS 8u   /* batches up to this size split their keys across threadgroups */
 #define DS4_MIMO_MAX_MTP 4u     /* MTP depths a graph can hold */
 
+/* transients sized by the prefill chunk; sessions of one server share them
+ * (a batched decode is one forward over every session's row) */
+#define DS4_MIMO_SCRATCH_FIELDS(X) \
+    X(h) X(xn) X(qkv) X(q) X(attn_o) X(blk) X(attn_part) X(router) X(selected) X(weights) X(mid) X(part) \
+    X(moe_lists) X(moe_counts) X(ffn_g) X(ffn_u) X(ffn_m) X(logits) X(mtp_cat)
+#define DS4_MIMO_BATCH_MAX_ROWS 32u
+
 typedef struct ds4_mimo_gpu_graph {
     uint32_t ctx_cap;
     uint32_t pos;
@@ -59396,6 +59405,8 @@ typedef struct ds4_mimo_gpu_graph {
     ds4_gpu_tensor *h, *xn, *qkv, *q, *attn_o, *blk, *attn_part;
     ds4_gpu_tensor *router, *selected, *weights, *mid, *part, *moe_lists, *moe_counts;
     ds4_gpu_tensor *ffn_g, *ffn_u, *ffn_m, *logits;
+    bool owns_scratch;
+    bool batch_exact;                      /* the arena: batched rows keep the single-row Q8 kernel */
     ds4_gpu_tensor *k_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *v_cache[DS4_MAX_LAYER];
     uint32_t ring[DS4_MAX_LAYER];
@@ -59436,6 +59447,29 @@ static uint32_t mimo_layer_kv(uint32_t il) {
     return ds4_mimo_layer_is_swa(il) ? DS4_N_HEAD_KV_SWA : DS4_N_HEAD_KV;
 }
 
+/* A batched decode reads each Q8 matrix once per four rows with the
+ * single-row kernel instead of once per batch with the tile, so every
+ * session's logits equal its single-session decode bit for bit
+ * (DS4_MIMO_BATCH_MM=1 takes the tile and its throughput instead). */
+static bool mimo_gemv(const ds4_mimo_gpu_graph *g, ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
+                      const ds4_gpu_tensor *x, uint32_t T) {
+    if (g->batch_exact && T > 1u && T <= 32u) {
+        /* row by row: the multi-row Q8 kernels order their sums differently */
+        const uint64_t in_bytes = (uint64_t)w->dim[0] * sizeof(float);
+        const uint64_t out_bytes = (uint64_t)(w->ndim >= 2 ? w->dim[1] : 1u) * sizeof(float);
+        for (uint32_t t = 0; t < T; t++) {
+            ds4_gpu_tensor *xr = ds4_gpu_tensor_view(x, t * in_bytes, in_bytes);
+            ds4_gpu_tensor *outr = ds4_gpu_tensor_view(out, t * out_bytes, out_bytes);
+            const bool ok = xr && outr && qwen4_gemv(outr, m, w, xr, 1u);
+            ds4_gpu_tensor_free(outr);
+            ds4_gpu_tensor_free(xr);
+            if (!ok) return false;
+        }
+        return true;
+    }
+    return qwen4_gemv(out, m, w, x, T);
+}
+
 static uint32_t mimo_prefill_chunk_tokens(uint32_t ctx) {
     return ctx < 4096u ? ctx : 4096u;
 }
@@ -59460,10 +59494,13 @@ static bool mimo_graph_weights_supported(const ds4_weights *w) {
 
 static void mimo_graph_free(ds4_mimo_gpu_graph *g) {
     if (g->mtp_draft_gpu) (void)glm_graph_end_commands_if_active();
-    ds4_gpu_tensor *fields[] = { g->h, g->xn, g->qkv, g->q, g->attn_o, g->blk, g->attn_part, g->router,
-                                 g->selected, g->weights, g->mid, g->part, g->moe_lists, g->moe_counts,
-                                 g->ffn_g, g->ffn_u, g->ffn_m, g->logits,
-                                 g->mtp_a, g->mtp_b, g->mtp_e, g->mtp_cat, g->mtp_carry, g->argmax, g->argmax_tmp, g->tok_id,
+    if (g->owns_scratch) {
+#define MIMO_FREE(field_) ds4_gpu_tensor_free(g->field_);
+        DS4_MIMO_SCRATCH_FIELDS(MIMO_FREE)
+#undef MIMO_FREE
+        free(g->host_row);
+    }
+    ds4_gpu_tensor *fields[] = { g->mtp_a, g->mtp_b, g->mtp_e, g->mtp_carry, g->argmax, g->argmax_tmp, g->tok_id,
                                  g->df_feat, g->df_c, g->df_cn, g->df_x, g->df_xn, g->df_blk, g->df_q, g->df_qo, g->df_k,
                                  g->df_v, g->df_o, g->df_g, g->df_u, g->df_m, g->df_part };
     for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) ds4_gpu_tensor_free(fields[i]);
@@ -59475,9 +59512,24 @@ static void mimo_graph_free(ds4_mimo_gpu_graph *g) {
         ds4_gpu_tensor_free(g->df_k_cache[il]);
         ds4_gpu_tensor_free(g->df_v_cache[il]);
     }
-    free(g->host_row);
     free(g->host_logits);
     memset(g, 0, sizeof(*g));
+}
+
+/* The first session's transients become the engine's arena, which outlives
+ * every session and lends them to the next ones; only ownership moves. */
+static void mimo_graph_transfer_scratch(ds4_mimo_gpu_graph *dst, ds4_mimo_gpu_graph *src) {
+    memset(dst, 0, sizeof(*dst));
+    dst->cap_tokens = src->cap_tokens;
+    dst->n_verify = src->n_verify;
+    dst->n_logit_rows = src->n_logit_rows;
+#define MIMO_TAKE(field_) dst->field_ = src->field_;
+    DS4_MIMO_SCRATCH_FIELDS(MIMO_TAKE)
+#undef MIMO_TAKE
+    dst->host_row = src->host_row;
+    dst->owns_scratch = true;
+    dst->batch_exact = getenv("DS4_MIMO_BATCH_MM") == NULL;
+    src->owns_scratch = false;
 }
 
 /* mtp also allocates the MTP blocks' rings, row buffers and a verify-sized
@@ -59485,7 +59537,8 @@ static void mimo_graph_free(ds4_mimo_gpu_graph *g) {
  * speculative row per depth).  df (with its model dm) adds the DFlash
  * drafter's feature rows, block scratch and rings instead. */
 static bool mimo_graph_alloc(ds4_mimo_gpu_graph *g, const ds4_weights *w, uint32_t ctx_cap, uint32_t cap_tokens,
-                             bool mtp, const ds4_dflash_weights *df, const ds4_model *dm) {
+                             bool mtp, const ds4_dflash_weights *df, const ds4_model *dm,
+                             const ds4_mimo_gpu_graph *shared) {
     memset(g, 0, sizeof(*g));
     if (!mimo_graph_weights_supported(w)) return false;
     if (mtp && DS4_N_NEXTN_PREDICT > DS4_MIMO_MAX_MTP) {
@@ -59499,9 +59552,17 @@ static bool mimo_graph_alloc(ds4_mimo_gpu_graph *g, const ds4_weights *w, uint32
     g->ctx_cap = ctx_cap;
     g->cap_tokens = cap_tokens;
     g->n_verify = df && df->block > n_mtp + 1u ? df->block : n_mtp + 1u;
-    g->n_logit_rows = g->n_verify;
+    g->n_logit_rows = g->n_verify > DS4_MIMO_BATCH_MAX_ROWS ? g->n_verify : DS4_MIMO_BATCH_MAX_ROWS;
+    g->owns_scratch = shared == NULL;
     bool ok = true;
 #define MIMO_ALLOC(field_, n_) do { g->field_ = qwen4_graph_alloc_f32(n_); ok = ok && g->field_; } while (0)
+    if (shared) {
+#define MIMO_BORROW(field_) g->field_ = shared->field_;
+        DS4_MIMO_SCRATCH_FIELDS(MIMO_BORROW)
+#undef MIMO_BORROW
+        g->host_row = shared->host_row;
+        goto private_state;
+    }
     MIMO_ALLOC(h, T * E);
     MIMO_ALLOC(xn, T * E);
     MIMO_ALLOC(qkv, T * qkv_max);
@@ -59520,12 +59581,14 @@ static bool mimo_graph_alloc(ds4_mimo_gpu_graph *g, const ds4_weights *w, uint32
     MIMO_ALLOC(ffn_u, T * DS4_N_FF_DENSE);
     MIMO_ALLOC(ffn_m, T * DS4_N_FF_DENSE);
     MIMO_ALLOC(logits, (uint64_t)g->n_logit_rows * DS4_N_VOCAB);
+    if (mtp) MIMO_ALLOC(mtp_cat, T * 2u * E);
+    g->host_row = xmalloc(T * E * sizeof(float));
+private_state:
     if (mtp) {
         g->mtp_rows = cap_tokens + n_mtp + 2u;
         MIMO_ALLOC(mtp_a, (uint64_t)g->mtp_rows * E);
         MIMO_ALLOC(mtp_b, (uint64_t)g->mtp_rows * E);
         MIMO_ALLOC(mtp_e, (uint64_t)g->mtp_rows * E);
-        MIMO_ALLOC(mtp_cat, T * 2u * E);
         MIMO_ALLOC(mtp_carry, (uint64_t)n_mtp * E);
     }
     if (mtp || df) {
@@ -59575,7 +59638,6 @@ static bool mimo_graph_alloc(ds4_mimo_gpu_graph *g, const ds4_weights *w, uint32
         MIMO_ALLOC(v_cache[il], (uint64_t)ring * kv * DS4_N_VALUE_DIM / 2u);
     }
 #undef MIMO_ALLOC
-    g->host_row = xmalloc(T * E * sizeof(float));
     if (!ok) {
         fprintf(stderr, "ds4: MiMo GPU graph allocation failed\n");
         mimo_graph_free(g);
@@ -59602,7 +59664,7 @@ static bool mimo_graph_attention(ds4_mimo_gpu_graph *g, const ds4_model *m, cons
     const uint32_t kv = mimo_layer_kv(il);
     const float base = swa ? DS4_ROPE_FREQ_BASE_SWA : DS4_ROPE_FREQ_BASE;
     /* a single token lets the attention kernel do the prep itself */
-    return qwen4_gemv(g->qkv, m, l->attn_qkv, g->xn, T) &&
+    return mimo_gemv(g, g->qkv, m, l->attn_qkv, g->xn, T) &&
            (T == 1u ||
             ds4_gpu_mimo_attn_prep_tensor(g->q, g->k_cache[il], g->v_cache[il], g->qkv, T, DS4_N_HEAD, kv,
                                           DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, DS4_N_ROT, pos0, g->ring[il], base,
@@ -59613,14 +59675,14 @@ static bool mimo_graph_attention(ds4_mimo_gpu_graph *g, const ds4_model *m, cons
                                     DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, pos0, g->ring[il], swa ? DS4_N_SWA : 0u,
                                     g->first[il], 0u, 1.0f / sqrtf((float)DS4_N_HEAD_DIM),
                                     T == 1u ? g->qkv : NULL, DS4_N_ROT, base, DS4_ATTN_VALUE_SCALE) &&
-           qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
+           mimo_gemv(g, g->blk, m, l->attn_output, g->attn_o, T);
 }
 
 static bool mimo_graph_dense_ffn(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
-    return qwen4_gemv(g->ffn_g, m, l->ffn_gate, g->xn, T) &&
-           qwen4_gemv(g->ffn_u, m, l->ffn_up, g->xn, T) &&
+    return mimo_gemv(g, g->ffn_g, m, l->ffn_gate, g->xn, T) &&
+           mimo_gemv(g, g->ffn_u, m, l->ffn_up, g->xn, T) &&
            ds4_gpu_swiglu_tensor(g->ffn_m, g->ffn_g, g->ffn_u, T * DS4_N_FF_DENSE, 0.0f, 1.0f) &&
-           qwen4_gemv(g->blk, m, l->ffn_down, g->ffn_m, T);
+           mimo_gemv(g, g->blk, m, l->ffn_down, g->ffn_m, T);
 }
 
 /* router GEMV + sigmoid top-k, experts per (token, slot) rows or, for
@@ -59628,7 +59690,7 @@ static bool mimo_graph_dense_ffn(ds4_mimo_gpu_graph *g, const ds4_model *m, cons
 static bool mimo_graph_moe(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, ds4_gpu_tensor *h,
                            uint32_t T) {
     const uint32_t NE = DS4_N_EXPERT, K = DS4_N_EXPERT_USED, E = DS4_N_EMBD, FF = DS4_N_FF_EXP;
-    bool ok = qwen4_gemv(g->router, m, l->ffn_gate_inp, g->xn, T) &&
+    bool ok = mimo_gemv(g, g->router, m, l->ffn_gate_inp, g->xn, T) &&
               ds4_gpu_mimo_router_tensor(g->selected, g->weights, g->router, m->map, m->size,
                                          l->ffn_exp_probs_b->abs_offset, T, NE, K);
     const bool mm = T > 64u && (E % 64u) == 0 && (FF % 64u) == 0 &&
@@ -59685,7 +59747,7 @@ static bool mimo_graph_head(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4
     ds4_gpu_tensor *rows = row0 ? ds4_gpu_tensor_view(h, row0 * E * sizeof(float), (uint64_t)n * E * sizeof(float)) : h;
     const bool ok = rows &&
         ds4_gpu_rms_norm_weight_rows_tensor(g->xn, rows, m->map, m->size, norm->abs_offset, (uint32_t)E, n, DS4_RMS_EPS) &&
-        qwen4_gemv(g->logits, m, w->output, g->xn, n);
+        mimo_gemv(g, g->logits, m, w->output, g->xn, n);
     if (row0) ds4_gpu_tensor_free(rows);
     return ok;
 }
@@ -69582,7 +69644,7 @@ static int mimo_first_token_test(const ds4_engine *e, const ds4_tokens *prompt, 
         if (chunk > n_seq) chunk = n_seq;
         ds4_mimo_gpu_graph *g = xcalloc(1, sizeof(*g));
         if (!mimo_graph_alloc(g, weights, n_seq + 8u, chunk, mtp_ref != NULL, n_anchor ? &e->dflash : NULL,
-                              &e->mtp_model)) {
+                              &e->mtp_model, NULL)) {
             free(g);
             free(df_ref); free(mtp_ref); free(layer_streams); free(post); free(logits); free(seq);
             return 1;
@@ -74538,6 +74600,13 @@ void ds4_engine_close(ds4_engine *e) {
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_QWEN4_GPU
     qwen4_state_pool_free(e);
+#ifdef DS4_HAS_MIMO_GPU
+    if (e->mimo_shared_workspace) {
+        mimo_graph_free(e->mimo_shared_workspace);
+        free(e->mimo_shared_workspace);
+        e->mimo_shared_workspace = NULL;
+    }
+#endif
     if (e->qwen4_shared_workspace) {
         qwen4_graph_free(e->qwen4_shared_workspace);
         free(e->qwen4_shared_workspace);
@@ -74865,11 +74934,26 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         const uint32_t cap_tokens = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
             e->prefill_chunk : mimo_prefill_chunk_tokens((uint32_t)ctx_size);
+        /* a server's sessions share one set of transients (the first session's,
+         * kept by the engine); a smaller unused arena is replaced */
+        const bool share = e->share_session_prefill_workspace;
+        const bool arena_fits = e->mimo_shared_workspace && e->mimo_shared_workspace->cap_tokens >= cap_tokens;
+        if (share && e->mimo_shared_workspace && !arena_fits && e->mimo_arena_users == 0) {
+            mimo_graph_free(e->mimo_shared_workspace);
+            free(e->mimo_shared_workspace);
+            e->mimo_shared_workspace = NULL;
+        }
         if (!mimo_graph_alloc(&s->mimo_graph, &e->weights, (uint32_t)ctx_size, cap_tokens, e->glm_mtp,
-                              e->dflash_ready ? &e->dflash : NULL, &e->mtp_model)) {
+                              e->dflash_ready ? &e->dflash : NULL, &e->mtp_model,
+                              share && arena_fits ? e->mimo_shared_workspace : NULL)) {
             free(s);
             return 1;
         }
+        if (share && !e->mimo_shared_workspace) {
+            e->mimo_shared_workspace = xcalloc(1, sizeof(*e->mimo_shared_workspace));
+            mimo_graph_transfer_scratch(e->mimo_shared_workspace, &s->mimo_graph);
+        }
+        if (!s->mimo_graph.owns_scratch) e->mimo_arena_users++;
         mimo_graph_reset(&s->mimo_graph);
         s->mimo_graph_ready = true;
         s->prefill_cap = (uint32_t)ctx_size;
@@ -75248,6 +75332,7 @@ void ds4_session_free(ds4_session *s) {
                         s->mimo_spec_cycles, s->mimo_spec_accepted,
                         (double)s->mimo_spec_accepted / (double)s->mimo_spec_cycles);
             }
+            if (s->mimo_graph_ready && !s->mimo_graph.owns_scratch && s->engine) s->engine->mimo_arena_users--;
             mimo_graph_free(&s->mimo_graph);
         } else
 #endif
@@ -76278,6 +76363,74 @@ static void mimo_spec_oracle_drafts(ds4_mimo_gpu_graph *g) {
         const uint32_t pos = g->pos + 1u + j;
         if (pos < (uint32_t)n) g->mtp_draft[j] = ids[pos];
     }
+}
+
+/* One decode step for several sessions on the shared transients: the
+ * projections, MoE and head run over every session's row at once, attention
+ * per session on its own caches.  Each session's next single-session call
+ * finds its MTP chain stale and replays it. */
+static bool mimo_graph_forward_batch(ds4_decode_item *items, int count, ds4_mimo_gpu_graph *a,
+                                     const ds4_model *m, const ds4_weights *w) {
+    const uint32_t E = DS4_N_EMBD, N = (uint32_t)count, n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const uint64_t q_bytes = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t o_bytes = (uint64_t)DS4_N_HEAD * DS4_N_VALUE_DIM * sizeof(float);
+    for (uint32_t i = 0; i < N; i++) {
+        ds4_mimo_gpu_graph *g = &items[i].session->mimo_graph;
+        if (items[i].token < 0 || items[i].token >= (int)DS4_N_VOCAB || !mimo_graph_flush_draft(g)) return false;
+        qwen4_ref_row(m, w->token_embd, (uint64_t)items[i].token, a->host_row + (uint64_t)i * E);
+    }
+    if (!ds4_gpu_tensor_write(a->h, 0, a->host_row, (uint64_t)N * E * sizeof(float))) return false;
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    bool ok = true;
+    for (uint32_t il = 0; il < n_trunk && ok; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        const bool swa = ds4_mimo_layer_is_swa(il);
+        const uint32_t kv = mimo_layer_kv(il);
+        const uint64_t qkv_bytes = q_bytes + (uint64_t)kv * (DS4_N_HEAD_DIM + DS4_N_VALUE_DIM) * sizeof(float);
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(a->xn, a->h, m->map, m->size, l->attn_norm->abs_offset, E, N, DS4_RMS_EPS) &&
+             mimo_gemv(a, a->qkv, m, l->attn_qkv, a->xn, N);
+        for (uint32_t i = 0; ok && i < N; i++) {
+            ds4_mimo_gpu_graph *g = &items[i].session->mimo_graph;
+            ds4_gpu_tensor *qkv = ds4_gpu_tensor_view(a->qkv, i * qkv_bytes, qkv_bytes);
+            ds4_gpu_tensor *q = ds4_gpu_tensor_view(a->q, i * q_bytes, q_bytes);
+            ds4_gpu_tensor *o = ds4_gpu_tensor_view(a->attn_o, i * o_bytes, o_bytes);
+            ok = qkv && q && o &&
+                 ds4_gpu_mimo_attn_tensor(o, q, g->k_cache[il], g->v_cache[il], m->map, m->size,
+                                          swa ? l->attn_sinks->abs_offset : 0u, swa, a->attn_part, 1u, DS4_N_HEAD, kv,
+                                          DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, g->pos, g->ring[il], swa ? DS4_N_SWA : 0u,
+                                          g->first[il], 0u, 1.0f / sqrtf((float)DS4_N_HEAD_DIM),
+                                          qkv, DS4_N_ROT, swa ? DS4_ROPE_FREQ_BASE_SWA : DS4_ROPE_FREQ_BASE,
+                                          DS4_ATTN_VALUE_SCALE) != 0;
+            ds4_gpu_tensor_free(o);
+            ds4_gpu_tensor_free(q);
+            ds4_gpu_tensor_free(qkv);
+        }
+        ok = ok && mimo_gemv(a, a->blk, m, l->attn_output, a->attn_o, N) &&
+             ds4_gpu_add_rms_norm_weight_rows_tensor(a->xn, a->h, a->h, a->blk, m->map, m->size, l->ffn_norm->abs_offset,
+                                                     E, N, DS4_RMS_EPS) &&
+             (ds4_mimo_layer_is_dense(il) ? mimo_graph_dense_ffn(a, m, l, N) && ds4_gpu_add_tensor(a->h, a->h, a->blk, N * E)
+                                          : mimo_graph_moe(a, m, l, a->h, N));
+    }
+    return ok && mimo_graph_head(a, m, w, a->h, w->output_norm, 0u, N);
+}
+
+/* DS4_MIMO_SESSION_BATCH=0 keeps the ordered fallback */
+static bool mimo_graph_native_session_batch_check(ds4_decode_item *items, int count, const ds4_engine *e) {
+    const char *env = getenv("DS4_MIMO_SESSION_BATCH");
+    if ((env && env[0] && strcmp(env, "0") == 0) || count < 2 || count > (int)DS4_MIMO_BATCH_MAX_ROWS ||
+        !e->mimo_shared_workspace || e->mimo_shared_workspace->cap_tokens < (uint32_t)count) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        const ds4_session *s = items[i].session;
+        const ds4_mimo_gpu_graph *g = &s->mimo_graph;
+        if (!s || s->engine != e || s->distributed || !s->checkpoint_valid || !s->mimo_graph_ready ||
+            g->owns_scratch || g->h != e->mimo_shared_workspace->h || g->pos != (uint32_t)s->checkpoint.len ||
+            g->pos + 1u > g->ctx_cap || g->vis_span_count != 0 || g->df || g->rows_ready) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* DS4_MIMO_MTP_DEPTH=1..max sets the drafts verified per cycle.  One MTP
@@ -81263,6 +81416,10 @@ static bool ds4_sessions_eval_batch_metal_supported(
     if (items[0].session && ds4_session_is_qwen4(items[0].session))
         return qwen4_graph_native_session_batch_supported(items, count, e);
 #endif
+#ifdef DS4_HAS_MIMO_GPU
+    if (items[0].session && ds4_session_is_mimo(items[0].session))
+        return mimo_graph_native_session_batch_check(items, count, e);
+#endif
     for (int i = 0; i < count; i++) {
         ds4_session *s = items[i].session;
         if (!s || s->engine != e || s->distributed ||
@@ -81684,7 +81841,12 @@ static int ds4_sessions_eval_batch_native(
 #else
     const bool native_qwen4 = false;
 #endif
-    const bool native_shared = ok && !native_ds41 && !native_glm53 && !native_qwen4 &&
+#ifdef DS4_HAS_MIMO_GPU
+    const bool native_mimo = ok && !prefill && ds4_session_is_mimo(items[0].session);
+#else
+    const bool native_mimo = false;
+#endif
+    const bool native_shared = ok && !native_ds41 && !native_glm53 && !native_qwen4 && !native_mimo &&
         metal_graph_native_session_batch_shared_supported(items, count, e);
     const bool native_qkv = native_shared &&
         metal_graph_native_session_batch_qkv_supported(items, count, e);
@@ -81709,6 +81871,10 @@ static int ds4_sessions_eval_batch_native(
     } else if (native_qwen4) {
         ok = qwen4_graph_encode_native_session_batch(
                 items, count, e->qwen4_shared_workspace, &e->model, &e->weights);
+#endif
+#ifdef DS4_HAS_MIMO_GPU
+    } else if (native_mimo) {
+        ok = mimo_graph_forward_batch(items, count, e->mimo_shared_workspace, &e->model, &e->weights);
 #endif
     } else if (native_glm53) {
         ok = glm53_graph_encode_native_session_batch(
@@ -81760,6 +81926,18 @@ static int ds4_sessions_eval_batch_native(
 #endif
     for (int i = 0; ok && i < count; i++) {
         ds4_session *s = items[i].session;
+#ifdef DS4_HAS_MIMO_GPU
+        if (native_mimo) {
+            ds4_mimo_gpu_graph *g = &s->mimo_graph;
+            ok = ds4_gpu_tensor_read(e->mimo_shared_workspace->logits, (uint64_t)i * DS4_N_VOCAB * sizeof(float),
+                                     s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+            g->pos++;
+            g->verify_rows = 0;
+            g->mtp_draft_valid = false;
+            memset(g->mtp_carry_ok, 0, sizeof(g->mtp_carry_ok));
+            continue;
+        }
+#endif
 #ifdef DS4_HAS_QWEN4_METAL
         if (native_qwen4) {
             ok = ds4_gpu_tensor_read(e->qwen4_shared_workspace->batch_logits,
