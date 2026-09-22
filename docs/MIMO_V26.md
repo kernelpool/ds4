@@ -30,21 +30,26 @@ otherwise emits itself.
 
 Two drafters are available; use one of them.
 
-`--mtp` runs the three MTP blocks embedded in the main GGUF. Each block is
-a sliding-window attention layer with a dense FFN chained on the previous
-block's residual, so a cycle drafts up to three tokens and verifies them in
-one target pass. `DS4_MIMO_MTP_DEPTH=1..3` limits the drafts per cycle.
+`--mtp` runs the MTP blocks embedded in the main GGUF. Each block is a
+sliding-window attention layer with a dense FFN chained on the previous
+block's residual. A cycle drafts one token and verifies it in one target
+pass, which decodes fastest on Apple Silicon; `DS4_MIMO_MTP_DEPTH=2` or `3`
+chains the deeper blocks for more drafts per cycle.
 
 `--mtp-model MiMo-V2.6-Flash-DFlash-Q8_0.gguf` runs the DFlash drafter
 instead: five Qwen3-style layers over features taken from five target
-layers draft a block of seven tokens per cycle. The sidecar uses the
-llama.cpp `dflash` layout plus the mask embedding DS4 needs.
+layers draft a block of seven tokens per cycle, of which two are verified
+by default (`DS4_MIMO_MTP_DEPTH=1..7`). The sidecar uses the llama.cpp
+`dflash` layout plus the mask embedding DS4 needs. The built-in MTP
+drafter is the faster of the two here.
 
 Both drafters verify against the target's logits, so temperature-zero
-output equals plain decoding. For non-zero temperature,
-`--mtp-exact-sampling` preserves the target distribution; see
-[speculative decoding](SPECULATIVE_DECODING.md). `--mtp-timing` prints the
-verify cycles and accepted drafts at exit.
+output follows plain decoding; the batched verifier's reduction order can
+differ from one-token decode, so a near tie in a long greedy continuation
+may resolve differently (see [speculative decoding](SPECULATIVE_DECODING.md)).
+For non-zero temperature, `--mtp-exact-sampling` preserves the target
+distribution. `--mtp-timing` prints the verify cycles and accepted drafts
+at exit.
 
 ## Vision
 
@@ -77,9 +82,9 @@ gguf-tools/quality-testing/score_official MiMo-V2.6-Flash-MXFP4.gguf \
 The fixture directory's README records the collection settings and its
 `results/` directory the Metal reference scores; the platform returns no
 logprobs, so only NLL, first-token match and greedy prefix length apply.
-Every speed change must
-reproduce the reference TSV (`validate_scores.py --strict-identical`) and
-the greedy texts of `--mtp` and `--mtp-model` must equal plain decoding.
+Every speed change must reproduce the reference TSV (`validate_scores.py
+--strict-identical`) and the greedy texts of `--mtp` and `--mtp-model` on
+the reference prompts must stay identical to plain decoding.
 
 ## Limits
 

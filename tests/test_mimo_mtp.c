@@ -104,6 +104,9 @@ int main(void) {
         return 0;
     }
     ds4_engine *e = open_engine(model, false);
+    char depth[8];   /* the oracle drafts cover the whole chain */
+    snprintf(depth, sizeof(depth), "%d", ds4_engine_mtp_draft_tokens(e) - 1);
+    if (!getenv("DS4_MIMO_MTP_DEPTH")) setenv("DS4_MIMO_MTP_DEPTH", depth, 1);
     ds4_tokens prompt = {0};
     ds4_tokenize_text(e, "The quick brown fox jumps over the lazy dog. Once upon a time", &prompt);
     char err[256] = {0};

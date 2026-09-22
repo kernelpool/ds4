@@ -79,13 +79,14 @@ perfect, disengaging after repeated second-draft rejections.
 
 ## MiMo-V2.6: built-in MTP or the DFlash sidecar
 
-`./ds4 --mtp` drafts with the three chained MTP blocks in the main GGUF
-(`DS4_MIMO_MTP_DEPTH=1..3` limits the drafts per cycle);
+`./ds4 --mtp` drafts with the chained MTP blocks in the main GGUF, one
+draft per cycle by default (`DS4_MIMO_MTP_DEPTH=1..3`);
 `./ds4 --mtp-model MiMo-V2.6-Flash-DFlash-Q8_0.gguf` drafts seven-token
-blocks with the DFlash sidecar instead. Both verify a whole block in one
-target pass and keep the longest accepted prefix; the position-indexed
-caches simply rewrite rejected rows, so no state snapshot is needed on
-rejection or rewind. See [MiMo setup](MIMO_V26.md).
+blocks with the DFlash sidecar instead and verifies two of them by default
+(`DS4_MIMO_MTP_DEPTH=1..7`). Both verify the drafts in one target pass and
+keep the longest accepted prefix; the position-indexed caches simply
+rewrite rejected rows, so no state snapshot is needed on rejection or
+rewind. See [MiMo setup](MIMO_V26.md).
 
 ## Sampling and reproducibility
 

@@ -76245,11 +76245,13 @@ static void mimo_spec_oracle_drafts(ds4_mimo_gpu_graph *g) {
     }
 }
 
-/* DS4_MIMO_MTP_DEPTH=1..n limits the drafts per cycle (default: every depth) */
-static uint32_t mimo_spec_depth(void) {
+/* DS4_MIMO_MTP_DEPTH=1..max sets the drafts verified per cycle.  One MTP
+ * draft and two DFlash drafts decode fastest: every further verify row costs
+ * more expert traffic than its rarer acceptance returns. */
+static uint32_t mimo_spec_depth(uint32_t max, uint32_t dflt) {
     const char *env = getenv("DS4_MIMO_MTP_DEPTH");
     const int v = env && env[0] ? atoi(env) : 0;
-    return v >= 1 && v <= (int)DS4_N_NEXTN_PREDICT ? (uint32_t)v : DS4_N_NEXTN_PREDICT;
+    return v >= 1 && v <= (int)max ? (uint32_t)v : dflt;
 }
 
 /* The drafter's bookkeeping after a forward whose first T rows (tokens at
@@ -76282,7 +76284,8 @@ static int ds4_session_mimo_spec_cycle(ds4_session *s, int first_token, float te
     ds4_mimo_gpu_graph *g = &s->mimo_graph;
     const ds4_model *m = &e->model;
     const ds4_weights *w = &e->weights;
-    const uint32_t V = DS4_N_VOCAB, depth = e->dflash_ready ? e->dflash.block - 1u : mimo_spec_depth();
+    const uint32_t V = DS4_N_VOCAB, depth = e->dflash_ready ?
+        mimo_spec_depth(e->dflash.block - 1u, 2u) : mimo_spec_depth(DS4_N_NEXTN_PREDICT, 1u);
     const bool trace = getenv("DS4_MIMO_SPEC_TRACE") != NULL;
     const uint32_t n = (uint32_t)s->checkpoint.len;
     if (g->mtp_draft_valid && first_token != g->mtp_parent) g->mtp_draft_valid = false;
