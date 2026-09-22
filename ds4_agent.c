@@ -410,7 +410,8 @@ static int agent_read_default_lines(agent_worker *w);
 static int agent_compact_reserve_tokens(agent_worker *w);
 
 static agent_tool_syntax agent_tool_syntax_for_engine(ds4_engine *engine) {
-    if (ds4_engine_is_qwen4(engine)) return AGENT_TOOL_SYNTAX_QWEN;
+    /* MiMo-V2.6 emits the same <tool_call><function=...> calls */
+    if (ds4_engine_is_qwen4(engine) || ds4_engine_is_mimo(engine)) return AGENT_TOOL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ? AGENT_TOOL_SYNTAX_GLM
          : ds4_engine_is_deepseek41(engine) ? AGENT_TOOL_SYNTAX_DSML41
                                            : AGENT_TOOL_SYNTAX_DSML;
