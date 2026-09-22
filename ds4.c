@@ -54,6 +54,7 @@
 #define DS4_HAS_QWEN4_GPU 1
 #ifdef __APPLE__
 #define DS4_HAS_QWEN4_METAL 1
+#define DS4_HAS_MIMO_GPU 1
 #endif
 #endif
 #ifdef DS4_ROCM_BUILD
@@ -527,6 +528,7 @@ typedef enum {
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
     DS4_MODEL_FAMILY_DEEPSEEK41 = 2,
     DS4_MODEL_FAMILY_QWEN4_EXP = 3,
+    DS4_MODEL_FAMILY_MIMO      = 4,
 } ds4_model_family;
 
 typedef enum {
@@ -537,6 +539,8 @@ typedef enum {
     DS4_VARIANT_FLASH41 = 4,
     DS4_VARIANT_QWEN4_EXP = 5,
     DS4_VARIANT_QWEN4_MINI = 6,
+    DS4_VARIANT_MIMO26_FLASH = 7,
+    DS4_VARIANT_MIMO_MINI = 8,
 } ds4_variant;
 
 typedef struct {
@@ -586,6 +590,9 @@ typedef struct {
     uint32_t n_ple_conv;
     uint32_t n_ple_head_dim;
     int32_t ple_eos_id;
+    uint32_t n_head_kv_swa;
+    float attn_value_scale;
+    float rope_freq_base_swa;
     float rms_eps;
     float hc_eps;
     float expert_weight_scale;
@@ -877,6 +884,67 @@ static const ds4_shape DS4_SHAPE_QWEN4_MINI = {
     .rope_orig_ctx = 262144,
 };
 
+/* MiMo-V2.6 Flash: 48 pre-norm layers, global GQA attention on the layers
+ * the GGUF sliding-window pattern marks 0 and 128-token SWA with per-head
+ * sinks elsewhere, a dense first FFN, sigmoid-routed experts, and three
+ * SWA-shaped dense-FFN MTP blocks counted in n_layer. */
+static const ds4_shape DS4_SHAPE_MIMO26 = {
+    .name = "MiMo V2.6 Flash",
+    .family = DS4_MODEL_FAMILY_MIMO,
+    .variant = DS4_VARIANT_MIMO26_FLASH,
+    .n_layer = 51,
+    .n_embd = 4096,
+    .n_vocab = 152576,
+    .n_head = 64,
+    .n_head_kv = 4,
+    .n_head_kv_swa = 8,
+    .n_head_dim = 192,
+    .n_value_dim = 128,
+    .n_rot = 64,
+    .n_expert = 256,
+    .n_expert_used = 8,
+    .n_ff_exp = 2048,
+    .n_ff_dense = 16384,
+    .n_swa = 128,
+    .n_nextn_predict = 3,
+    .n_leading_dense = 1,
+    .attn_value_scale = 0.707f,
+    .rms_eps = 1.0e-6f,
+    .expert_weight_scale = 1.0f,
+    .rope_freq_base = 10000000.0f,
+    .rope_freq_base_swa = 10000.0f,
+    .rope_orig_ctx = 1048576,
+};
+
+/* Synthetic test model: same structure at toy widths, real tokenizer. */
+static const ds4_shape DS4_SHAPE_MIMO_MINI = {
+    .name = "MiMo V2.6 mini",
+    .family = DS4_MODEL_FAMILY_MIMO,
+    .variant = DS4_VARIANT_MIMO_MINI,
+    .n_layer = 9,
+    .n_embd = 64,
+    .n_vocab = 152576,
+    .n_head = 8,
+    .n_head_kv = 2,
+    .n_head_kv_swa = 4,
+    .n_head_dim = 96,
+    .n_value_dim = 64,
+    .n_rot = 32,
+    .n_expert = 32,
+    .n_expert_used = 8,
+    .n_ff_exp = 32,
+    .n_ff_dense = 128,
+    .n_swa = 8,
+    .n_nextn_predict = 3,
+    .n_leading_dense = 1,
+    .attn_value_scale = 0.707f,
+    .rms_eps = 1.0e-6f,
+    .expert_weight_scale = 1.0f,
+    .rope_freq_base = 10000000.0f,
+    .rope_freq_base_swa = 10000.0f,
+    .rope_orig_ctx = 1048576,
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -958,6 +1026,9 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_EXPERT_WEIGHT_SCALE       (g_ds4_shape.expert_weight_scale)
 #define DS4_SWIGLU_CLAMP_EXP          (g_ds4_shape.swiglu_clamp_exp)
 #define DS4_ROPE_FREQ_BASE            (g_ds4_shape.rope_freq_base)
+#define DS4_N_HEAD_KV_SWA             (g_ds4_shape.n_head_kv_swa)
+#define DS4_ATTN_VALUE_SCALE          (g_ds4_shape.attn_value_scale)
+#define DS4_ROPE_FREQ_BASE_SWA        (g_ds4_shape.rope_freq_base_swa)
 #define DS4_ROPE_SCALE_FACTOR         (g_ds4_shape.rope_scale_factor)
 #define DS4_ROPE_YARN_BETA_FAST       (g_ds4_shape.rope_yarn_beta_fast)
 #define DS4_ROPE_YARN_BETA_SLOW       (g_ds4_shape.rope_yarn_beta_slow)
@@ -1024,6 +1095,25 @@ static bool ds4_qwen4_layer_is_ple(uint32_t il) {
 static bool ds4_qwen4_layer_is_nextn(uint32_t il) {
     return ds4_model_is_qwen4() && DS4_N_NEXTN_PREDICT != 0 &&
            il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER;
+}
+
+static bool ds4_model_is_mimo(void) {
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MIMO;
+}
+
+/* MiMo sliding-window pattern from the GGUF: 1 = SWA, 0 = global. */
+static uint8_t g_ds4_mimo_swa[DS4_MAX_LAYER];
+
+static bool ds4_mimo_layer_is_nextn(uint32_t il) {
+    return ds4_model_is_mimo() && il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER;
+}
+
+static bool ds4_mimo_layer_is_swa(uint32_t il) {
+    return ds4_model_is_mimo() && g_ds4_mimo_swa[il] != 0;
+}
+
+static bool ds4_mimo_layer_is_dense(uint32_t il) {
+    return ds4_model_is_mimo() && (il < DS4_N_LEADING_DENSE || ds4_mimo_layer_is_nextn(il));
 }
 
 static int g_ds4_lock_fd = -1;
@@ -2960,6 +3050,7 @@ typedef enum {
     DS4_SUPPORT_NONE = 0,
     DS4_SUPPORT_MTP_LEGACY,
     DS4_SUPPORT_DSPARK,
+    DS4_SUPPORT_DFLASH,
 } ds4_support_kind;
 
 static bool model_get_u32_any(const ds4_model *m, const char *const *keys,
@@ -3252,6 +3343,7 @@ static const char *support_kind_name(ds4_support_kind kind) {
     switch (kind) {
     case DS4_SUPPORT_MTP_LEGACY: return "legacy MTP";
     case DS4_SUPPORT_DSPARK:     return "DSpark";
+    case DS4_SUPPORT_DFLASH:     return "DFlash";
     case DS4_SUPPORT_NONE:       return "none";
     }
     return "unknown";
@@ -3264,6 +3356,8 @@ static ds4_support_kind support_model_detect(
     if (stages_out) *stages_out = 0;
     if (summary_out) memset(summary_out, 0, sizeof(*summary_out));
     if (!m) return DS4_SUPPORT_NONE;
+    ds4_str arch = {0};
+    if (model_get_string(m, "general.architecture", &arch) && ds4_streq(arch, "dflash")) return DS4_SUPPORT_DFLASH;
 
     ds4_dspark_summary s = model_dspark_summary(m);
     if (summary_out) *summary_out = s;
@@ -4708,6 +4802,8 @@ typedef struct {
     ds4_tensor *nextn_hc_head_norm;
     ds4_tensor *nextn_hc_head_down;
     ds4_tensor *nextn_hc_head_up;
+    /* MiMo-V2.6 */
+    ds4_tensor *attn_qkv;
 } ds4_layer_weights;
 
 typedef struct {
@@ -4735,6 +4831,23 @@ typedef struct {
     ds4_tensor *hc_head_scale;
     ds4_layer_weights block;
 } ds4_mtp_weights;
+
+/* DFlash drafter: the MiMo --mtp-model sidecar in the llama.cpp `dflash`
+ * layout, Qwen3-style layers over features of the target's residual stream */
+#define DS4_DFLASH_MAX_LAYER 8u
+#define DS4_DFLASH_MAX_TARGET 8u
+#define DS4_DFLASH_BLOCK 8u
+typedef struct {
+    ds4_tensor *attn_norm, *ffn_norm, *q_norm, *k_norm, *sinks, *q, *k, *v, *o, *gate, *up, *down;
+} ds4_dflash_layer;
+typedef struct {
+    ds4_tensor *fc, *hidden_norm, *output_norm, *mask_embd;
+    ds4_dflash_layer layer[DS4_DFLASH_MAX_LAYER];
+    uint32_t n_layer, n_ff, n_head, n_head_kv, head_dim, value_dim, n_rot, window, block, n_target;
+    uint32_t target[DS4_DFLASH_MAX_TARGET];   /* trunk layers whose residual outputs are the features */
+    int mask_token;
+    float rope_base, eps, value_scale;
+} ds4_dflash_weights;
 
 typedef struct {
     ds4_tensor *main_proj;
@@ -5341,7 +5454,7 @@ static void tensor_expect_routed_expert(
 
 static bool weights_have_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_mimo()) {
         return w && w->output_norm && w->output;
     }
     if (ds4_model_is_qwen4()) {
@@ -5357,7 +5470,7 @@ static bool weights_have_output_head(const ds4_weights *w) {
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_mimo()) {
         return w && (w->output_norm || w->output);
     }
     if (ds4_model_is_qwen4()) {
@@ -5634,10 +5747,91 @@ static void weights_validate_qwen4_layout(
     }
 }
 
+static bool weights_mimo_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
+    if (!l) return false;
+    if (!l->attn_norm || !l->ffn_norm || !l->attn_qkv || !l->attn_output) return false;
+    if (ds4_mimo_layer_is_swa(il) && !l->attn_sinks) return false;
+    if (ds4_mimo_layer_is_dense(il)) {
+        if (!l->ffn_gate || !l->ffn_up || !l->ffn_down) return false;
+    } else if (!l->ffn_gate_inp || !l->ffn_exp_probs_b ||
+               !l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) {
+        return false;
+    }
+    if (ds4_mimo_layer_is_nextn(il) &&
+        (!l->nextn_eh_proj || !l->nextn_enorm || !l->nextn_hnorm || !l->nextn_shared_head_norm)) {
+        return false;
+    }
+    return true;
+}
+
+static void weights_validate_mimo_layout(
+        const ds4_weights *w,
+        uint32_t           layer_start,
+        uint32_t           layer_end,
+        bool               require_token_embd,
+        bool               require_output) {
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t o_dim = (uint64_t)DS4_N_HEAD * DS4_N_VALUE_DIM;
+
+    if (!w) ds4_die("internal error: missing weights while validating MiMo layout");
+    if (layer_start >= DS4_N_LAYER) ds4_die("invalid first layer in MiMo weight layout validation");
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) {
+        ds4_die("invalid layer range in MiMo weight layout validation");
+    }
+    if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
+    if (w->token_embd) tensor_expect_qwen4_dense_layout(w->token_embd, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    const bool have_output = weights_have_output_head(w);
+    if (require_output && !have_output) ds4_die("required output head tensors are missing");
+    if (weights_have_partial_output_head(w) && !have_output) ds4_die("partial output head in GGUF");
+    if (have_output) {
+        tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_qwen4_dense_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!weights_mimo_layer_has_required(l, il)) {
+            fprintf(stderr, "ds4: required MiMo tensors for layer %u are missing\n", il);
+            exit(1);
+        }
+        const uint64_t n_kv = ds4_mimo_layer_is_swa(il) ? DS4_N_HEAD_KV_SWA : DS4_N_HEAD_KV;
+        tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_qwen4_dense_layout(l->attn_qkv, 2, DS4_N_EMBD,
+                                         q_dim + n_kv * (DS4_N_HEAD_DIM + DS4_N_VALUE_DIM), 0);
+        tensor_expect_qwen4_dense_layout(l->attn_output, 2, o_dim, DS4_N_EMBD, 0);
+        if (l->attn_sinks) tensor_expect_layout(l->attn_sinks, DS4_TENSOR_F32, 1, DS4_N_HEAD, 0, 0);
+        if (ds4_mimo_layer_is_dense(il)) {
+            tensor_expect_qwen4_dense_layout(l->ffn_gate, 2, DS4_N_EMBD, DS4_N_FF_DENSE, 0);
+            tensor_expect_qwen4_dense_layout(l->ffn_up, 2, DS4_N_EMBD, DS4_N_FF_DENSE, 0);
+            tensor_expect_qwen4_dense_layout(l->ffn_down, 2, DS4_N_FF_DENSE, DS4_N_EMBD, 0);
+        } else {
+            tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+            tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+            tensor_expect_qwen4_expert_layout(l->ffn_gate_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+            tensor_expect_qwen4_expert_layout(l->ffn_up_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+            tensor_expect_qwen4_expert_layout(l->ffn_down_exps, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+            if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
+                fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
+                exit(1);
+            }
+        }
+        if (ds4_mimo_layer_is_nextn(il)) {
+            tensor_expect_qwen4_dense_layout(l->nextn_eh_proj, 2, 2u * DS4_N_EMBD, DS4_N_EMBD, 0);
+            tensor_expect_layout(l->nextn_enorm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+            tensor_expect_layout(l->nextn_hnorm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+            tensor_expect_layout(l->nextn_shared_head_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        }
+    }
+}
+
 static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
     if (!l) return false;
     if (ds4_model_is_qwen4()) {
         return weights_qwen4_layer_has_required(l, il);
+    }
+    if (ds4_model_is_mimo()) {
+        return weights_mimo_layer_has_required(l, il);
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return weights_glm_dsa_layer_has_required(l, il);
@@ -5897,6 +6091,11 @@ static void weights_validate_layout(
     if (ds4_model_is_qwen4()) {
         weights_validate_qwen4_layout(w, layer_start, layer_end,
                                       require_token_embd, require_output);
+        return;
+    }
+    if (ds4_model_is_mimo()) {
+        weights_validate_mimo_layout(w, layer_start, layer_end,
+                                     require_token_embd, require_output);
         return;
     }
 
@@ -7147,6 +7346,65 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
 }
 
+static void config_validate_mimo_model(const ds4_model *m) {
+    const uint32_t n_embd = required_u32(m, "mimo2.embedding_length");
+    if (n_embd == DS4_SHAPE_MIMO26.n_embd) {
+        g_ds4_shape = DS4_SHAPE_MIMO26;
+    } else if (n_embd == DS4_SHAPE_MIMO_MINI.n_embd) {
+        g_ds4_shape = DS4_SHAPE_MIMO_MINI;
+    } else {
+        fprintf(stderr, "ds4: unsupported mimo2 embedding_length %u\n", n_embd);
+        exit(1);
+    }
+    memset(g_ds4_mimo_swa, 0, sizeof(g_ds4_mimo_swa));
+    config_expect_u32("block_count", required_u32(m, "mimo2.block_count"), DS4_N_LAYER);
+    config_expect_u32("nextn_predict_layers", required_u32(m, "mimo2.nextn_predict_layers"),
+                      DS4_N_NEXTN_PREDICT);
+    config_expect_u32("leading_dense_block_count",
+                      required_u32(m, "mimo2.leading_dense_block_count"), DS4_N_LEADING_DENSE);
+    config_expect_u32("vocab_size", required_u32(m, "mimo2.vocab_size"), DS4_N_VOCAB);
+    config_expect_u32("attention.head_count", required_u32(m, "mimo2.attention.head_count"), DS4_N_HEAD);
+    config_expect_u32("attention.key_length", required_u32(m, "mimo2.attention.key_length"), DS4_N_HEAD_DIM);
+    config_expect_u32("attention.value_length",
+                      required_u32(m, "mimo2.attention.value_length"), DS4_N_VALUE_DIM);
+    config_expect_u32("rope.dimension_count", required_u32(m, "mimo2.rope.dimension_count"), DS4_N_ROT);
+    config_expect_u32("attention.sliding_window", required_u32(m, "mimo2.attention.sliding_window"), DS4_N_SWA);
+    config_expect_u32("expert_count", required_u32(m, "mimo2.expert_count"), DS4_N_EXPERT);
+    config_expect_u32("expert_used_count", required_u32(m, "mimo2.expert_used_count"), DS4_N_EXPERT_USED);
+    config_expect_u32("expert_feed_forward_length",
+                      required_u32(m, "mimo2.expert_feed_forward_length"), DS4_N_FF_EXP);
+    config_expect_u32("feed_forward_length", required_u32(m, "mimo2.feed_forward_length"), DS4_N_FF_DENSE);
+    config_expect_u32("expert_gating_func", required_u32(m, "mimo2.expert_gating_func"), 2u);
+    config_expect_f32("expert_weights_scale", required_f32(m, "mimo2.expert_weights_scale"), 1.0f);
+    config_expect_f32("attention.value_scale", required_f32(m, "mimo2.attention.value_scale"),
+                      DS4_ATTN_VALUE_SCALE);
+    config_expect_f32("rope.freq_base", required_f32(m, "mimo2.rope.freq_base"), DS4_ROPE_FREQ_BASE);
+    config_expect_f32("rope.freq_base_swa", required_f32(m, "mimo2.rope.freq_base_swa"),
+                      DS4_ROPE_FREQ_BASE_SWA);
+    config_expect_epsilon("attention.layer_norm_rms_epsilon",
+                          required_f32(m, "mimo2.attention.layer_norm_rms_epsilon"), DS4_RMS_EPS);
+
+    uint64_t vals[DS4_MAX_LAYER];
+    uint32_t n = 0;
+    config_read_qwen4_u64_array(m, "mimo2.attention.sliding_window_pattern", vals, DS4_MAX_LAYER, &n);
+    if (n != DS4_N_LAYER) ds4_die("mimo2.attention.sliding_window_pattern length differs from block_count");
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (vals[il] > 1u) ds4_die("mimo2.attention.sliding_window_pattern entries must be 0 or 1");
+        if (ds4_mimo_layer_is_nextn(il) && vals[il] != 1u) ds4_die("MiMo MTP blocks must use sliding-window attention");
+        g_ds4_mimo_swa[il] = (uint8_t)vals[il];
+    }
+    config_read_qwen4_u64_array(m, "mimo2.attention.head_count_kv", vals, DS4_MAX_LAYER, &n);
+    if (n != DS4_N_LAYER) ds4_die("mimo2.attention.head_count_kv length differs from block_count");
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t expected = ds4_mimo_layer_is_swa(il) ? DS4_N_HEAD_KV_SWA : DS4_N_HEAD_KV;
+        if (vals[il] != expected) {
+            fprintf(stderr, "ds4: unexpected mimo2 kv head count at layer %u: got %" PRIu64
+                    ", expected %u\n", il, vals[il], expected);
+            exit(1);
+        }
+    }
+}
+
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
     ds4_str arch = {0};
@@ -7165,6 +7423,10 @@ static void config_validate_model(const ds4_model *m) {
         }
         if (ds4_streq(arch, "qwen4exp")) {
             config_validate_qwen4_model(m);
+            return;
+        }
+        if (ds4_streq(arch, "mimo2")) {
+            config_validate_mimo_model(m);
             return;
         }
     }
@@ -7638,6 +7900,107 @@ static int qwen4_vision_encode_image(const ds4_model *vm, const ds4_qwen4_vision
 #endif
 #endif
 
+/* MiMo-V2.6 vision: the clip / mimovl mmproj written by gguf-tools/mimo26_vision.py */
+static void mimo_vision_weights_bind(ds4_mimo_vision_weights *w, const ds4_model *m) {
+    ds4_str arch = {0}, proj = {0};
+    if (!model_get_string(m, "general.architecture", &arch) || !ds4_streq(arch, "clip") ||
+        !model_get_string(m, "clip.projector_type", &proj) || !ds4_streq(proj, "mimovl")) {
+        ds4_die("--vision file is not a MiMo mmproj GGUF (clip / mimovl)");
+    }
+    memset(w, 0, sizeof(*w));
+    w->n_layer = required_u32(m, "clip.vision.block_count");
+    w->n_embd = required_u32(m, "clip.vision.embedding_length");
+    w->n_ff = required_u32(m, "clip.vision.feed_forward_length");
+    w->n_head = required_u32(m, "clip.vision.attention.head_count");
+    w->n_head_kv = required_u32(m, "clip.vision.attention.head_count_kv");
+    w->head_dim = required_u32(m, "clip.vision.attention.head_dim");
+    w->n_patch = required_u32(m, "clip.vision.patch_size");
+    w->n_merge = required_u32(m, "clip.vision.spatial_merge_size");
+    w->n_out = required_u32(m, "clip.vision.projection_dim");
+    w->window = required_u32(m, "clip.vision.window_size");
+    w->eps = 1e-6f;
+    (void)model_get_f32_compat(m, "clip.vision.attention.layer_norm_epsilon", &w->eps);
+    config_expect_u32("vision patch_size", w->n_patch, 16u);
+    config_expect_u32("vision spatial_merge_size", w->n_merge, 2u);
+    if ((w->head_dim != 32u && w->head_dim != 64u) ||
+        w->n_layer == 0 || w->n_layer > DS4_MIMO_VISION_MAX_LAYERS || w->n_head_kv == 0 ||
+        (w->n_head % w->n_head_kv) != 0 || w->window == 0) {
+        ds4_die("unsupported MiMo vision tower shape");
+    }
+    uint64_t modes[DS4_MIMO_VISION_MAX_LAYERS];
+    uint32_t n_modes = 0;
+    ds4_array_ref arr;
+    if (!model_get_array(m, "clip.vision.wa_pattern_mode", &arr) || arr.len != w->n_layer) {
+        ds4_die("vision wa_pattern_mode must list every block");
+    }
+    {
+        ds4_cursor c = cursor_at(m, arr.data_pos);
+        for (n_modes = 0; n_modes < w->n_layer; n_modes++) {
+            int32_t v = 0;
+            if (arr.type != 5 || !cursor_read(&c, &v, sizeof(v)) || v < -1 || v > 1) {
+                ds4_die("vision wa_pattern_mode entries must be int32 -1, 0 or 1");
+            }
+            modes[n_modes] = (uint64_t)(uint32_t)v;
+        }
+    }
+    const uint64_t E = w->n_embd, FF = w->n_ff, P = w->n_patch, ME = 4u * E, O = w->n_out;
+    const uint64_t QKV = (uint64_t)(w->n_head + 2u * w->n_head_kv) * w->head_dim, QW = (uint64_t)w->n_head * w->head_dim;
+    const uint64_t d_e[1] = { E }, d_ff[1] = { FF }, d_qkv[1] = { QKV }, d_h[1] = { w->n_head };
+    uint32_t patch_type1 = 0;
+    w->patch_w0 = qwen4_vision_dense(m, "v.patch_embd.weight", 3u * P * P, E, &w->patch_type);
+    w->patch_w1 = qwen4_vision_dense(m, "v.patch_embd.weight.1", 3u * P * P, E, &patch_type1);
+    if (patch_type1 != w->patch_type) ds4_die("vision patch taps must share a type");
+    w->post_ln_w = deepseek4_vision_required_offset(m, "v.post_ln.weight", DS4_TENSOR_F32, 1, d_e);
+    w->mm0_w = qwen4_vision_dense(m, "mm.0.weight", ME, ME, &w->mm0_type);
+    w->mm2_w = qwen4_vision_dense(m, "mm.2.weight", ME, O, &w->mm2_type);
+    for (uint32_t il = 0; il < w->n_layer; il++) {
+        ds4_mimo_vision_layer_weights *l = &w->layer[il];
+        char name[96];
+#define VIS_NAME(suffix_) (snprintf(name, sizeof(name), "v.blk.%u.%s", il, suffix_), name)
+        l->mode = (int32_t)modes[il];
+        l->ln1_w = deepseek4_vision_required_offset(m, VIS_NAME("ln1.weight"), DS4_TENSOR_F32, 1, d_e);
+        l->ln2_w = deepseek4_vision_required_offset(m, VIS_NAME("ln2.weight"), DS4_TENSOR_F32, 1, d_e);
+        l->qkv_w = qwen4_vision_dense(m, VIS_NAME("attn_qkv.weight"), E, QKV, &l->qkv_type);
+        l->qkv_b = deepseek4_vision_required_offset(m, VIS_NAME("attn_qkv.bias"), DS4_TENSOR_F32, 1, d_qkv);
+        l->out_w = qwen4_vision_dense(m, VIS_NAME("attn_out.weight"), QW, E, &l->out_type);
+        l->out_b = deepseek4_vision_required_offset(m, VIS_NAME("attn_out.bias"), DS4_TENSOR_F32, 1, d_e);
+        if (l->mode != -1) l->sinks = deepseek4_vision_required_offset(m, VIS_NAME("attn_sinks"), DS4_TENSOR_F32, 1, d_h);
+        l->gate_w = qwen4_vision_dense(m, VIS_NAME("ffn_gate.weight"), E, FF, &l->gate_type);
+        l->gate_b = deepseek4_vision_required_offset(m, VIS_NAME("ffn_gate.bias"), DS4_TENSOR_F32, 1, d_ff);
+        l->up_w = qwen4_vision_dense(m, VIS_NAME("ffn_up.weight"), E, FF, &l->up_type);
+        l->up_b = deepseek4_vision_required_offset(m, VIS_NAME("ffn_up.bias"), DS4_TENSOR_F32, 1, d_ff);
+        l->down_w = qwen4_vision_dense(m, VIS_NAME("ffn_down.weight"), FF, E, &l->down_type);
+        l->down_b = deepseek4_vision_required_offset(m, VIS_NAME("ffn_down.bias"), DS4_TENSOR_F32, 1, d_e);
+#undef VIS_NAME
+    }
+}
+
+#ifdef DS4_HAS_MIMO_GPU
+static uint32_t mimo_vision_max_tokens(void) {
+    const char *env = getenv("DS4_MIMO_IMAGE_MAX_TOKENS");
+    const long v = env ? atol(env) : 0;
+    return v >= 64 && v <= 16383 ? (uint32_t)v : 1024u;
+}
+
+/* preprocess + encode one image; out gets malloc'd [tokens][n_out] embeddings */
+static int mimo_vision_encode_image(const ds4_model *vm, const ds4_mimo_vision_weights *w, const ds4_image *image,
+                                    uint32_t min_tokens, uint32_t max_tokens, float **out, ds4_image_patches *patches,
+                                    char *error, size_t error_cap) {
+    *out = NULL;
+    if (!ds4_image_preprocess_mimo(patches, image, min_tokens, max_tokens, error, error_cap)) return 0;
+    float *emb = malloc((size_t)patches->image_token_count * w->n_out * sizeof(float));
+    const int ok = emb && ds4_gpu_mimo_vision_encode(emb, patches->patches, patches->patch_count, patches->grid_width,
+                                                     vm->map, vm->size, w);
+    if (!ok) {
+        free(emb);
+        if (error && error_cap) snprintf(error, error_cap, "MiMo vision inference failed");
+        return 0;
+    }
+    *out = emb;
+    return 1;
+}
+#endif
+
 static void weights_bind_output(
         ds4_weights     *w,
         const ds4_model *m,
@@ -7656,7 +8019,7 @@ static void weights_bind_output(
             w->output         = model_find_tensor(m, "output.weight");
         }
     } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_mimo()) {
 
         if (required) {
             w->output_norm = required_tensor(m, "output_norm.weight");
@@ -7819,9 +8182,38 @@ static void weights_bind_qwen4_layer(ds4_layer_weights *l, const ds4_model *m, u
     }
 }
 
+static void weights_bind_mimo_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    l->attn_norm   = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->ffn_norm    = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+    l->attn_qkv    = required_tensorf(m, "blk.%u.attn_qkv.weight", il);
+    l->attn_output = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    if (ds4_mimo_layer_is_swa(il)) l->attn_sinks = required_tensorf(m, "blk.%u.attn_sinks.weight", il);
+    if (ds4_mimo_layer_is_dense(il)) {
+        l->ffn_gate = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+        l->ffn_up   = required_tensorf(m, "blk.%u.ffn_up.weight", il);
+        l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+    } else {
+        l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+        l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+        l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+        l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+        l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+    }
+    if (ds4_mimo_layer_is_nextn(il)) {
+        l->nextn_eh_proj          = required_tensorf(m, "blk.%u.nextn.eh_proj.weight", il);
+        l->nextn_enorm            = required_tensorf(m, "blk.%u.nextn.enorm.weight", il);
+        l->nextn_hnorm            = required_tensorf(m, "blk.%u.nextn.hnorm.weight", il);
+        l->nextn_shared_head_norm = required_tensorf(m, "blk.%u.nextn.shared_head_norm.weight", il);
+    }
+}
+
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
     if (ds4_model_is_qwen4()) {
         weights_bind_qwen4_layer(l, m, il);
+        return;
+    }
+    if (ds4_model_is_mimo()) {
+        weights_bind_mimo_layer(l, m, il);
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -7908,7 +8300,7 @@ static void weights_bind(
     memset(w, 0, sizeof(*w));
 
     uint32_t executable_layers = DS4_N_LAYER;
-    if ((DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA || ds4_model_is_qwen4()) &&
+    if ((DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA || ds4_model_is_qwen4() || ds4_model_is_mimo()) &&
         DS4_N_LAYER > DS4_N_NEXTN_PREDICT) {
         executable_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     }
@@ -7942,7 +8334,7 @@ static void weights_bind(
     /* GLM nextn/MTP block(s): excluded from the executable pass but bound
      * so the drafter can run them. Only when the full model is loaded. */
     if (!load_slice &&
-        (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA || ds4_model_is_qwen4()) &&
+        (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA || ds4_model_is_qwen4() || ds4_model_is_mimo()) &&
         start == 0 && end == executable_layers - 1u) {
         for (uint32_t il = executable_layers; il < DS4_N_LAYER; il++) {
             weights_bind_layer(&w->layer[il], m, il);
@@ -42231,6 +42623,7 @@ typedef enum {
     DS4_VISION_GLM53,
     DS4_VISION_DEEPSEEK4,
     DS4_VISION_QWEN4,
+    DS4_VISION_MIMO,
 } ds4_vision_kind;
 
 struct ds4_engine {
@@ -42243,10 +42636,13 @@ struct ds4_engine {
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
+    ds4_dflash_weights dflash;
+    bool dflash_ready;
 #ifndef DS4_NO_GPU
     ds4_glm53_vision_weights vision_weights;
     ds4_deepseek4_vision_weights deepseek4_vision_weights;
     ds4_qwen4_vision_weights qwen4_vision_weights;
+    ds4_mimo_vision_weights mimo_vision_weights;
 #endif
     ds4_vision_kind vision_kind;
     int vision_image_token;
@@ -43074,7 +43470,8 @@ static qwen4_char_info qwen4_char_at(const char *s, uint64_t len, uint64_t pos) 
  *   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ | \p{N} |
  *    ?[^\s\p{L}\p{M}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
  * with the Unicode classes generated from the `regex` module. */
-static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, token_vec *out) {
+static void bpe_tokenize_text_qwen_regex(const ds4_vocab *vocab, const char *text, bool marks,
+                                         token_vec *out) {
     const uint64_t len = strlen(text);
     uint64_t pos = 0;
 
@@ -43105,17 +43502,17 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
         /* an optional non-letter prefix, then a run of letters and marks */
         {
             uint64_t run = UINT64_MAX;
-            if (cur.letter || cur.mark) {
+            if (cur.letter || (marks && cur.mark)) {
                 run = cur.next;
             } else if (cur.cp != '\r' && cur.cp != '\n' && !cur.number) {
                 qwen4_char_info n1 = qwen4_char_at(text, len, cur.next);
-                if (n1.valid && (n1.letter || n1.mark)) run = n1.next;
+                if (n1.valid && (n1.letter || (marks && n1.mark))) run = n1.next;
             }
             if (run != UINT64_MAX) {
                 pos = run;
                 while (pos < len) {
                     qwen4_char_info scan = qwen4_char_at(text, len, pos);
-                    if (!scan.valid || !(scan.letter || scan.mark)) break;
+                    if (!scan.valid || !(scan.letter || (marks && scan.mark))) break;
                     pos = scan.next;
                 }
                 bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
@@ -43136,11 +43533,11 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
                 punct_pos = cur.next;
                 punct = qwen4_char_at(text, len, punct_pos);
             }
-            if (punct.valid && !punct.space && !punct.letter && !punct.mark && !punct.number) {
+            if (punct.valid && !punct.space && !punct.letter && !(marks && punct.mark) && !punct.number) {
                 pos = punct_pos;
                 while (pos < len) {
                     qwen4_char_info scan = qwen4_char_at(text, len, pos);
-                    if (!scan.valid || scan.space || scan.letter || scan.mark || scan.number) break;
+                    if (!scan.valid || scan.space || scan.letter || (marks && scan.mark) || scan.number) break;
                     pos = scan.next;
                 }
                 while (pos < len) {
@@ -43183,6 +43580,16 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
     }
 }
 
+static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    bpe_tokenize_text_qwen_regex(vocab, text, true, out);
+}
+
+/* Qwen2 pre-tokenization (MiMo, tokenizer.ggml.pre = "qwen2"): the same
+ * alternation without \p{M}, so marks split off as punctuation. */
+static void bpe_tokenize_text_qwen2(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    bpe_tokenize_text_qwen_regex(vocab, text, false, out);
+}
+
 /*
  * DeepSeek V4 Flash declares tokenizer.ggml.pre = "joyai-llm".  The split
  * below mirrors the JoyAI BPE pre-tokenizer for the cases this model
@@ -43208,6 +43615,10 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
     }
     if (ds4_model_is_qwen4()) {
         bpe_tokenize_text_qwen35(vocab, text, out);
+        return;
+    }
+    if (ds4_model_is_mimo()) {
+        bpe_tokenize_text_qwen2(vocab, text, out);
         return;
     }
 
@@ -43360,6 +43771,32 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         return;
     }
 
+    if (ds4_model_is_mimo()) {
+        /* ChatML without BOS; <|im_end|> ends a turn, <|endoftext|> pads. */
+        vocab->im_start_id = vocab_lookup(vocab, "<|im_start|>");
+        vocab->im_end_id = vocab_lookup(vocab, "<|im_end|>");
+        vocab->endoftext_id = vocab_lookup(vocab, "<|endoftext|>");
+        vocab->bos_id = -1;
+        vocab->eos_id = vocab->im_end_id;
+        vocab->system_id = -1;
+        vocab->user_id = -1;
+        vocab->assistant_id = -1;
+        vocab->observation_id = -1;
+        vocab->sop_id = -1;
+        vocab->think_start_id = vocab_lookup(vocab, "<think>");
+        vocab->think_end_id = vocab_lookup(vocab, "</think>");
+        vocab->tool_call_start_id = vocab_lookup(vocab, "<tool_call>");
+        vocab->tool_call_end_id = vocab_lookup(vocab, "</tool_call>");
+        vocab->tool_response_start_id = vocab_lookup_optional(vocab, "<tool_response>");
+        vocab->tool_response_end_id = vocab_lookup_optional(vocab, "</tool_response>");
+        vocab->arg_key_start_id = -1;
+        vocab->arg_key_end_id = -1;
+        vocab->arg_value_start_id = -1;
+        vocab->arg_value_end_id = -1;
+        vocab->dsml_id = -1;
+        return;
+    }
+
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
             vocab->bos_id = vocab_lookup_optional(vocab, "<sop>");
@@ -43460,7 +43897,7 @@ static void chat_push_think_prefix(const ds4_vocab *vocab,
             token_vec_push(out, vocab->system_id);
             bpe_tokenize_text(vocab, effort, out);
         }
-    } else if (think_mode == DS4_THINK_MAX) {
+    } else if (think_mode == DS4_THINK_MAX && !ds4_model_is_mimo()) {
         bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
     }
 }
@@ -43513,12 +43950,46 @@ static void qwen4_chat_system(const ds4_vocab *vocab, const char *system, ds4_th
     qwen4_chat_close(vocab, out);
 }
 
+/* MiMo-V2.6 ChatML: no newline after <|im_end|>, tool results are a `tool`
+ * turn, and every assistant turn carries a <think> block (empty when off). */
+static void mimo_chat_open(const ds4_vocab *vocab, const char *role, token_vec *out) {
+    token_vec_push(out, vocab->im_start_id);
+    bpe_tokenize_text(vocab, role, out);
+    bpe_tokenize_text(vocab, "\n", out);
+}
+
+static void mimo_chat_close(const ds4_vocab *vocab, token_vec *out) {
+    token_vec_push(out, vocab->im_end_id);
+}
+
+static void mimo_chat_assistant_prefix(const ds4_vocab *vocab, ds4_think_mode think_mode, token_vec *out) {
+    mimo_chat_open(vocab, "assistant", out);
+    token_vec_push(out, vocab->think_start_id);
+    if (!ds4_think_mode_enabled(think_mode)) token_vec_push(out, vocab->think_end_id);
+}
+
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (ds4_model_is_mimo()) {
+        if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
+            vocab->think_start_id < 0 || vocab->think_end_id < 0) {
+            ds4_die("this tokenizer does not provide the MiMo chat markers; use raw prompt tokenization");
+        }
+        if (system && system[0]) {
+            mimo_chat_open(vocab, "system", out);
+            bpe_tokenize_text(vocab, system, out);
+            mimo_chat_close(vocab, out);
+        }
+        mimo_chat_open(vocab, "user", out);
+        bpe_tokenize_text(vocab, prompt, out);
+        mimo_chat_close(vocab, out);
+        mimo_chat_assistant_prefix(vocab, think_mode, out);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
             vocab->think_start_id < 0 || vocab->think_end_id < 0) {
@@ -43736,6 +44207,28 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
         return;
     }
 
+    if (ds4_model_is_mimo()) {
+        if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+            mimo_chat_open(vocab, "tool", tokens);
+            bpe_tokenize_text(vocab, content, tokens);
+        } else {
+            const char *name = (!strcmp(role, "system") || !strcmp(role, "developer")) ? "system" :
+                               !strcmp(role, "assistant") ? "assistant" : "user";
+            mimo_chat_open(vocab, name, tokens);
+            if (!strcmp(name, "assistant")) {
+                if (strncmp(content, "<think>", 7) != 0) {
+                    token_vec_push(tokens, vocab->think_start_id);
+                    token_vec_push(tokens, vocab->think_end_id);
+                }
+                tokenize_rendered_chat_vocab(vocab, content, tokens);
+            } else {
+                bpe_tokenize_text(vocab, content, tokens);
+            }
+        }
+        mimo_chat_close(vocab, tokens);
+        return;
+    }
+
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (!strcmp(role, "system") || !strcmp(role, "developer")) {
             if (vocab->system_id >= 0) token_vec_push(tokens, vocab->system_id);
@@ -43784,6 +44277,10 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
     if (ds4_model_is_qwen4()) {
         qwen4_chat_assistant_prefix(&e->vocab, think_mode, tokens);
+        return;
+    }
+    if (ds4_model_is_mimo()) {
+        mimo_chat_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
     }
     token_vec_push(tokens, e->vocab.assistant_id);
@@ -58879,6 +59376,554 @@ static bool qwen4_graph_forward_token(ds4_qwen4_gpu_graph *g, const ds4_model *m
     return qwen4_graph_forward_tokens(g, m, w, &token, 1, logits_out, false);
 }
 
+#ifdef DS4_HAS_MIMO_GPU
+/* ---------------------------------------------------------------------
+ * MiMo-V2.6 Metal graph.  Transients are f32 rows of the chunk.  Every
+ * attention layer keeps half K/V rows in a ring: global layers span the
+ * context, sliding-window layers the window plus one prefill chunk, so a
+ * chunk's queries always find the window before them.  The MTP blocks own
+ * rings of their own, filled from the position they first see.  Math
+ * mirrors the mimo_ref_* scalar reference.
+ * --------------------------------------------------------------------- */
+#define DS4_MIMO_PART_ROWS 8u   /* batches up to this size split their keys across threadgroups */
+#define DS4_MIMO_MAX_MTP 4u     /* MTP depths a graph can hold */
+
+typedef struct ds4_mimo_gpu_graph {
+    uint32_t ctx_cap;
+    uint32_t pos;
+    uint32_t cap_tokens;
+    uint32_t n_logit_rows;
+    ds4_gpu_tensor *h, *xn, *qkv, *q, *attn_o, *blk, *attn_part;
+    ds4_gpu_tensor *router, *selected, *weights, *mid, *part, *moe_lists, *moe_counts;
+    ds4_gpu_tensor *ffn_g, *ffn_u, *ffn_m, *logits;
+    ds4_gpu_tensor *k_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *v_cache[DS4_MAX_LAYER];
+    uint32_t ring[DS4_MAX_LAYER];
+    uint32_t first[DS4_MAX_LAYER];
+    float *host_row;
+    /* MTP: row buffers (row i is position p0 - 1 + i of a call) and the
+     * carried hidden row per depth */
+    uint32_t mtp_rows;
+    ds4_gpu_tensor *mtp_a, *mtp_b, *mtp_e, *mtp_cat, *mtp_carry;
+    bool mtp_carry_ok[DS4_MIMO_MAX_MTP];
+    /* pending drafts (MTP or DFlash), the verify logits and the logits before the block */
+    bool mtp_draft_valid;
+    int mtp_parent;
+    uint32_t mtp_n_draft;
+    int mtp_draft[DS4_DFLASH_BLOCK];
+    uint32_t n_verify;
+    float *host_logits;
+    uint32_t verify_pos, verify_rows;
+    ds4_gpu_tensor *argmax, *argmax_tmp;   /* GPU argmax of a draft row */
+    /* image spans of the prompt being prefilled: their rows replace token embeddings */
+    const ds4_vision_span *vis_spans;
+    size_t vis_span_count;
+    /* DFlash: feature rows of the last forward, context/block scratch, rings per draft layer */
+    const ds4_dflash_weights *df;
+    const ds4_model *df_model;
+    uint32_t df_rows, df_ring;
+    ds4_gpu_tensor *df_feat, *df_c, *df_cn, *df_x, *df_xn, *df_blk, *df_q, *df_qo, *df_k, *df_v, *df_o, *df_g, *df_u, *df_m, *df_part;
+    ds4_gpu_tensor *df_k_cache[DS4_DFLASH_MAX_LAYER];
+    ds4_gpu_tensor *df_v_cache[DS4_DFLASH_MAX_LAYER];
+} ds4_mimo_gpu_graph;
+
+static uint32_t mimo_layer_kv(uint32_t il) {
+    return ds4_mimo_layer_is_swa(il) ? DS4_N_HEAD_KV_SWA : DS4_N_HEAD_KV;
+}
+
+static uint32_t mimo_prefill_chunk_tokens(uint32_t ctx) {
+    return ctx < 4096u ? ctx : 4096u;
+}
+
+static bool mimo_graph_weights_supported(const ds4_weights *w) {
+    bool ok = qwen4_graph_dense_ok(w->token_embd) && qwen4_graph_dense_ok(w->output);
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        ok = qwen4_graph_dense_ok(l->attn_qkv) && qwen4_graph_dense_ok(l->attn_output);
+        if (ds4_mimo_layer_is_dense(il)) {
+            ok = ok && qwen4_graph_dense_ok(l->ffn_gate) && qwen4_graph_dense_ok(l->ffn_up) &&
+                 qwen4_graph_dense_ok(l->ffn_down);
+        } else {
+            ok = ok && qwen4_graph_expert_ok(l->ffn_gate_exps) && qwen4_graph_expert_ok(l->ffn_up_exps) &&
+                 qwen4_graph_expert_ok(l->ffn_down_exps);
+        }
+        if (ds4_mimo_layer_is_nextn(il)) ok = ok && qwen4_graph_dense_ok(l->nextn_eh_proj);
+    }
+    if (!ok) fprintf(stderr, "ds4: MiMo GPU graph needs Q8_0/F16/BF16/F32 dense weights and routed expert types\n");
+    return ok;
+}
+
+static void mimo_graph_free(ds4_mimo_gpu_graph *g) {
+    ds4_gpu_tensor *fields[] = { g->h, g->xn, g->qkv, g->q, g->attn_o, g->blk, g->attn_part, g->router,
+                                 g->selected, g->weights, g->mid, g->part, g->moe_lists, g->moe_counts,
+                                 g->ffn_g, g->ffn_u, g->ffn_m, g->logits,
+                                 g->mtp_a, g->mtp_b, g->mtp_e, g->mtp_cat, g->mtp_carry, g->argmax, g->argmax_tmp,
+                                 g->df_feat, g->df_c, g->df_cn, g->df_x, g->df_xn, g->df_blk, g->df_q, g->df_qo, g->df_k,
+                                 g->df_v, g->df_o, g->df_g, g->df_u, g->df_m, g->df_part };
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) ds4_gpu_tensor_free(fields[i]);
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(g->k_cache[il]);
+        ds4_gpu_tensor_free(g->v_cache[il]);
+    }
+    for (uint32_t il = 0; il < DS4_DFLASH_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(g->df_k_cache[il]);
+        ds4_gpu_tensor_free(g->df_v_cache[il]);
+    }
+    free(g->host_row);
+    free(g->host_logits);
+    memset(g, 0, sizeof(*g));
+}
+
+/* mtp also allocates the MTP blocks' rings, row buffers and a verify-sized
+ * logit buffer; the transients then take the MTP batch (cap_tokens plus one
+ * speculative row per depth).  df (with its model dm) adds the DFlash
+ * drafter's feature rows, block scratch and rings instead. */
+static bool mimo_graph_alloc(ds4_mimo_gpu_graph *g, const ds4_weights *w, uint32_t ctx_cap, uint32_t cap_tokens,
+                             bool mtp, const ds4_dflash_weights *df, const ds4_model *dm) {
+    memset(g, 0, sizeof(*g));
+    if (!mimo_graph_weights_supported(w)) return false;
+    if (mtp && DS4_N_NEXTN_PREDICT > DS4_MIMO_MAX_MTP) {
+        fprintf(stderr, "ds4: MiMo MTP supports at most %u depths\n", DS4_MIMO_MAX_MTP);
+        return false;
+    }
+    const uint32_t n_mtp = mtp ? DS4_N_NEXTN_PREDICT : 0u;
+    const uint64_t E = DS4_N_EMBD, T = cap_tokens + n_mtp, NE = DS4_N_EXPERT, K = DS4_N_EXPERT_USED;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM, o_dim = (uint64_t)DS4_N_HEAD * DS4_N_VALUE_DIM;
+    const uint64_t qkv_max = q_dim + (uint64_t)DS4_N_HEAD_KV_SWA * (DS4_N_HEAD_DIM + DS4_N_VALUE_DIM);
+    g->ctx_cap = ctx_cap;
+    g->cap_tokens = cap_tokens;
+    g->n_verify = df && df->block > n_mtp + 1u ? df->block : n_mtp + 1u;
+    g->n_logit_rows = g->n_verify;
+    bool ok = true;
+#define MIMO_ALLOC(field_, n_) do { g->field_ = qwen4_graph_alloc_f32(n_); ok = ok && g->field_; } while (0)
+    MIMO_ALLOC(h, T * E);
+    MIMO_ALLOC(xn, T * E);
+    MIMO_ALLOC(qkv, T * qkv_max);
+    MIMO_ALLOC(q, T * q_dim);
+    MIMO_ALLOC(attn_o, T * o_dim);
+    MIMO_ALLOC(blk, T * E);
+    MIMO_ALLOC(attn_part, ds4_gpu_mimo_attn_part_floats(DS4_MIMO_PART_ROWS, DS4_N_HEAD, DS4_N_VALUE_DIM));
+    MIMO_ALLOC(router, T * NE);
+    MIMO_ALLOC(selected, T * K);
+    MIMO_ALLOC(weights, T * K);
+    MIMO_ALLOC(mid, T * K * DS4_N_FF_EXP);
+    MIMO_ALLOC(part, T * K * E);
+    MIMO_ALLOC(moe_lists, NE * T);
+    MIMO_ALLOC(moe_counts, NE);
+    MIMO_ALLOC(ffn_g, T * DS4_N_FF_DENSE);
+    MIMO_ALLOC(ffn_u, T * DS4_N_FF_DENSE);
+    MIMO_ALLOC(ffn_m, T * DS4_N_FF_DENSE);
+    MIMO_ALLOC(logits, (uint64_t)g->n_logit_rows * DS4_N_VOCAB);
+    if (mtp) {
+        g->mtp_rows = cap_tokens + n_mtp + 2u;
+        MIMO_ALLOC(mtp_a, (uint64_t)g->mtp_rows * E);
+        MIMO_ALLOC(mtp_b, (uint64_t)g->mtp_rows * E);
+        MIMO_ALLOC(mtp_e, (uint64_t)g->mtp_rows * E);
+        MIMO_ALLOC(mtp_cat, T * 2u * E);
+        MIMO_ALLOC(mtp_carry, (uint64_t)n_mtp * E);
+    }
+    if (mtp || df) {
+        /* verify rows, the logits before the block, the draft rows */
+        g->host_logits = xmalloc((uint64_t)(g->n_verify + 1u + DS4_DFLASH_BLOCK) * DS4_N_VOCAB * sizeof(float));
+        g->argmax = ds4_gpu_tensor_alloc(sizeof(int32_t));
+        g->argmax_tmp = ds4_gpu_tensor_alloc(((uint64_t)DS4_N_VOCAB / 4096u + 1u) * 8u);
+        ok = ok && g->argmax && g->argmax_tmp;
+    }
+    if (df) {
+        const uint64_t B = df->block, Hk = (uint64_t)df->n_head * df->head_dim, Hv = (uint64_t)df->n_head * df->value_dim;
+        const uint64_t Kk = (uint64_t)df->n_head_kv * df->head_dim, Kv = (uint64_t)df->n_head_kv * df->value_dim;
+        g->df = df;
+        g->df_model = dm;
+        g->df_rows = cap_tokens > B ? cap_tokens : (uint32_t)B;
+        g->df_ring = df->window + g->df_rows + (uint32_t)B;
+        MIMO_ALLOC(df_feat, (uint64_t)g->df_rows * df->n_target * E);
+        MIMO_ALLOC(df_c, (uint64_t)g->df_rows * E);
+        MIMO_ALLOC(df_cn, (uint64_t)g->df_rows * E);
+        MIMO_ALLOC(df_k, (uint64_t)g->df_rows * Kk);
+        MIMO_ALLOC(df_v, (uint64_t)g->df_rows * Kv);
+        MIMO_ALLOC(df_x, B * E);
+        MIMO_ALLOC(df_xn, B * E);
+        MIMO_ALLOC(df_blk, B * E);
+        MIMO_ALLOC(df_q, B * Hk);
+        MIMO_ALLOC(df_qo, B * Hk);
+        MIMO_ALLOC(df_o, B * Hv);
+        MIMO_ALLOC(df_g, B * df->n_ff);
+        MIMO_ALLOC(df_u, B * df->n_ff);
+        MIMO_ALLOC(df_m, B * df->n_ff);
+        MIMO_ALLOC(df_part, ds4_gpu_mimo_attn_part_floats((uint32_t)B, df->n_head, df->value_dim));
+        for (uint32_t il = 0; il < df->n_layer; il++) {
+            MIMO_ALLOC(df_k_cache[il], (uint64_t)g->df_ring * Kk / 2u);
+            MIMO_ALLOC(df_v_cache[il], (uint64_t)g->df_ring * Kv / 2u);
+        }
+    }
+    const uint32_t n_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT + n_mtp;
+    for (uint32_t il = 0; il < n_layers; il++) {
+        const bool swa = ds4_mimo_layer_is_swa(il);
+        uint32_t ring = swa ? DS4_N_SWA + (uint32_t)T : ctx_cap;
+        if (ring > ctx_cap) ring = ctx_cap;
+        const uint64_t kv = mimo_layer_kv(il);
+        g->ring[il] = ring;
+        /* half rows, sized in floats */
+        MIMO_ALLOC(k_cache[il], (uint64_t)ring * kv * DS4_N_HEAD_DIM / 2u);
+        MIMO_ALLOC(v_cache[il], (uint64_t)ring * kv * DS4_N_VALUE_DIM / 2u);
+    }
+#undef MIMO_ALLOC
+    g->host_row = xmalloc(T * E * sizeof(float));
+    if (!ok) {
+        fprintf(stderr, "ds4: MiMo GPU graph allocation failed\n");
+        mimo_graph_free(g);
+    }
+    return ok;
+}
+
+/* MTP depth k first sees position k + 1; its ring holds nothing below */
+static void mimo_graph_reset(ds4_mimo_gpu_graph *g) {
+    (void)ds4_gpu_synchronize();
+    g->pos = 0;
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        g->first[il] = ds4_mimo_layer_is_nextn(il) ? il - (DS4_N_LAYER - DS4_N_NEXTN_PREDICT) + 1u : 0u;
+    }
+    memset(g->mtp_carry_ok, 0, sizeof(g->mtp_carry_ok));
+    g->mtp_draft_valid = false;
+    g->verify_rows = 0;
+}
+
+static bool mimo_graph_attention(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                 uint32_t il, uint32_t pos0, uint32_t T) {
+    const bool swa = ds4_mimo_layer_is_swa(il);
+    const uint32_t kv = mimo_layer_kv(il);
+    const float base = swa ? DS4_ROPE_FREQ_BASE_SWA : DS4_ROPE_FREQ_BASE;
+    return qwen4_gemv(g->qkv, m, l->attn_qkv, g->xn, T) &&
+           ds4_gpu_mimo_attn_prep_tensor(g->q, g->k_cache[il], g->v_cache[il], g->qkv, T, DS4_N_HEAD, kv,
+                                         DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, DS4_N_ROT, pos0, g->ring[il], base,
+                                         DS4_ATTN_VALUE_SCALE) &&
+           ds4_gpu_mimo_attn_tensor(g->attn_o, g->q, g->k_cache[il], g->v_cache[il], m->map, m->size,
+                                    swa ? l->attn_sinks->abs_offset : 0u, swa,
+                                    T <= DS4_MIMO_PART_ROWS ? g->attn_part : NULL, T, DS4_N_HEAD, kv,
+                                    DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, pos0, g->ring[il], swa ? DS4_N_SWA : 0u,
+                                    g->first[il], 0u, 1.0f / sqrtf((float)DS4_N_HEAD_DIM)) &&
+           qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
+}
+
+static bool mimo_graph_dense_ffn(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
+    return qwen4_gemv(g->ffn_g, m, l->ffn_gate, g->xn, T) &&
+           qwen4_gemv(g->ffn_u, m, l->ffn_up, g->xn, T) &&
+           ds4_gpu_swiglu_tensor(g->ffn_m, g->ffn_g, g->ffn_u, T * DS4_N_FF_DENSE, 0.0f, 1.0f) &&
+           qwen4_gemv(g->blk, m, l->ffn_down, g->ffn_m, T);
+}
+
+/* router GEMV + sigmoid top-k, experts per (token, slot) rows or, for
+ * prefill-sized batches, the expert-grouped tiled GEMMs, weighted reduce */
+static bool mimo_graph_moe(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
+    const uint32_t NE = DS4_N_EXPERT, K = DS4_N_EXPERT_USED, E = DS4_N_EMBD, FF = DS4_N_FF_EXP;
+    bool ok = qwen4_gemv(g->router, m, l->ffn_gate_inp, g->xn, T) &&
+              ds4_gpu_mimo_router_tensor(g->selected, g->weights, g->router, m->map, m->size,
+                                         l->ffn_exp_probs_b->abs_offset, T, NE, K);
+    const bool mm = T > 64u && (E % 64u) == 0 && (FF % 64u) == 0 &&
+        qwen4_expert_type_has_mm(l->ffn_gate_exps->type) && l->ffn_up_exps->type == l->ffn_gate_exps->type &&
+        qwen4_expert_type_has_mm(l->ffn_down_exps->type);
+    if (ok && mm) {
+        ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, K, NE, g->cap_tokens) &&
+             ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->xn, g->moe_lists, g->moe_counts, m->map, m->size,
+                                             l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                                             l->ffn_gate_exps->type, NE, T, K, K, E, FF, g->cap_tokens) &&
+             ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->moe_lists, g->moe_counts, m->map, m->size,
+                                              l->ffn_down_exps->abs_offset, l->ffn_down_exps->type, NE, T, K, K,
+                                              FF, E, g->cap_tokens);
+    } else if (ok) {
+        ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->xn, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
+                                          l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, NE, T, K, E, FF,
+                                          0u, 0u, UINT32_MAX) != 0 &&
+             ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
+                                           l->ffn_down_exps->type, NE, T, K, FF, E, 0u, UINT32_MAX) != 0;
+    }
+    return ok && ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, NULL, NULL, NULL, NULL,
+                                                 T, K, K, E, 0u) != 0;
+}
+
+/* pre-norm block on the T rows of residual h at pos0.. */
+static bool mimo_graph_layer(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                             uint32_t il, ds4_gpu_tensor *h, uint32_t pos0, uint32_t T) {
+    const uint32_t E = DS4_N_EMBD;
+    return ds4_gpu_rms_norm_weight_rows_tensor(g->xn, h, m->map, m->size, l->attn_norm->abs_offset, E, T, DS4_RMS_EPS) &&
+           mimo_graph_attention(g, m, l, il, pos0, T) &&
+           ds4_gpu_add_tensor(h, h, g->blk, T * E) &&
+           ds4_gpu_rms_norm_weight_rows_tensor(g->xn, h, m->map, m->size, l->ffn_norm->abs_offset, E, T, DS4_RMS_EPS) &&
+           (ds4_mimo_layer_is_dense(il) ? mimo_graph_dense_ffn(g, m, l, T) : mimo_graph_moe(g, m, l, T)) &&
+           ds4_gpu_add_tensor(h, h, g->blk, T * E);
+}
+
+/* norm + head over rows [row0, row0 + n) of h into logit rows 0..n-1 */
+static bool mimo_graph_head(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_weights *w, ds4_gpu_tensor *h,
+                            const ds4_tensor *norm, uint32_t row0, uint32_t n) {
+    const uint64_t E = DS4_N_EMBD;
+    ds4_gpu_tensor *rows = row0 ? ds4_gpu_tensor_view(h, row0 * E * sizeof(float), (uint64_t)n * E * sizeof(float)) : h;
+    const bool ok = rows &&
+        ds4_gpu_rms_norm_weight_rows_tensor(g->xn, rows, m->map, m->size, norm->abs_offset, (uint32_t)E, n, DS4_RMS_EPS) &&
+        qwen4_gemv(g->logits, m, w->output, g->xn, n);
+    if (row0) ds4_gpu_tensor_free(rows);
+    return ok;
+}
+
+/* Forward T tokens at g->pos..; logits (optional) receive the last token's
+ * row, or all T rows with all_rows (T <= n_logit_rows).  h keeps the
+ * post-trunk residual of every row afterwards. */
+static bool mimo_graph_forward_tokens(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                      const int *tokens, uint32_t T, float *logits_out, bool all_rows) {
+    if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
+    if (all_rows && T > g->n_logit_rows) return false;
+    const uint32_t E = DS4_N_EMBD, n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    for (uint32_t t = 0; t < T; t++) {
+        if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
+            fprintf(stderr, "ds4: MiMo token id %d is outside the vocabulary\n", tokens[t]);
+            return false;
+        }
+        const float *img = g->vis_span_count ? qwen4_span_row(g->vis_spans, g->vis_span_count, g->pos + t) : NULL;
+        if (img) memcpy(g->host_row + (uint64_t)t * E, img, E * sizeof(float));
+        else qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], g->host_row + (uint64_t)t * E);
+    }
+    if (!ds4_gpu_tensor_write(g->h, 0, g->host_row, (uint64_t)T * E * sizeof(float))) return false;
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    const uint32_t pos0 = g->pos;
+    g->verify_rows = 0;
+    bool ok = true;
+    for (uint32_t il = 0; il < n_trunk && ok; il++) {
+        ok = mimo_graph_layer(g, m, &w->layer[il], il, g->h, pos0, T);
+        /* DFlash features: the residual outputs of the target layers */
+        for (uint32_t t = 0; ok && g->df && t < g->df->n_target; t++) {
+            if (g->df->target[t] == il) {
+                ok = ds4_gpu_mimo_scatter_cols_tensor(g->df_feat, g->h, T, E, g->df->n_target * E, t * E) != 0;
+            }
+        }
+    }
+    if (ok && logits_out) {
+        ok = all_rows ? mimo_graph_head(g, m, w, g->h, w->output_norm, 0u, T)
+                      : mimo_graph_head(g, m, w, g->h, w->output_norm, T - 1u, 1u);
+    }
+    if (!ds4_gpu_end_commands()) ok = false;
+    if (ok && logits_out) {
+        ok = ds4_gpu_tensor_read(g->logits, 0, logits_out,
+                                 (uint64_t)(all_rows ? T : 1u) * DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (ok) g->pos += T;
+    return ok;
+}
+
+/* A draft only needs its argmax, and the tokenizer assigns ids in merge
+ * order, so the frequent tokens sit at low ids: DS4_MIMO_DRAFT_ROWS scores
+ * drafts over that leading prefix of the head only.  Verify rows always use
+ * the full head, so committed tokens are unchanged; only which draft is
+ * proposed can differ when the true argmax lies beyond the prefix.
+ * Default: the full vocabulary. */
+static uint32_t mimo_draft_rows(void) {
+    static uint32_t rows = 0;
+    if (!rows) {
+        const char *env = getenv("DS4_MIMO_DRAFT_ROWS");
+        const long v = env && env[0] ? atol(env) : 0;
+        rows = v >= 1024 && v < (long)DS4_N_VOCAB ? (uint32_t)v : DS4_N_VOCAB;
+    }
+    return rows;
+}
+
+/* argmax of the first `rows` logits of g->logits row 0, read back to the host */
+static bool mimo_graph_draft_argmax(ds4_mimo_gpu_graph *g, uint32_t rows, int *token) {
+    int32_t idx = 0;
+    if (!ds4_gpu_qwen4_argmax_tensor(g->argmax, g->argmax_tmp, g->logits, rows) ||
+        !ds4_gpu_end_commands() || !ds4_gpu_tensor_read(g->argmax, 0, &idx, sizeof(idx))) {
+        return false;
+    }
+    *token = (int)idx;
+    return true;
+}
+
+static bool mimo_graph_mtp_row_write(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                     uint32_t row, int token) {
+    const uint64_t E = DS4_N_EMBD;
+    if (token < 0 || token >= (int)DS4_N_VOCAB || row >= g->mtp_rows) return false;
+    qwen4_ref_row(m, w->token_embd, (uint64_t)token, g->host_row);
+    return ds4_gpu_tensor_write(g->mtp_e, row * E * sizeof(float), g->host_row, E * sizeof(float)) != 0;
+}
+
+/* Run the MTP blocks after a forward whose first T rows (tokens[], at
+ * positions p0..) are committed and still in h: depth k re-runs its rows
+ * from p0 through the parent and the shallower drafts, and its last row
+ * drafts token k + 1 while k < n_draft.  Row i of the buffers is position
+ * p0 - 1 + i; row 0 is the hidden row carried from the previous call,
+ * without which (a fresh chain, or after a rewind) a depth starts one row
+ * after the depth above it.  T may be 0 to draft from the carried rows
+ * alone.  Rows of depth k feed depth k + 1, whose output reuses the buffer
+ * of depth k - 1.
+ * rows_logits, if set, receives every committed row's logits per depth
+ * ([depth][T][vocab], positions before the depth's first row untouched). */
+static bool mimo_graph_mtp_rows(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                const int *tokens, uint32_t T, uint32_t p0, int parent,
+                                int *drafts, uint32_t n_draft, float *rows_logits) {
+    const uint32_t K = DS4_N_NEXTN_PREDICT, n_trunk = DS4_N_LAYER - K, E = DS4_N_EMBD, V = DS4_N_VOCAB;
+    const uint64_t row = (uint64_t)E * sizeof(float);
+    if (!g->mtp_a || n_draft > K || T + K + 2u > g->mtp_rows) return false;
+    if (T == 0 && p0 != 0 && !g->mtp_carry_ok[0]) return false;
+    if (n_draft && (parent < 0 || parent >= (int)V)) return false;
+    for (uint32_t i = 0; i < T; i++) {
+        if (!mimo_graph_mtp_row_write(g, m, w, i + 1u, tokens[i])) return false;
+    }
+    if (n_draft && !mimo_graph_mtp_row_write(g, m, w, T + 1u, parent)) return false;
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    bool ok = true;
+    if (T) {
+        ds4_gpu_tensor *norm_rows = ds4_gpu_tensor_view(g->mtp_a, row, (uint64_t)T * row);
+        ok = norm_rows &&
+             ds4_gpu_rms_norm_weight_rows_tensor(norm_rows, g->h, m->map, m->size, w->output_norm->abs_offset,
+                                                 E, T, DS4_RMS_EPS);
+        ds4_gpu_tensor_free(norm_rows);
+    }
+    uint32_t q_prev = p0;   /* first row of the depth above, whose rows feed this one */
+    for (uint32_t k = 0; k < K && ok; k++) {
+        const uint32_t il = n_trunk + k;
+        const ds4_layer_weights *l = &w->layer[il];
+        ds4_gpu_tensor *src = (k & 1u) ? g->mtp_b : g->mtp_a;
+        ds4_gpu_tensor *out = (k & 1u) ? g->mtp_a : g->mtp_b;
+        const uint32_t q = g->mtp_carry_ok[k] ? (p0 > k + 1u ? p0 : k + 1u) : q_prev + 1u;
+        const uint32_t end = p0 + T + (k + 1u < n_draft ? k + 1u : n_draft);
+        /* the carried row feeds position p0; the source row at p0 + T - 1
+         * (written by the depth above, or the trunk) carries the next call */
+        if (q == p0) ok = ds4_gpu_tensor_copy(src, 0, g->mtp_carry, (uint64_t)k * row, row) != 0;
+        if (T) {
+            g->mtp_carry_ok[k] = q_prev + 1u <= p0 + T;
+            if (g->mtp_carry_ok[k]) {
+                ok = ok && ds4_gpu_tensor_copy(g->mtp_carry, (uint64_t)k * row, src, (uint64_t)T * row, row) != 0;
+            }
+        }
+        q_prev = q;
+        if (!ok || end <= q) continue;
+        const uint32_t n = end - q, i0 = q - p0 + 1u;
+        ds4_gpu_tensor *e_rows = ds4_gpu_tensor_view(g->mtp_e, (uint64_t)i0 * row, (uint64_t)n * row);
+        ds4_gpu_tensor *h_rows = ds4_gpu_tensor_view(src, (uint64_t)(i0 - 1u) * row, (uint64_t)n * row);
+        ds4_gpu_tensor *r = ds4_gpu_tensor_view(out, (uint64_t)i0 * row, (uint64_t)n * row);
+        ok = e_rows && h_rows && r &&
+             ds4_gpu_mimo_mtp_cat_tensor(g->mtp_cat, e_rows, h_rows, m->map, m->size, l->nextn_enorm->abs_offset,
+                                         l->nextn_hnorm->abs_offset, n, E, DS4_RMS_EPS) &&
+             qwen4_gemv(r, m, l->nextn_eh_proj, g->mtp_cat, n) &&
+             mimo_graph_layer(g, m, l, il, r, q, n);
+        if (ok && rows_logits && q < p0 + T) {
+            const uint32_t nc = p0 + T - q;
+            ok = nc <= g->n_logit_rows && mimo_graph_head(g, m, w, r, l->nextn_shared_head_norm, 0u, nc) &&
+                 ds4_gpu_end_commands() != 0 &&
+                 ds4_gpu_tensor_read(g->logits, 0, rows_logits + ((uint64_t)k * T + (q - p0)) * V,
+                                     (uint64_t)nc * V * sizeof(float)) != 0 &&
+                 glm_graph_begin_commands_if_needed();
+        }
+        if (ok && k < n_draft) {
+            const uint32_t rows = mimo_draft_rows();
+            ds4_gpu_tensor *last = ds4_gpu_tensor_view(r, (uint64_t)(n - 1u) * row, row);
+            ok = last &&
+                 ds4_gpu_rms_norm_weight_rows_tensor(g->xn, last, m->map, m->size, l->nextn_shared_head_norm->abs_offset,
+                                                     E, 1u, DS4_RMS_EPS) &&
+                 qwen4_gemv_rows(g->logits, m, w->output, g->xn, 1u, rows) &&
+                 mimo_graph_draft_argmax(g, rows, &drafts[k]);
+            ds4_gpu_tensor_free(last);
+            if (ok) {
+                ok = (k + 1u >= K || mimo_graph_mtp_row_write(g, m, w, T + k + 2u, drafts[k])) &&
+                     glm_graph_begin_commands_if_needed();
+            }
+        }
+        ds4_gpu_tensor_free(e_rows);
+        ds4_gpu_tensor_free(h_rows);
+        ds4_gpu_tensor_free(r);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (ok && n_draft) {
+        g->mtp_parent = parent;
+        g->mtp_n_draft = n_draft;
+        g->mtp_draft_valid = true;
+    }
+    return ok;
+}
+
+/* DFlash context: the first T feature rows of the last forward (committed
+ * tokens at positions p0..) become K/V rows of every draft layer */
+static bool mimo_graph_dflash_inject(ds4_mimo_gpu_graph *g, uint32_t T, uint32_t p0) {
+    const ds4_dflash_weights *d = g->df;
+    const ds4_model *dm = g->df_model;
+    const uint32_t E = DS4_N_EMBD;
+    if (!d || T > g->df_rows) return false;
+    if (T == 0) return true;
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    bool ok = qwen4_gemv(g->df_c, dm, d->fc, g->df_feat, T) &&
+              ds4_gpu_rms_norm_weight_rows_tensor(g->df_cn, g->df_c, dm->map, dm->size, d->hidden_norm->abs_offset,
+                                                  E, T, d->eps);
+    for (uint32_t il = 0; ok && il < d->n_layer; il++) {
+        const ds4_dflash_layer *l = &d->layer[il];
+        ok = qwen4_gemv(g->df_k, dm, l->k, g->df_cn, T) &&
+             qwen4_gemv(g->df_v, dm, l->v, g->df_cn, T) &&
+             ds4_gpu_mimo_dflash_prep_tensor(NULL, g->df_k_cache[il], g->df_v_cache[il], NULL, g->df_k, g->df_v,
+                                             dm->map, dm->size, l->q_norm->abs_offset, l->k_norm->abs_offset, T, 0u,
+                                             d->n_head_kv, d->head_dim, d->value_dim, d->n_rot, p0, g->df_ring,
+                                             d->rope_base, d->value_scale, d->eps);
+    }
+    return ok && ds4_gpu_end_commands() != 0;
+}
+
+/* DFlash draft: the block [anchor, mask x (block-1)] at positions s..
+ * through the draft layers, attending to the injected context in the
+ * window and to the whole block; rows 1.. through the shared head give the
+ * drafts (logits_out, optional, receives their [block-1][vocab] logits). */
+static bool mimo_graph_dflash_draft(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_weights *w, int anchor,
+                                    uint32_t s, int *drafts, float *logits_out) {
+    const ds4_dflash_weights *d = g->df;
+    const ds4_model *dm = g->df_model;
+    const uint32_t E = DS4_N_EMBD, V = DS4_N_VOCAB, B = d ? d->block : 0u;
+    if (!d || anchor < 0 || anchor >= (int)V) return false;
+    for (uint32_t j = 0; j < B; j++) {
+        if (j == 0) qwen4_ref_row(m, w->token_embd, (uint64_t)anchor, g->host_row);
+        else qwen4_ref_row(dm, d->mask_embd, 0, g->host_row);
+        if (!ds4_gpu_tensor_write(g->df_x, (uint64_t)j * E * sizeof(float), g->host_row, E * sizeof(float))) return false;
+    }
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    const float scale = 1.0f / sqrtf((float)d->head_dim);
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < d->n_layer; il++) {
+        const ds4_dflash_layer *l = &d->layer[il];
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(g->df_xn, g->df_x, dm->map, dm->size, l->attn_norm->abs_offset, E, B, d->eps) &&
+             qwen4_gemv(g->df_q, dm, l->q, g->df_xn, B) &&
+             qwen4_gemv(g->df_k, dm, l->k, g->df_xn, B) &&
+             qwen4_gemv(g->df_v, dm, l->v, g->df_xn, B) &&
+             ds4_gpu_mimo_dflash_prep_tensor(g->df_qo, g->df_k_cache[il], g->df_v_cache[il], g->df_q, g->df_k, g->df_v,
+                                             dm->map, dm->size, l->q_norm->abs_offset, l->k_norm->abs_offset, B,
+                                             d->n_head, d->n_head_kv, d->head_dim, d->value_dim, d->n_rot, s,
+                                             g->df_ring, d->rope_base, d->value_scale, d->eps) &&
+             ds4_gpu_mimo_attn_tensor(g->df_o, g->df_qo, g->df_k_cache[il], g->df_v_cache[il], dm->map, dm->size,
+                                      l->sinks->abs_offset, true, g->df_part, B, d->n_head, d->n_head_kv, d->head_dim,
+                                      d->value_dim, s, g->df_ring, d->window, 0u, s + B, scale) &&
+             qwen4_gemv(g->df_blk, dm, l->o, g->df_o, B) &&
+             ds4_gpu_add_tensor(g->df_x, g->df_x, g->df_blk, B * E) &&
+             ds4_gpu_rms_norm_weight_rows_tensor(g->df_xn, g->df_x, dm->map, dm->size, l->ffn_norm->abs_offset, E, B, d->eps) &&
+             qwen4_gemv(g->df_g, dm, l->gate, g->df_xn, B) &&
+             qwen4_gemv(g->df_u, dm, l->up, g->df_xn, B) &&
+             ds4_gpu_swiglu_tensor(g->df_m, g->df_g, g->df_u, B * d->n_ff, 0.0f, 1.0f) &&
+             qwen4_gemv(g->df_blk, dm, l->down, g->df_m, B) &&
+             ds4_gpu_add_tensor(g->df_x, g->df_x, g->df_blk, B * E);
+    }
+    float *rows = g->host_logits + (uint64_t)(g->n_verify + 1u) * V;
+    const uint32_t head_rows = logits_out ? V : mimo_draft_rows();
+    if (ok) {
+        ds4_gpu_tensor *tail = ds4_gpu_tensor_view(g->df_x, E * sizeof(float), (uint64_t)(B - 1u) * E * sizeof(float));
+        ok = tail &&
+             ds4_gpu_rms_norm_weight_rows_tensor(g->df_xn, tail, dm->map, dm->size, d->output_norm->abs_offset, E, B - 1u, d->eps) &&
+             qwen4_gemv_rows(g->logits, m, w->output, g->df_xn, B - 1u, head_rows) &&
+             ds4_gpu_end_commands() != 0 &&
+             ds4_gpu_tensor_read(g->logits, 0, rows, (uint64_t)(B - 1u) * head_rows * sizeof(float)) != 0;
+        ds4_gpu_tensor_free(tail);
+    }
+    if (!ok) return false;
+    for (uint32_t j = 0; j + 1u < B; j++) drafts[j] = sample_argmax(rows + (uint64_t)j * head_rows, head_rows);
+    if (logits_out) memcpy(logits_out, rows, (uint64_t)(B - 1u) * V * sizeof(float));
+    g->mtp_parent = anchor;
+    g->mtp_n_draft = B - 1u;
+    g->mtp_draft_valid = true;
+    return true;
+}
+#endif /* DS4_HAS_MIMO_GPU */
+
 /* Copy the recurrent state (GDN states and conv histories, PLE history and
  * n-gram context, position) between the live buffers and one snapshot set,
  * saving to it (save) or restoring from it. */
@@ -60240,6 +61285,12 @@ struct ds4_session {
     uint64_t qwen4_spec_cycles;
     uint64_t qwen4_spec_accepted;
 #endif
+#ifdef DS4_HAS_MIMO_GPU
+    ds4_mimo_gpu_graph mimo_graph;
+    bool mimo_graph_ready;
+    uint64_t mimo_spec_cycles;
+    uint64_t mimo_spec_accepted;
+#endif
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state.  parent is the token that conditioned the
      * pending point-mass draft; sampled decoding discards a draft when its
@@ -61260,6 +62311,10 @@ static bool ds4_session_is_qwen4(const ds4_session *s) {
     return s && s->engine && ds4_model_is_qwen4();
 }
 
+static bool ds4_session_is_mimo(const ds4_session *s) {
+    return s && s->engine && ds4_model_is_mimo();
+}
+
 #ifndef DS4_NO_GPU
 static void ds4_session_glm_reset_dense_cache(ds4_session *s) {
     if (!s) return;
@@ -62204,6 +63259,11 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     if (e && ds4_model_is_qwen4()) {
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && e->backend != DS4_BACKEND_CPU ? 2 : 0;
     }
+    if (e && ds4_model_is_mimo()) {
+        if (e->dflash_ready && e->backend != DS4_BACKEND_CPU) return (int)e->dflash.block;
+        return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && e->backend != DS4_BACKEND_CPU ?
+            (int)DS4_N_NEXTN_PREDICT + 1 : 0;
+    }
     if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
     }
@@ -62865,6 +63925,10 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) return ds41_save_payload(s, fp, err, errlen);
 #endif
+    if (ds4_session_is_mimo(s)) {
+        payload_set_err(err, errlen, "MiMo sessions do not support KV checkpoints yet");
+        return 1;
+    }
     if (ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         payload_set_err(err, errlen, "graph backend support is not compiled in");
@@ -63250,6 +64314,10 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         return rc;
     }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (ds4_session_is_mimo(s)) {
+        payload_set_err(err, errlen, "MiMo sessions do not support KV checkpoints yet");
+        return 1;
+    }
     if (ds4_session_is_ds41(s)) return ds41_load_payload(s, fp, h, remaining, err, errlen);
 #endif
     if (ds4_session_is_qwen4(s)) {
@@ -64584,7 +65652,7 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
-    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s)) {
+    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s) || ds4_session_is_mimo(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
     }
@@ -65063,7 +66131,7 @@ int ds4_engine_generate_argmax(
                     ds4_backend_name(e->backend));
             return 1;
         }
-        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_mimo()) {
             ds4_session *s = NULL;
             char err[256] = {0};
             const double t_prefill0 = now_sec();
@@ -68003,6 +69071,629 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
     return 0;
 }
 
+/* ---------------------------------------------------------------------
+ * MiMo-V2.6 CPU reference (double accumulation): the parity oracle for the
+ * Metal graph, not an inference path.  Weight layouts follow the llama.cpp
+ * mimo2 GGUF: one fused [Q | K | V] projection per layer, sinks on the
+ * sliding-window layers, three trailing MTP blocks with their own caches.
+ * --------------------------------------------------------------------- */
+
+typedef struct {
+    uint32_t cap;
+    uint32_t first[DS4_MAX_LAYER];   /* first cached position; MTP caches start after the trunk's */
+    float *k;   /* [layer][cap][Hkv_swa*Dk] */
+    float *v;   /* [layer][cap][Hkv_swa*Dv] */
+} mimo_ref_state;
+
+static void mimo_ref_state_init(mimo_ref_state *st, uint32_t cap) {
+    memset(st, 0, sizeof(*st));
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) st->first[il] = UINT32_MAX;
+    st->cap = cap;
+    st->k = xcalloc((uint64_t)DS4_N_LAYER * cap * DS4_N_HEAD_KV_SWA * DS4_N_HEAD_DIM, sizeof(float));
+    st->v = xcalloc((uint64_t)DS4_N_LAYER * cap * DS4_N_HEAD_KV_SWA * DS4_N_VALUE_DIM, sizeof(float));
+}
+
+static void mimo_ref_state_free(mimo_ref_state *st) {
+    free(st->k);
+    free(st->v);
+    memset(st, 0, sizeof(*st));
+}
+
+/* NeoX rotation of the first n_rot dims (pairs i, i + n_rot/2); the table
+ * is built in float like the reference. */
+static void mimo_ref_rope(float *x, uint32_t n_rot, uint32_t pos, float base) {
+    const uint32_t half = n_rot / 2u;
+    for (uint32_t i = 0; i < half; i++) {
+        const float inv = 1.0f / powf(base, (float)(2u * i) / (float)n_rot);
+        const float theta = (float)pos * inv;
+        const float c = (float)cos((double)theta), s = (float)sin((double)theta);
+        const float x0 = x[i], x1 = x[i + half];
+        x[i] = x0 * c - x1 * s;
+        x[i + half] = x0 * s + x1 * c;
+    }
+}
+
+static void mimo_ref_attention(const ds4_model *m, const ds4_layer_weights *l, uint32_t il,
+                               mimo_ref_state *st, const float *x, uint32_t pos, float *out) {
+    const uint32_t H = DS4_N_HEAD, Dk = DS4_N_HEAD_DIM, Dv = DS4_N_VALUE_DIM;
+    const bool swa = ds4_mimo_layer_is_swa(il);
+    const uint32_t Hkv = swa ? DS4_N_HEAD_KV_SWA : DS4_N_HEAD_KV;
+    const float base = swa ? DS4_ROPE_FREQ_BASE_SWA : DS4_ROPE_FREQ_BASE;
+    const uint32_t q_dim = H * Dk, k_dim = Hkv * Dk, v_dim = Hkv * Dv;
+    const uint64_t k_stride = (uint64_t)DS4_N_HEAD_KV_SWA * Dk, v_stride = (uint64_t)DS4_N_HEAD_KV_SWA * Dv;
+    float *qkv = xmalloc((q_dim + k_dim + v_dim) * sizeof(float));
+    float *o = xmalloc((uint64_t)H * Dv * sizeof(float));
+    qwen4_ref_matvec(m, l->attn_qkv, x, qkv);
+    float *q = qkv, *k = qkv + q_dim, *v = qkv + q_dim + k_dim;
+    for (uint32_t h = 0; h < H; h++) mimo_ref_rope(q + h * Dk, DS4_N_ROT, pos, base);
+    for (uint32_t h = 0; h < Hkv; h++) mimo_ref_rope(k + h * Dk, DS4_N_ROT, pos, base);
+    for (uint32_t i = 0; i < v_dim; i++) v[i] *= DS4_ATTN_VALUE_SCALE;
+    memcpy(st->k + ((uint64_t)il * st->cap + pos) * k_stride, k, k_dim * sizeof(float));
+    memcpy(st->v + ((uint64_t)il * st->cap + pos) * v_stride, v, v_dim * sizeof(float));
+    if (pos < st->first[il]) st->first[il] = pos;
+
+    /* a window of n_swa keys including the query; the sink is one extra
+     * unscaled logit per head whose mass is dropped after the softmax */
+    uint32_t lo = swa && pos + 1u > DS4_N_SWA ? pos + 1u - DS4_N_SWA : 0u;
+    if (lo < st->first[il]) lo = st->first[il];
+    const uint32_t n_vis = pos + 1u - lo;
+    const float *sinks = swa ? qwen4_ref_f32(m, l->attn_sinks) : NULL;
+    float *p = xmalloc(n_vis * sizeof(float));
+    const float scale = 1.0f / sqrtf((float)Dk);
+    for (uint32_t h = 0; h < H; h++) {
+        const uint32_t kvh = h / (H / Hkv);
+        float mx = sinks ? sinks[h] : -FLT_MAX;
+        for (uint32_t i = 0; i < n_vis; i++) {
+            const float *kt = st->k + ((uint64_t)il * st->cap + lo + i) * k_stride + kvh * Dk;
+            double dot = 0.0;
+            for (uint32_t d = 0; d < Dk; d++) dot += (double)q[h * Dk + d] * kt[d];
+            p[i] = (float)dot * scale;
+            if (p[i] > mx) mx = p[i];
+        }
+        double sum = sinks ? exp((double)sinks[h] - mx) : 0.0;
+        for (uint32_t i = 0; i < n_vis; i++) { p[i] = expf(p[i] - mx); sum += p[i]; }
+        for (uint32_t d = 0; d < Dv; d++) {
+            double acc = 0.0;
+            for (uint32_t i = 0; i < n_vis; i++) {
+                const float *vt = st->v + ((uint64_t)il * st->cap + lo + i) * v_stride + kvh * Dv;
+                acc += (double)p[i] * vt[d];
+            }
+            o[h * Dv + d] = (float)(acc / sum);
+        }
+    }
+    qwen4_ref_matvec(m, l->attn_output, o, out);
+    free(p); free(o); free(qkv);
+}
+
+static void mimo_ref_dense_ffn(const ds4_model *m, const ds4_layer_weights *l, const float *x, float *out) {
+    const uint32_t F = DS4_N_FF_DENSE;
+    float *g = xmalloc(F * sizeof(float));
+    float *u = xmalloc(F * sizeof(float));
+    qwen4_ref_matvec(m, l->ffn_gate, x, g);
+    qwen4_ref_matvec(m, l->ffn_up, x, u);
+    for (uint32_t f = 0; f < F; f++) g[f] = silu(g[f]) * u[f];
+    qwen4_ref_matvec(m, l->ffn_down, g, out);
+    free(u); free(g);
+}
+
+/* sigmoid router: experts chosen by score + bias, weighted by the unbiased
+ * scores renormalised over the selection */
+static void mimo_ref_moe(const ds4_model *m, const ds4_layer_weights *l, const float *x, float *out) {
+    const uint32_t E = DS4_N_EMBD, NE = DS4_N_EXPERT, K = DS4_N_EXPERT_USED, F = DS4_N_FF_EXP;
+    float *logits = xmalloc(NE * sizeof(float));
+    double *prob = xmalloc(NE * sizeof(double));
+    float *g = xmalloc(F * sizeof(float));
+    float *u = xmalloc(F * sizeof(float));
+    float *y = xmalloc(E * sizeof(float));
+    const float *bias = qwen4_ref_f32(m, l->ffn_exp_probs_b);
+    qwen4_ref_matvec(m, l->ffn_gate_inp, x, logits);
+    for (uint32_t e = 0; e < NE; e++) prob[e] = 1.0 / (1.0 + exp(-(double)logits[e]));
+    int sel[DS4_MAX_EXPERT_USED];
+    double wsum = 0.0;
+    for (uint32_t i = 0; i < K; i++) {
+        int best = -1;
+        for (uint32_t e = 0; e < NE; e++) {
+            bool used = false;
+            for (uint32_t j = 0; j < i; j++) used |= sel[j] == (int)e;
+            if (!used && (best < 0 || prob[e] + bias[e] > prob[best] + bias[best])) best = (int)e;
+        }
+        if (best < 0) ds4_die("MiMo router selected more experts than available");
+        sel[i] = best;
+        wsum += prob[best];
+    }
+    for (uint32_t d = 0; d < E; d++) out[d] = 0.0f;
+    for (uint32_t i = 0; i < K; i++) {
+        const uint32_t e = (uint32_t)sel[i];
+        const float wgt = (float)(prob[e] / (wsum + 1e-20));
+        qwen4_ref_matvec_rows(m, l->ffn_gate_exps, (uint64_t)e * F, F, x, g);
+        qwen4_ref_matvec_rows(m, l->ffn_up_exps, (uint64_t)e * F, F, x, u);
+        for (uint32_t f = 0; f < F; f++) g[f] = silu(g[f]) * u[f];
+        qwen4_ref_matvec_rows(m, l->ffn_down_exps, (uint64_t)e * E, E, g, y);
+        for (uint32_t d = 0; d < E; d++) out[d] += wgt * y[d];
+    }
+    free(y); free(u); free(g); free(prob); free(logits);
+}
+
+static void mimo_ref_layer(const ds4_model *m, const ds4_layer_weights *l, uint32_t il,
+                           mimo_ref_state *st, uint32_t pos, float *h) {
+    const uint32_t E = DS4_N_EMBD;
+    float *xn = xmalloc(E * sizeof(float));
+    float *blk = xmalloc(E * sizeof(float));
+    qwen4_ref_rms(xn, h, qwen4_ref_f32(m, l->attn_norm), E, DS4_RMS_EPS);
+    mimo_ref_attention(m, l, il, st, xn, pos, blk);
+    for (uint32_t d = 0; d < E; d++) h[d] += blk[d];
+    qwen4_ref_rms(xn, h, qwen4_ref_f32(m, l->ffn_norm), E, DS4_RMS_EPS);
+    if (ds4_mimo_layer_is_dense(il)) mimo_ref_dense_ffn(m, l, xn, blk);
+    else mimo_ref_moe(m, l, xn, blk);
+    for (uint32_t d = 0; d < E; d++) h[d] += blk[d];
+    free(blk); free(xn);
+}
+
+/* Forward `token` at `pos`; h_post (optional) receives the post-norm hidden
+ * state, streams (optional) the residual after every trunk layer. */
+static void mimo_ref_forward_token(const ds4_model *m, const ds4_weights *w, mimo_ref_state *st,
+                                   int token, uint32_t pos, float *logits, float *h_post, float *streams) {
+    const uint32_t E = DS4_N_EMBD, n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    float *h = xmalloc(E * sizeof(float));
+    float *hn = xmalloc(E * sizeof(float));
+    qwen4_ref_row(m, w->token_embd, (uint64_t)token, h);
+    for (uint32_t il = 0; il < n_trunk; il++) {
+        mimo_ref_layer(m, &w->layer[il], il, st, pos, h);
+        if (streams) memcpy(streams + (uint64_t)il * E, h, E * sizeof(float));
+    }
+    qwen4_ref_rms(hn, h, qwen4_ref_f32(m, w->output_norm), E, DS4_RMS_EPS);
+    if (h_post) memcpy(h_post, hn, E * sizeof(float));
+    if (logits) qwen4_ref_matvec(m, w->output, hn, logits);
+    free(hn); free(h);
+}
+
+/* MTP depth k at `pos`: eh_proj over [enorm(E[token]) ; hnorm(h_prev)], one
+ * SWA block on its own cache, then the shared head; r2 (optional) is the
+ * pre-head residual the next depth consumes. */
+static void mimo_ref_mtp(const ds4_model *m, const ds4_weights *w, mimo_ref_state *st, uint32_t k,
+                         const float *h_prev, int token, uint32_t pos, float *logits, float *r2) {
+    const uint32_t E = DS4_N_EMBD, il = DS4_N_LAYER - DS4_N_NEXTN_PREDICT + k;
+    const ds4_layer_weights *l = &w->layer[il];
+    float *e = xmalloc(E * sizeof(float));
+    float *cat = xmalloc(2u * E * sizeof(float));
+    float *h = xmalloc(E * sizeof(float));
+    float *hn = xmalloc(E * sizeof(float));
+    qwen4_ref_row(m, w->token_embd, (uint64_t)token, e);
+    qwen4_ref_rms(cat, e, qwen4_ref_f32(m, l->nextn_enorm), E, DS4_RMS_EPS);
+    qwen4_ref_rms(cat + E, h_prev, qwen4_ref_f32(m, l->nextn_hnorm), E, DS4_RMS_EPS);
+    qwen4_ref_matvec(m, l->nextn_eh_proj, cat, h);
+    mimo_ref_layer(m, l, il, st, pos, h);
+    if (r2) memcpy(r2, h, E * sizeof(float));
+    if (logits) {
+        qwen4_ref_rms(hn, h, qwen4_ref_f32(m, l->nextn_shared_head_norm), E, DS4_RMS_EPS);
+        qwen4_ref_matvec(m, w->output, hn, logits);
+    }
+    free(hn); free(h); free(cat); free(e);
+}
+
+static ds4_tensor *dflash_tensor(const ds4_model *m, const char *name, uint64_t n0, uint64_t n1, bool *ok) {
+    ds4_tensor *t = model_find_tensor(m, name);
+    if (!t || t->dim[0] != n0 || (n1 ? (t->ndim < 2 || t->dim[1] != n1) : t->ndim > 1)) {
+        fprintf(stderr, "ds4: DFlash tensor %s is missing or has an unexpected shape\n", name);
+        *ok = false;
+        return NULL;
+    }
+    return t;
+}
+
+static bool dflash_bind(ds4_dflash_weights *d, const ds4_model *m) {
+    memset(d, 0, sizeof(*d));
+    const uint32_t E = DS4_N_EMBD, n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    uint32_t embd = 0, vocab = 0, mask = 0;
+    bool causal = true;
+    bool ok = model_get_u32(m, "dflash.block_count", &d->n_layer) &&
+              model_get_u32(m, "dflash.embedding_length", &embd) &&
+              model_get_u32(m, "dflash.feed_forward_length", &d->n_ff) &&
+              model_get_u32(m, "dflash.vocab_size", &vocab) &&
+              model_get_u32(m, "dflash.attention.head_count", &d->n_head) &&
+              model_get_u32(m, "dflash.attention.head_count_kv", &d->n_head_kv) &&
+              model_get_u32(m, "dflash.attention.key_length", &d->head_dim) &&
+              model_get_u32(m, "dflash.attention.value_length", &d->value_dim) &&
+              model_get_f32_compat(m, "dflash.attention.layer_norm_rms_epsilon", &d->eps) &&
+              model_get_u32(m, "dflash.attention.sliding_window", &d->window) &&
+              model_get_bool(m, "dflash.attention.causal", &causal) &&
+              model_get_f32_compat(m, "dflash.attention.value_scale", &d->value_scale) &&
+              model_get_u32(m, "dflash.rope.dimension_count", &d->n_rot) &&
+              model_get_f32_compat(m, "dflash.rope.freq_base", &d->rope_base) &&
+              model_get_u32(m, "dflash.block_size", &d->block) &&
+              model_get_u32(m, "tokenizer.ggml.mask_token_id", &mask);
+    if (!ok) {
+        fprintf(stderr, "ds4: DFlash drafter metadata is incomplete\n");
+        return false;
+    }
+    uint64_t targets[DS4_DFLASH_MAX_TARGET + 1];
+    uint32_t n_target = 0;
+    config_read_qwen4_u64_array(m, "dflash.target_layers", targets, DS4_DFLASH_MAX_TARGET + 1, &n_target);
+    ok = n_target >= 1 && n_target <= DS4_DFLASH_MAX_TARGET;
+    for (uint32_t i = 0; ok && i < n_target; i++) {
+        /* llama.cpp names the input of trunk layer i + 1 */
+        ok = targets[i] >= 1 && targets[i] <= n_trunk;
+        d->target[i] = (uint32_t)targets[i] - 1u;
+    }
+    d->n_target = n_target;
+    d->mask_token = (int)mask;
+    if (!ok || embd != E || vocab != DS4_N_VOCAB || causal || d->n_layer == 0 || d->n_layer > DS4_DFLASH_MAX_LAYER ||
+        d->block != DS4_DFLASH_BLOCK || d->n_head_kv == 0 || (d->n_head % d->n_head_kv) != 0 ||
+        (d->head_dim % 32) != 0 || (d->value_dim % 32) != 0 || d->n_rot > d->head_dim || d->window == 0 ||
+        mask >= DS4_N_VOCAB) {
+        fprintf(stderr, "ds4: DFlash drafter does not fit this model\n");
+        return false;
+    }
+    const uint64_t Hk = (uint64_t)d->n_head * d->head_dim, Hv = (uint64_t)d->n_head * d->value_dim;
+    d->fc = dflash_tensor(m, "fc.weight", (uint64_t)n_target * E, E, &ok);
+    d->hidden_norm = dflash_tensor(m, "enc.output_norm.weight", E, 0, &ok);
+    d->output_norm = dflash_tensor(m, "output_norm.weight", E, 0, &ok);
+    d->mask_embd = dflash_tensor(m, "mask_embd.weight", E, 0, &ok);
+    for (uint32_t il = 0; il < d->n_layer; il++) {
+        ds4_dflash_layer *l = &d->layer[il];
+        char name[96];
+#define DFLASH_T(field_, suffix_, n0_, n1_) do { \
+            snprintf(name, sizeof(name), "blk.%u.%s", il, suffix_); \
+            l->field_ = dflash_tensor(m, name, n0_, n1_, &ok); } while (0)
+        DFLASH_T(attn_norm, "attn_norm.weight", E, 0);
+        DFLASH_T(ffn_norm, "ffn_norm.weight", E, 0);
+        DFLASH_T(q_norm, "attn_q_norm.weight", d->head_dim, 0);
+        DFLASH_T(k_norm, "attn_k_norm.weight", d->head_dim, 0);
+        DFLASH_T(sinks, "attn_sinks.weight", d->n_head, 0);
+        DFLASH_T(q, "attn_q.weight", E, Hk);
+        DFLASH_T(k, "attn_k.weight", E, (uint64_t)d->n_head_kv * d->head_dim);
+        DFLASH_T(v, "attn_v.weight", E, (uint64_t)d->n_head_kv * d->value_dim);
+        DFLASH_T(o, "attn_output.weight", Hv, E);
+        DFLASH_T(gate, "ffn_gate.weight", E, d->n_ff);
+        DFLASH_T(up, "ffn_up.weight", E, d->n_ff);
+        DFLASH_T(down, "ffn_down.weight", d->n_ff, E);
+#undef DFLASH_T
+    }
+    return ok;
+}
+
+/* DFlash draft logits [block-1][vocab] for the block anchored at position
+ * s: context rows are fc + hidden_norm over the concatenated residual
+ * outputs of the target layers (streams[token][trunk layer][E]), the block
+ * [ids[s], mask x (block-1)] attends without a causal mask over the window
+ * of context rows and the whole block, and rows 1.. go through the shared
+ * head.  Mirrors the oracle's dflash_draft. */
+static void mimo_ref_dflash(const ds4_model *m, const ds4_weights *w, const ds4_model *dm,
+                            const ds4_dflash_weights *d, const int *ids, const float *streams, uint32_t s,
+                            float *logits) {
+    const uint32_t E = DS4_N_EMBD, n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT, B = d->block;
+    const uint32_t H = d->n_head, Hkv = d->n_head_kv, Dk = d->head_dim, Dv = d->value_dim, group = H / Hkv;
+    const uint32_t n_rows = s + B;   /* context rows, then the block */
+    float *feat = xmalloc((uint64_t)d->n_target * E * sizeof(float));
+    float *c = xmalloc((uint64_t)(s ? s : 1u) * E * sizeof(float));
+    float *x = xmalloc((uint64_t)B * E * sizeof(float));
+    float *xn = xmalloc((uint64_t)B * E * sizeof(float));
+    float *tmp = xmalloc(E * sizeof(float));
+    float *q = xmalloc((uint64_t)H * Dk * sizeof(float));
+    float *k = xmalloc((uint64_t)n_rows * Hkv * Dk * sizeof(float));
+    float *v = xmalloc((uint64_t)n_rows * Hkv * Dv * sizeof(float));
+    float *o = xmalloc((uint64_t)H * Dv * sizeof(float));
+    float *p = xmalloc(n_rows * sizeof(float));
+    float *g = xmalloc(d->n_ff * sizeof(float));
+    float *u = xmalloc(d->n_ff * sizeof(float));
+    for (uint32_t i = 0; i < s; i++) {
+        for (uint32_t t = 0; t < d->n_target; t++) {
+            memcpy(feat + (uint64_t)t * E, streams + ((uint64_t)i * n_trunk + d->target[t]) * E, E * sizeof(float));
+        }
+        qwen4_ref_matvec(dm, d->fc, feat, tmp);
+        qwen4_ref_rms(c + (uint64_t)i * E, tmp, qwen4_ref_f32(dm, d->hidden_norm), E, d->eps);
+    }
+    qwen4_ref_row(m, w->token_embd, (uint64_t)ids[s], x);
+    for (uint32_t j = 1; j < B; j++) qwen4_ref_row(dm, d->mask_embd, 0, x + (uint64_t)j * E);
+    const float scale = 1.0f / sqrtf((float)Dk);
+    for (uint32_t il = 0; il < d->n_layer; il++) {
+        const ds4_dflash_layer *l = &d->layer[il];
+        const float *gq = qwen4_ref_f32(dm, l->q_norm), *gk = qwen4_ref_f32(dm, l->k_norm);
+        const float *sinks = qwen4_ref_f32(dm, l->sinks);
+        for (uint32_t j = 0; j < B; j++) {
+            qwen4_ref_rms(xn + (uint64_t)j * E, x + (uint64_t)j * E, qwen4_ref_f32(dm, l->attn_norm), E, d->eps);
+        }
+        for (uint32_t r = 0; r < n_rows; r++) {
+            const float *in = r < s ? c + (uint64_t)r * E : xn + (uint64_t)(r - s) * E;
+            float *kr = k + (uint64_t)r * Hkv * Dk, *vr = v + (uint64_t)r * Hkv * Dv;
+            qwen4_ref_matvec(dm, l->k, in, kr);
+            qwen4_ref_matvec(dm, l->v, in, vr);
+            for (uint32_t h = 0; h < Hkv; h++) {
+                qwen4_ref_rms(kr + h * Dk, kr + h * Dk, gk, Dk, d->eps);
+                mimo_ref_rope(kr + h * Dk, d->n_rot, r, d->rope_base);
+            }
+            for (uint32_t i = 0; i < Hkv * Dv; i++) vr[i] *= d->value_scale;
+        }
+        for (uint32_t j = 0; j < B; j++) {
+            const uint32_t pos = s + j;
+            const uint32_t lo = pos + 1u > d->window ? pos + 1u - d->window : 0u;
+            float *xj = x + (uint64_t)j * E, *xnj = xn + (uint64_t)j * E;
+            qwen4_ref_matvec(dm, l->q, xnj, q);
+            for (uint32_t h = 0; h < H; h++) {
+                qwen4_ref_rms(q + h * Dk, q + h * Dk, gq, Dk, d->eps);
+                mimo_ref_rope(q + h * Dk, d->n_rot, pos, d->rope_base);
+            }
+            /* keys: context rows in the window, then every block row */
+            for (uint32_t h = 0; h < H; h++) {
+                const uint32_t kvh = h / group;
+                float mx = sinks[h];
+                for (uint32_t r = lo; r < n_rows; r++) {
+                    const float *kt = k + ((uint64_t)r * Hkv + kvh) * Dk;
+                    double dot = 0.0;
+                    for (uint32_t dd = 0; dd < Dk; dd++) dot += (double)q[h * Dk + dd] * kt[dd];
+                    p[r] = (float)dot * scale;
+                    if (p[r] > mx) mx = p[r];
+                }
+                double sum = exp((double)sinks[h] - mx);
+                for (uint32_t r = lo; r < n_rows; r++) { p[r] = expf(p[r] - mx); sum += p[r]; }
+                for (uint32_t dd = 0; dd < Dv; dd++) {
+                    double acc = 0.0;
+                    for (uint32_t r = lo; r < n_rows; r++) acc += (double)p[r] * v[((uint64_t)r * Hkv + kvh) * Dv + dd];
+                    o[h * Dv + dd] = (float)(acc / sum);
+                }
+            }
+            qwen4_ref_matvec(dm, l->o, o, tmp);
+            for (uint32_t i = 0; i < E; i++) xj[i] += tmp[i];
+            qwen4_ref_rms(xnj, xj, qwen4_ref_f32(dm, l->ffn_norm), E, d->eps);
+            qwen4_ref_matvec(dm, l->gate, xnj, g);
+            qwen4_ref_matvec(dm, l->up, xnj, u);
+            for (uint32_t i = 0; i < d->n_ff; i++) g[i] = g[i] / (1.0f + expf(-g[i])) * u[i];
+            qwen4_ref_matvec(dm, l->down, g, tmp);
+            for (uint32_t i = 0; i < E; i++) xj[i] += tmp[i];
+        }
+    }
+    for (uint32_t j = 1; j < B; j++) {
+        qwen4_ref_rms(tmp, x + (uint64_t)j * E, qwen4_ref_f32(dm, d->output_norm), E, d->eps);
+        qwen4_ref_matvec(m, w->output, tmp, logits + (uint64_t)(j - 1u) * DS4_N_VOCAB);
+    }
+    free(u); free(g); free(p); free(o); free(v); free(k); free(q); free(tmp); free(xn); free(x); free(c); free(feat);
+}
+
+/* --first-token-test for MiMo: DS4_MIMO_FT_TOKENS (comma-separated ids,
+ * default: the prompt) runs the sequential CPU reference; DS4_MIMO_FT_OUT
+ * dumps [n][vocab] f32 logits, DS4_MIMO_FT_HIDDEN [n][trunk][embd] residual
+ * streams, DS4_MIMO_MTP_OUT the teacher-forced drafts of every depth in
+ * turn, depth k contributing [n-k-1][vocab] rows.  With a DFlash drafter,
+ * DS4_MIMO_DFLASH_S (comma-separated anchor positions) runs the draft
+ * blocks and DS4_MIMO_DFLASH_OUT dumps [anchors][block-1][vocab]. */
+static int mimo_first_token_test(const ds4_engine *e, const ds4_tokens *prompt, bool metal) {
+    const ds4_model *model = &e->model;
+    const ds4_weights *weights = &e->weights;
+    int *seq = xmalloc(4096 * sizeof(int));
+    uint32_t n_seq = 0;
+    const char *seq_env = getenv("DS4_MIMO_FT_TOKENS");
+    if (seq_env && seq_env[0]) {
+        n_seq = qwen4_parse_token_list(seq_env, seq, 4096);
+    } else {
+        for (int i = 0; i < prompt->len && n_seq < 4096; i++) seq[n_seq++] = prompt->v[i];
+    }
+    if (n_seq == 0) {
+        free(seq);
+        return 1;
+    }
+    const uint32_t V = DS4_N_VOCAB, E = DS4_N_EMBD, n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const char *hidden_out = getenv("DS4_MIMO_FT_HIDDEN");
+    int anchors[32];
+    uint32_t n_anchor = 0;
+    const char *anchor_env = getenv("DS4_MIMO_DFLASH_S");
+    if (e->dflash_ready && anchor_env && anchor_env[0]) n_anchor = qwen4_parse_token_list(anchor_env, anchors, 32);
+    for (uint32_t a = 0; a < n_anchor; a++) {
+        if (anchors[a] < 0 || (uint32_t)anchors[a] >= n_seq) {
+            fprintf(stderr, "ds4: DFlash anchor %d is outside the sequence\n", anchors[a]);
+            free(seq);
+            return 1;
+        }
+    }
+    float *logits = xmalloc((uint64_t)n_seq * V * sizeof(float));
+    float *post = xmalloc((uint64_t)n_seq * E * sizeof(float));
+    float *layer_streams = (hidden_out && hidden_out[0]) || n_anchor ?
+        xmalloc((uint64_t)n_seq * n_trunk * E * sizeof(float)) : NULL;
+    mimo_ref_state st;
+    mimo_ref_state_init(&st, n_seq);
+    for (uint32_t t = 0; t < n_seq; t++) {
+        mimo_ref_forward_token(model, weights, &st, seq[t], t, logits + (uint64_t)t * V,
+                               post + (uint64_t)t * E,
+                               layer_streams ? layer_streams + (uint64_t)t * n_trunk * E : NULL);
+    }
+    /* mtp_ref[k][p] holds depth k's logits at position p (rows below k + 1 unused) */
+    const char *mtp_out = getenv("DS4_MIMO_MTP_OUT");
+    const uint32_t K = DS4_N_NEXTN_PREDICT;
+    float *mtp_ref = NULL;
+    if (mtp_out && mtp_out[0] && n_seq > 1 && K) {
+        mtp_ref = xmalloc((uint64_t)K * n_seq * V * sizeof(float));
+        float *prev = xmalloc((uint64_t)n_seq * E * sizeof(float));
+        float *next = xmalloc((uint64_t)n_seq * E * sizeof(float));
+        memcpy(prev, post, (uint64_t)n_seq * E * sizeof(float));
+        for (uint32_t k = 0; k < K && k + 1u < n_seq; k++) {
+            for (uint32_t i = 0; i + k + 1u < n_seq; i++) {
+                mimo_ref_mtp(model, weights, &st, k, prev + (uint64_t)i * E, seq[i + k + 1u], i + k + 1u,
+                             mtp_ref + ((uint64_t)k * n_seq + i + k + 1u) * V, next + (uint64_t)i * E);
+            }
+            float *tmp = prev;
+            prev = next;
+            next = tmp;
+        }
+        free(next); free(prev);
+    }
+    mimo_ref_state_free(&st);
+    const uint32_t df_rows = n_anchor ? e->dflash.block - 1u : 0u;
+    float *df_ref = n_anchor ? xmalloc((uint64_t)n_anchor * df_rows * V * sizeof(float)) : NULL;
+    for (uint32_t a = 0; a < n_anchor; a++) {
+        mimo_ref_dflash(model, weights, &e->mtp_model, &e->dflash, seq, layer_streams, (uint32_t)anchors[a],
+                        df_ref + (uint64_t)a * df_rows * V);
+    }
+
+#ifdef DS4_HAS_MIMO_GPU
+    /* DS4_MIMO_GPU=1 runs the Metal graph over the same ids in chunks of
+     * DS4_MIMO_GPU_CHUNK tokens (default 1) with every row's logits, reports
+     * it against the CPU reference, and leaves the GPU logits in the dumps. */
+    if (metal && getenv("DS4_MIMO_GPU")) {
+        const char *chunk_env = getenv("DS4_MIMO_GPU_CHUNK");
+        uint32_t chunk = chunk_env ? (uint32_t)atoi(chunk_env) : 1u;
+        if (chunk == 0) chunk = 1;
+        if (chunk > n_seq) chunk = n_seq;
+        ds4_mimo_gpu_graph *g = xcalloc(1, sizeof(*g));
+        if (!mimo_graph_alloc(g, weights, n_seq + 8u, chunk, mtp_ref != NULL, n_anchor ? &e->dflash : NULL,
+                              &e->mtp_model)) {
+            free(g);
+            free(df_ref); free(mtp_ref); free(layer_streams); free(post); free(logits); free(seq);
+            return 1;
+        }
+        ds4_gpu_tensor_free(g->logits);
+        g->n_logit_rows = chunk > g->n_verify ? chunk : g->n_verify;
+        g->logits = qwen4_graph_alloc_f32((uint64_t)g->n_logit_rows * V);
+        mimo_graph_reset(g);
+        float *gpu = xmalloc((uint64_t)g->n_logit_rows * V * sizeof(float));
+        float *gpu_mtp = mtp_ref ? xmalloc((uint64_t)K * chunk * V * sizeof(float)) : NULL;
+        float worst = 0.0f, worst_mtp = 0.0f;
+        uint32_t agree = 0, agree_mtp = 0, n_mtp = 0;
+        for (uint32_t t0 = 0; t0 < n_seq; t0 += chunk) {
+            const uint32_t n = t0 + chunk <= n_seq ? chunk : n_seq - t0;
+            /* rows a depth does not reach (fresh chains) keep the marker and are skipped */
+            for (uint32_t i = 0; mtp_ref && i < K * n; i++) gpu_mtp[(uint64_t)i * V] = FLT_MAX;
+            if (!g->logits || !mimo_graph_forward_tokens(g, model, weights, seq + t0, n, gpu, true) ||
+                (mtp_ref && !mimo_graph_mtp_rows(g, model, weights, seq + t0, n, t0, -1, NULL, 0u, gpu_mtp)) ||
+                (n_anchor && !mimo_graph_dflash_inject(g, n, t0))) {
+                fprintf(stderr, "ds4: MiMo GPU forward failed at token %u\n", t0);
+                free(gpu_mtp); free(gpu); mimo_graph_free(g); free(g);
+                free(df_ref); free(mtp_ref); free(layer_streams); free(post); free(logits); free(seq);
+                return 1;
+            }
+            /* teacher-forced MTP rows of the chunk against the reference */
+            for (uint32_t k = 0; mtp_ref && k < K; k++) {
+                for (uint32_t r = 0; r < n; r++) {
+                    const uint32_t pos = t0 + r;
+                    const float *row = gpu_mtp + ((uint64_t)k * n + r) * V;
+                    if (pos < k + 1u || row[0] == FLT_MAX) continue;
+                    float *cpu = mtp_ref + ((uint64_t)k * n_seq + pos) * V;
+                    float max_err = 0.0f;
+                    uint32_t cb = 0, gb = 0;
+                    for (uint32_t i = 0; i < V; i++) {
+                        const float d = fabsf(row[i] - cpu[i]);
+                        if (d > max_err) max_err = d;
+                        if (cpu[i] > cpu[cb]) cb = i;
+                        if (row[i] > row[gb]) gb = i;
+                    }
+                    n_mtp++;
+                    if (cb == gb) agree_mtp++;
+                    if (max_err > worst_mtp) worst_mtp = max_err;
+                    printf("  mtp%u pos %3u: max|gpu-cpu|=%g top1 cpu=%u gpu=%u%s\n", k, pos, (double)max_err,
+                           cb, gb, cb == gb ? "" : "  <-- MISMATCH");
+                    memcpy(cpu, row, (uint64_t)V * sizeof(float));
+                }
+            }
+            for (uint32_t r = 0; r < n; r++) {
+                float *cpu = logits + (uint64_t)(t0 + r) * V;
+                const float *row = gpu + (uint64_t)r * V;
+                float max_err = 0.0f;
+                uint32_t cb = 0, gb = 0;
+                for (uint32_t i = 0; i < V; i++) {
+                    const float d = fabsf(row[i] - cpu[i]);
+                    if (d > max_err) max_err = d;
+                    if (cpu[i] > cpu[cb]) cb = i;
+                    if (row[i] > row[gb]) gb = i;
+                }
+                if (cb == gb) agree++;
+                if (max_err > worst) worst = max_err;
+                printf("  pos %3u: max|gpu-cpu|=%g top1 cpu=%u gpu=%u%s\n", t0 + r, (double)max_err, cb, gb,
+                       cb == gb ? "" : "  <-- MISMATCH");
+                memcpy(cpu, row, (uint64_t)V * sizeof(float));
+            }
+        }
+        printf("MiMo GPU-vs-CPU: %u tokens (chunk %u), worst max|diff|=%g, top1 agree %u/%u\n",
+               n_seq, chunk, (double)worst, agree, n_seq);
+        if (mtp_ref) {
+            printf("MiMo MTP GPU-vs-CPU: %u rows, worst max|diff|=%g, top1 agree %u/%u\n",
+                   n_mtp, (double)worst_mtp, agree_mtp, n_mtp);
+        }
+        /* draft blocks: each anchor replays the context before it in chunks,
+         * as a session would, since the rings only keep the window */
+        float worst_df = 0.0f;
+        uint32_t agree_df = 0;
+        for (uint32_t a = 0; a < n_anchor; a++) {
+            const uint32_t s_pos = (uint32_t)anchors[a];
+            float *ref_rows = df_ref + (uint64_t)a * df_rows * V;
+            float *gpu_rows = gpu;
+            int drafts[DS4_DFLASH_BLOCK];
+            bool ok = true;
+            mimo_graph_reset(g);
+            for (uint32_t t0 = 0; ok && t0 < s_pos; t0 += chunk) {
+                const uint32_t n = t0 + chunk <= s_pos ? chunk : s_pos - t0;
+                ok = mimo_graph_forward_tokens(g, model, weights, seq + t0, n, NULL, false) &&
+                     mimo_graph_dflash_inject(g, n, t0);
+            }
+            if (!ok || !mimo_graph_dflash_draft(g, model, weights, seq[s_pos], s_pos, drafts, gpu_rows)) {
+                fprintf(stderr, "ds4: MiMo DFlash draft failed at anchor %d\n", anchors[a]);
+                free(gpu_mtp); free(gpu); mimo_graph_free(g); free(g);
+                free(df_ref); free(mtp_ref); free(layer_streams); free(post); free(logits); free(seq);
+                return 1;
+            }
+            for (uint32_t r = 0; r < df_rows; r++) {
+                float *cpu = ref_rows + (uint64_t)r * V;
+                const float *row = gpu_rows + (uint64_t)r * V;
+                float max_err = 0.0f;
+                uint32_t cb = 0, gb = 0;
+                for (uint32_t i = 0; i < V; i++) {
+                    const float dd = fabsf(row[i] - cpu[i]);
+                    if (dd > max_err) max_err = dd;
+                    if (cpu[i] > cpu[cb]) cb = i;
+                    if (row[i] > row[gb]) gb = i;
+                }
+                if (cb == gb) agree_df++;
+                if (max_err > worst_df) worst_df = max_err;
+                printf("  dflash s=%d row %u: max|gpu-cpu|=%g top1 cpu=%u gpu=%u%s\n", anchors[a], r + 1u,
+                       (double)max_err, cb, gb, cb == gb ? "" : "  <-- MISMATCH");
+                memcpy(cpu, row, (uint64_t)V * sizeof(float));
+            }
+        }
+        if (n_anchor) {
+            printf("MiMo DFlash GPU-vs-CPU: %u rows, worst max|diff|=%g, top1 agree %u/%u\n",
+                   n_anchor * df_rows, (double)worst_df, agree_df, n_anchor * df_rows);
+        }
+        free(gpu_mtp);
+        free(gpu);
+        mimo_graph_free(g);
+        free(g);
+    }
+#else
+    (void)metal;
+#endif
+
+    const char *out_env = getenv("DS4_MIMO_FT_OUT");
+    if (out_env && out_env[0]) qwen4_dump_f32(out_env, logits, (uint64_t)n_seq * V);
+    if (hidden_out && hidden_out[0]) qwen4_dump_f32(hidden_out, layer_streams, (uint64_t)n_seq * n_trunk * E);
+    const char *df_out = getenv("DS4_MIMO_DFLASH_OUT");
+    if (df_ref && df_out && df_out[0]) qwen4_dump_f32(df_out, df_ref, (uint64_t)n_anchor * df_rows * V);
+    free(df_ref);
+    if (mtp_ref) {
+        /* depth k contributes its rows at positions k + 1 .. n - 1 */
+        FILE *f = fopen(mtp_out, "wb");
+        for (uint32_t k = 0; f && k < K && k + 1u < n_seq; k++) {
+            fwrite(mtp_ref + ((uint64_t)k * n_seq + k + 1u) * V, sizeof(float), (uint64_t)(n_seq - k - 1u) * V, f);
+        }
+        if (f) fclose(f);
+        free(mtp_ref);
+    }
+
+    const float *last = logits + (uint64_t)(n_seq - 1u) * V;
+    print_vec_stats("last-position logits", last, V);
+    int best[8];
+    for (int i = 0; i < 8; i++) best[i] = -1;
+    for (uint32_t i = 0; i < V; i++) {
+        for (int j = 0; j < 8; j++) {
+            if (best[j] < 0 || last[i] > last[best[j]]) {
+                for (int k = 7; k > j; k--) best[k] = best[k - 1];
+                best[j] = (int)i;
+                break;
+            }
+        }
+    }
+    printf("top logits after MiMo CPU pass over %u tokens:\n", n_seq);
+    for (int j = 0; j < 8; j++) printf("  %d: %g\n", best[j], (double)last[best[j]]);
+    free(layer_streams); free(post); free(logits); free(seq);
+    return 0;
+}
+
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     if (!engine_legacy_graph_test_supported(e)) return 1;
     if (!prompt || prompt->len <= 0) {
@@ -68016,6 +69707,9 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
 
     if (ds4_model_is_qwen4()) {
         return qwen4_first_token_test(model, vocab, weights, prompt, ds4_backend_uses_graph(e->backend));
+    }
+    if (ds4_model_is_mimo()) {
+        return mimo_first_token_test(e, prompt, ds4_backend_uses_graph(e->backend));
     }
 
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -70597,6 +72291,24 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
     }
+    if (ds4_model_is_mimo() && !opt->inspect_only) {
+        const bool backend_ok =
+#ifdef DS4_HAS_MIMO_GPU
+            e->backend == DS4_BACKEND_METAL ||
+#endif
+            (opt->first_token_test && e->backend == DS4_BACKEND_CPU);
+        if (!backend_ok || opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel ||
+            (gpu_cfg && gpu_cfg->n_gpus > 1) ||
+            opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
+            e->ssd_streaming || opt->dspark || e->power_percent != 100) {
+            fprintf(stderr, "ds4: MiMo-V2.6 requires Metal (or --cpu --first-token-test); "
+                            "tensor parallelism, pipeline execution, SSD streaming, DSpark "
+                            "and power throttling are not supported\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
         const bool supported = (e->backend == DS4_BACKEND_METAL ||
 #if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__)
@@ -70630,10 +72342,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (engine_warm_full_model(opt) && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41)
         model_warm_weights(&e->model);
     if (opt->vision_path && opt->vision_path[0]) {
-        if (!ds4_model_is_glm53() && !g_ds4_flash_vision_exp && !ds4_model_is_qwen4() &&
+        if (!ds4_model_is_glm53() && !g_ds4_flash_vision_exp && !ds4_model_is_qwen4() && !ds4_model_is_mimo() &&
             DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) {
             fprintf(stderr,
-                    "ds4: --vision requires GLM-5.3, Qwen3.8-Flash-Next or the pinned "
+                    "ds4: --vision requires GLM-5.3, Qwen3.8-Flash-Next, MiMo-V2.6 or the pinned "
                     "DeepSeek V4 Flash Vision-Exp or V4.1 Flash model\n");
             ds4_engine_close(e);
             *out = NULL;
@@ -70664,6 +72376,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
             qwen4_vision_weights_bind(&e->qwen4_vision_weights, &e->vision_model);
             config_expect_u32("vision projection_dim", e->qwen4_vision_weights.n_out, DS4_N_EMBD);
             e->vision_kind = DS4_VISION_QWEN4;
+        } else if (ds4_model_is_mimo()) {
+            mimo_vision_weights_bind(&e->mimo_vision_weights, &e->vision_model);
+            config_expect_u32("vision projection_dim", e->mimo_vision_weights.n_out, DS4_N_EMBD);
+            e->vision_kind = DS4_VISION_MIMO;
         } else {
             deepseek4_vision_weights_bind(
                     &e->deepseek4_vision_weights, &e->vision_model);
@@ -70814,6 +72530,59 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (engine_warm_full_model(opt)) model_warm_weights(&e->model);
     }
 #endif
+    if (ds4_model_is_mimo()) {
+        if (opt->inspect_only) {
+            *out = e;
+            return 0;
+        }
+        if (opt->first_token_test) {
+            if (e->backend != DS4_BACKEND_CPU && e->backend != DS4_BACKEND_METAL) {
+                fprintf(stderr, "ds4: MiMo first-token test needs CPU or Metal\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+#ifndef DS4_NO_GPU
+            if (ds4_backend_uses_graph(e->backend)) {
+                bool ready = ds4_gpu_init() && ds4_gpu_set_model_map(e->model.map, e->model.size);
+                if (ready && getenv("DS4_MIMO_GPU")) {
+                    (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+                    ready = accelerator_cache_model_tensors(e->backend, &e->model, NULL, NULL, 0);
+                }
+                if (!ready) {
+                    fprintf(stderr, "ds4: MiMo test model map setup failed\n");
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+            }
+#endif
+            if (opt->mtp_path && opt->mtp_path[0]) {
+                model_open(&e->mtp_model, opt->mtp_path, ds4_backend_uses_graph(e->backend), true);
+                e->support_kind = support_model_detect(&e->mtp_model, &e->support_stages, NULL);
+                bool ready = e->support_kind == DS4_SUPPORT_DFLASH && dflash_bind(&e->dflash, &e->mtp_model);
+#ifndef DS4_NO_GPU
+                if (ready && ds4_backend_uses_graph(e->backend) && getenv("DS4_MIMO_GPU")) {
+                    ready = ds4_gpu_set_model_map_range(e->mtp_model.map, e->mtp_model.size,
+                                                        e->mtp_model.tensor_data_pos,
+                                                        e->mtp_model.size - e->mtp_model.tensor_data_pos,
+                                                        e->mtp_model.max_tensor_bytes) &&
+                            accelerator_cache_model_tensors(e->backend, &e->mtp_model, NULL, NULL, 0);
+                }
+#endif
+                if (!ready) {
+                    fprintf(stderr, "ds4: MiMo test needs a DFlash drafter as --mtp-model\n");
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+                e->dflash_ready = true;
+            }
+            vocab_load(&e->vocab, &e->model);
+            *out = e;
+            return 0;
+        }
+    }
     if (ds4_model_is_qwen4()) {
         if (opt->inspect_only) {
             *out = e;
@@ -70960,13 +72729,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
     } else if (!opt->inspect_only) {
         vocab_load(&e->vocab, &e->model);
     }
-    if (e->vision_kind == DS4_VISION_QWEN4) {
+    if (e->vision_kind == DS4_VISION_QWEN4 || e->vision_kind == DS4_VISION_MIMO) {
         e->vision_start_token = vocab_lookup(&e->vocab, "<|vision_start|>");
         e->vision_image_token = vocab_lookup(&e->vocab, "<|image_pad|>");
         e->vision_end_token = vocab_lookup(&e->vocab, "<|vision_end|>");
     }
     if (opt->glm_mtp &&
-        ((DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA && !ds4_model_is_qwen4()) ||
+        ((DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA && !ds4_model_is_qwen4() && !ds4_model_is_mimo()) ||
          DS4_N_NEXTN_PREDICT == 0)) {
         fprintf(stderr,
                 "ds4: --mtp requires a model with embedded MTP weights; "
@@ -71150,6 +72919,22 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         "output may differ from one-token decode due "
                         "to batched floating-point operation order\n");
             }
+        } else if (e->support_kind == DS4_SUPPORT_DFLASH) {
+            if (!ds4_model_is_mimo()) {
+                fprintf(stderr, "ds4: DFlash drafter %s needs a MiMo-V2.6 target model\n", opt->mtp_path);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            if (!dflash_bind(&e->dflash, &e->mtp_model)) {
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            e->dflash_ready = true;
+            e->glm_mtp = false;   /* the drafter replaces the embedded MTP chain */
+            fprintf(stderr, "ds4: DFlash drafter loaded: %s (%u layers, block %u)\n",
+                    opt->mtp_path, e->dflash.n_layer, e->dflash.block);
         } else {
             fprintf(stderr,
                     "ds4: unsupported --mtp-model support model %s (detected=%s); "
@@ -71620,7 +73405,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                        tp_shard_rank);
         }
         const bool support_model_runtime_ready =
-            e->mtp_ready ||
+            e->mtp_ready || e->dflash_ready ||
             (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
         bool support_uses_secondary_rocm_cache = false;
 #ifdef DS4_ROCM_BUILD
@@ -71840,6 +73625,11 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
 bool ds4_engine_is_qwen4(ds4_engine *e) {
     (void)e;
     return ds4_model_is_qwen4();
+}
+
+bool ds4_engine_is_mimo(ds4_engine *e) {
+    (void)e;
+    return ds4_model_is_mimo();
 }
 
 /* The official template's default effort is xhigh; medium adds no text. */
@@ -72305,6 +74095,22 @@ static int ds4_engine_vision_encode_image(
         grid_height = patches.grid_height / 2u;
         ds4_image_patches_free(&patches);
 #endif
+    } else if (e->vision_kind == DS4_VISION_MIMO) {
+#ifdef DS4_HAS_MIMO_GPU
+        ds4_image_patches patches = {0};
+        if (!mimo_vision_encode_image(&e->vision_model, &e->mimo_vision_weights, image, 64u,
+                                      mimo_vision_max_tokens(), &embedding, &patches, error, error_cap)) {
+            ds4_image_patches_free(&patches);
+            return 0;
+        }
+        ok = 1;
+        token_count = patches.image_token_count;
+        content_width = patches.content_width;
+        content_height = patches.content_height;
+        grid_width = patches.grid_width / 2u;
+        grid_height = patches.grid_height / 2u;
+        ds4_image_patches_free(&patches);
+#endif
     } else {
         ds4_image_patches patches = {0};
         if (!ds4_image_preprocess_glm53(&patches, image, 16u, 8000u,
@@ -72334,7 +74140,8 @@ static int ds4_engine_vision_encode_image(
         if (error && error_cap)
             snprintf(error, error_cap, "%s vision inference failed",
                      e->vision_kind == DS4_VISION_DEEPSEEK4 ? "DeepSeek V4" :
-                     e->vision_kind == DS4_VISION_QWEN4 ? "Qwen3.8" : "GLM-5.3");
+                     e->vision_kind == DS4_VISION_QWEN4 ? "Qwen3.8" :
+                     e->vision_kind == DS4_VISION_MIMO ? "MiMo" : "GLM-5.3");
         return 0;
     }
     out->data = embedding;
@@ -72382,6 +74189,58 @@ int ds4_qwen4_vision_dump(const char *vision_path, const char *image_path, const
                  (size_t)patches.image_token_count * w.n_out;
         fclose(fp);
     } else if (ok) {
+        ok = 0;
+    }
+    free(emb);
+    ds4_image_patches_free(&patches);
+    ds4_image_free(&image);
+    return ok;
+#endif
+}
+
+int ds4_mimo_vision_dump(const char *vision_path, const char *image_path, const char *out_path,
+                         uint32_t min_image_tokens, uint32_t max_image_tokens, const char *patches_path) {
+#ifndef DS4_HAS_MIMO_GPU
+    (void)vision_path; (void)image_path; (void)out_path; (void)min_image_tokens; (void)max_image_tokens;
+    (void)patches_path;
+    fprintf(stderr, "ds4: this build does not include a GPU vision backend\n");
+    return 0;
+#else
+    ds4_model vm;
+    ds4_mimo_vision_weights w;
+    model_open(&vm, vision_path, true, false);
+    mimo_vision_weights_bind(&w, &vm);
+    ds4_image image = {0};
+    char err[256] = {0};
+    if (!ds4_image_decode_file(&image, image_path, err, sizeof(err))) {
+        fprintf(stderr, "ds4: %s\n", err);
+        return 0;
+    }
+    int ok = ds4_gpu_init() && ds4_gpu_set_model_map_range(vm.map, vm.size, vm.tensor_data_pos,
+                                                          vm.size - vm.tensor_data_pos, vm.max_tensor_bytes);
+    float *emb = NULL;
+    ds4_image_patches patches = {0};
+    if (ok) ok = mimo_vision_encode_image(&vm, &w, &image, min_image_tokens, max_image_tokens, &emb, &patches,
+                                          err, sizeof(err));
+    if (!ok) fprintf(stderr, "ds4: %s\n", err);
+    FILE *fp = ok ? fopen(out_path, "wb") : NULL;
+    if (fp) {
+        const uint32_t hdr[4] = { patches.image_token_count, w.n_out, patches.grid_height / 2u, patches.grid_width / 2u };
+        ok = fwrite(hdr, sizeof(hdr), 1, fp) == 1 &&
+             fwrite(emb, sizeof(float), (size_t)patches.image_token_count * w.n_out, fp) ==
+                 (size_t)patches.image_token_count * w.n_out;
+        fclose(fp);
+    } else if (ok) {
+        ok = 0;
+    }
+    /* the preprocessed patches, so a reference can skip its own resize */
+    FILE *pp = ok && patches_path ? fopen(patches_path, "wb") : NULL;
+    if (pp) {
+        const uint32_t hdr[4] = { patches.patch_count, 3u * 16u * 16u, patches.grid_height, patches.grid_width };
+        const size_t n = (size_t)patches.patch_count * 3u * 16u * 16u;
+        ok = fwrite(hdr, sizeof(hdr), 1, pp) == 1 && fwrite(patches.patches, sizeof(float), n, pp) == n;
+        fclose(pp);
+    } else if (ok && patches_path) {
         ok = 0;
     }
     free(emb);
@@ -72799,6 +74658,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             fprintf(stderr, "ds4: Qwen3.8 sessions require Metal or CUDA\n");
             return 1;
         }
+        if (ds4_model_is_mimo()) {
+            fprintf(stderr, "ds4: MiMo sessions require Metal\n");
+            return 1;
+        }
         if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
             fprintf(stderr, "ds4: distributed coordinator sessions require the graph backend\n");
             return 1;
@@ -72934,6 +74797,33 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         s->qwen4_graph_ready = true;
         if (!s->qwen4_graph.owns_scratch) e->qwen4_arena_users++;
+        s->prefill_cap = (uint32_t)ctx_size;
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+        if (!ds4_session_tp_register(s)) {
+            ds4_session_free(s);
+            return 1;
+        }
+        *out = s;
+        return 0;
+    }
+#endif
+#ifdef DS4_HAS_MIMO_GPU
+    if (ds4_model_is_mimo()) {
+        if (e->backend != DS4_BACKEND_METAL || e->distributed.role != DS4_DISTRIBUTED_NONE) {
+            fprintf(stderr, "ds4: MiMo sessions require single-host Metal\n");
+            free(s);
+            return 1;
+        }
+        const uint32_t cap_tokens = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
+            e->prefill_chunk : mimo_prefill_chunk_tokens((uint32_t)ctx_size);
+        if (!mimo_graph_alloc(&s->mimo_graph, &e->weights, (uint32_t)ctx_size, cap_tokens, e->glm_mtp,
+                              e->dflash_ready ? &e->dflash : NULL, &e->mtp_model)) {
+            free(s);
+            return 1;
+        }
+        mimo_graph_reset(&s->mimo_graph);
+        s->mimo_graph_ready = true;
         s->prefill_cap = (uint32_t)ctx_size;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
@@ -73300,6 +75190,17 @@ void ds4_session_free(ds4_session *s) {
             }
             if (s->qwen4_graph_ready && !s->qwen4_graph.owns_scratch && s->engine) s->engine->qwen4_arena_users--;
             qwen4_graph_free(&s->qwen4_graph);
+        } else
+#endif
+#ifdef DS4_HAS_MIMO_GPU
+        if (ds4_session_is_mimo(s)) {
+            if (s->engine && s->engine->glm_mtp_timing && s->mimo_spec_cycles) {
+                fprintf(stderr, "ds4: MiMo %s: %" PRIu64 " verify cycles, %" PRIu64 " drafts accepted (%.2f per cycle)\n",
+                        s->engine->dflash_ready ? "dflash" : "mtp",
+                        s->mimo_spec_cycles, s->mimo_spec_accepted,
+                        (double)s->mimo_spec_accepted / (double)s->mimo_spec_cycles);
+            }
+            mimo_graph_free(&s->mimo_graph);
         } else
 #endif
         if (ds4_session_is_glm(s)) {
@@ -74299,6 +76200,166 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     return 1;
 }
 #endif
+#endif
+
+#ifdef DS4_HAS_MIMO_GPU
+/* test knob: DS4_MIMO_SPEC_DRAFTS=FILE (whitespace-separated ids by position)
+ * replaces each draft with the id at its position, so the accept paths run
+ * on models whose own drafts rarely match */
+static void mimo_spec_oracle_drafts(ds4_mimo_gpu_graph *g) {
+    static int *ids = NULL;
+    static int n = 0;
+    static char loaded[512];
+    const char *path = getenv("DS4_MIMO_SPEC_DRAFTS");
+    if (!path || !path[0]) return;
+    if (strcmp(path, loaded) != 0) {
+        snprintf(loaded, sizeof(loaded), "%s", path);
+        n = 0;
+        FILE *f = fopen(path, "r");
+        if (f) {
+            int cap = 0, id;
+            while (fscanf(f, "%d", &id) == 1) {
+                if (n == cap) ids = xrealloc(ids, (size_t)(cap = cap ? cap * 2 : 256) * sizeof(int));
+                ids[n++] = id;
+            }
+            fclose(f);
+        }
+    }
+    for (uint32_t j = 0; g->mtp_draft_valid && j < g->mtp_n_draft; j++) {
+        const uint32_t pos = g->pos + 1u + j;
+        if (pos < (uint32_t)n) g->mtp_draft[j] = ids[pos];
+    }
+}
+
+/* DS4_MIMO_MTP_DEPTH=1..n limits the drafts per cycle (default: every depth) */
+static uint32_t mimo_spec_depth(void) {
+    const char *env = getenv("DS4_MIMO_MTP_DEPTH");
+    const int v = env && env[0] ? atoi(env) : 0;
+    return v >= 1 && v <= (int)DS4_N_NEXTN_PREDICT ? (uint32_t)v : DS4_N_NEXTN_PREDICT;
+}
+
+/* The drafter's bookkeeping after a forward whose first T rows (tokens at
+ * p0..) are committed: the MTP chain catches up, or the DFlash context takes
+ * the rows' features; with a parent the new drafts follow. */
+static bool mimo_session_drafter(ds4_session *s, const int *tokens, uint32_t T, uint32_t p0, int parent,
+                                 uint32_t depth) {
+    ds4_engine *e = s->engine;
+    ds4_mimo_gpu_graph *g = &s->mimo_graph;
+    if (e->dflash_ready) {
+        return mimo_graph_dflash_inject(g, T, p0) &&
+               (parent < 0 || mimo_graph_dflash_draft(g, &e->model, &e->weights, parent, g->pos, g->mtp_draft, NULL));
+    }
+    return mimo_graph_mtp_rows(g, &e->model, &e->weights, tokens, T, p0, parent, g->mtp_draft,
+                               parent < 0 ? 0u : depth, NULL);
+}
+
+/* One MiMo speculative cycle (MTP chain or DFlash block): evaluate
+ * first_token, or verify it with the pending drafts in one all-rows pass
+ * and keep the longest accepted prefix; the rings are position-indexed, so
+ * rejected rows are simply rewritten.  Greedy and opportunistic sampling
+ * accept a draft that is the target argmax; exact sampling accepts each
+ * draft with its target probability and replays a residual sample in place
+ * of the first rejected one.  The next drafts follow the argmax after the
+ * last committed token. */
+static int ds4_session_mimo_spec_cycle(ds4_session *s, int first_token, float temperature, int top_k,
+                                       float top_p, float min_p, uint64_t *rng, bool exact_sampling,
+                                       int *accepted, int accepted_cap, char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    ds4_mimo_gpu_graph *g = &s->mimo_graph;
+    const ds4_model *m = &e->model;
+    const ds4_weights *w = &e->weights;
+    const uint32_t V = DS4_N_VOCAB, depth = e->dflash_ready ? e->dflash.block - 1u : mimo_spec_depth();
+    const bool trace = getenv("DS4_MIMO_SPEC_TRACE") != NULL;
+    const uint32_t n = (uint32_t)s->checkpoint.len;
+    if (g->mtp_draft_valid && first_token != g->mtp_parent) g->mtp_draft_valid = false;
+    uint32_t D = g->mtp_draft_valid ? g->mtp_n_draft : 0u;
+    if (D > depth) D = depth;
+    if (D + 1u > (uint32_t)accepted_cap) D = (uint32_t)accepted_cap - 1u;
+    if (D + 1u > g->cap_tokens) D = g->cap_tokens - 1u;
+    if (n + 1u >= g->ctx_cap) D = 0;
+    else if (n + 1u + D > g->ctx_cap) D = g->ctx_cap - n - 1u;
+    float *rows = g->host_logits;
+    /* the logits before the block restore a rewind to its start */
+    memcpy(rows + (size_t)g->n_verify * V, s->logits, (size_t)V * sizeof(float));
+    if (D == 0) {
+        s->glm_spec_inside = 1;
+        const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
+        s->glm_spec_inside = 0;
+        if (rc != 0) return -1;
+        g->verify_pos = n;
+        g->verify_rows = 1;
+        (void)mimo_session_drafter(s, NULL, 0u, g->pos, sample_argmax(s->logits, V), depth);
+        mimo_spec_oracle_drafts(g);
+        if (trace) fprintf(stderr, "ds4: spec pos %u token %d plain\n", n, first_token);
+        accepted[0] = first_token;
+        return 1;
+    }
+    g->mtp_draft_valid = false;
+    int toks[DS4_DFLASH_BLOCK];
+    toks[0] = first_token;
+    for (uint32_t j = 0; j < D; j++) toks[1u + j] = g->mtp_draft[j];
+    g->pos = n;
+    s->checkpoint_valid = false;
+    if (!mimo_graph_forward_tokens(g, m, w, toks, D + 1u, rows, true)) {
+        if (errlen) snprintf(err, errlen, "MiMo mtp: verify failed");
+        return -1;
+    }
+    g->verify_pos = n;
+    g->verify_rows = D + 1u;
+    uint32_t a = 0;
+    int replacement = -1;
+    for (; a < D; a++) {
+        const float *row = rows + (size_t)a * V;
+        if (exact_sampling && temperature > 0.0f) {
+            if (!rng || !sample_build_probabilities(row, V, temperature, top_k, top_p, min_p, s->sample_probs)) {
+                if (errlen) snprintf(err, errlen, "MiMo mtp: target distribution failed");
+                return -1;
+            }
+            if (speculative_point_accept(s->sample_probs[toks[a + 1u]], 1.0f, rng)) continue;
+            replacement = speculative_point_replacement(s, toks[a + 1u], rng);
+            if (replacement < 0) {
+                if (errlen) snprintf(err, errlen, "MiMo mtp: replacement sampling failed");
+                return -1;
+            }
+            break;
+        }
+        if (sample_argmax(row, V) != toks[a + 1u]) break;
+    }
+    for (uint32_t j = 0; j <= a; j++) token_vec_push(&s->checkpoint, toks[j]);
+    g->pos = n + 1u + a;
+    memcpy(s->logits, rows + (size_t)a * V, (size_t)V * sizeof(float));
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    s->mimo_spec_cycles++;
+    s->mimo_spec_accepted += a;
+    if (trace) {
+        fprintf(stderr, "ds4: spec pos %u token %d drafts", n, first_token);
+        for (uint32_t j = 0; j < D; j++) fprintf(stderr, " %d", toks[1u + j]);
+        fprintf(stderr, " accepted %u%s\n", a, replacement >= 0 ? " +replacement" : "");
+    }
+    bool ok;
+    if (replacement >= 0) {
+        /* the residual sample stands in for the rejected draft: run it after
+         * the drafter took the accepted rows */
+        ok = mimo_session_drafter(s, toks, 1u + a, n, -1, depth) &&
+             mimo_graph_forward_tokens(g, m, w, &replacement, 1u, s->logits, false);
+        if (ok) {
+            token_vec_push(&s->checkpoint, replacement);
+            (void)mimo_session_drafter(s, &replacement, 1u, n + 1u + a, sample_argmax(s->logits, V), depth);
+        }
+    } else {
+        ok = mimo_session_drafter(s, toks, 1u + a, n, sample_argmax(s->logits, V), depth);
+    }
+    if (!ok) {
+        if (errlen) snprintf(err, errlen, "MiMo mtp: predictor failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
+    mimo_spec_oracle_drafts(g);
+    for (uint32_t j = 0; j <= a; j++) accepted[j] = toks[j];
+    if (replacement >= 0) accepted[a + 1u] = replacement;
+    return (int)a + 1 + (replacement >= 0 ? 1 : 0);
+}
 #endif
 
 int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
@@ -75327,6 +77388,68 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         s->qwen4_graph.vis_spans = NULL;
         s->qwen4_graph.vis_span_count = 0;
         s->qwen4_graph.dump_prompt_rows = false;
+        if (prefill_rc != 0) return prefill_rc;
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
+#endif
+#ifdef DS4_HAS_MIMO_GPU
+    if (ds4_session_is_mimo(s)) {
+        ds4_engine *e = s->engine;
+        ds4_mimo_gpu_graph *g = &s->mimo_graph;
+        int start = 0;
+        g->mtp_draft_valid = false;
+        if (s->checkpoint_valid && g->pos >= (uint32_t)s->checkpoint.len &&
+            prompt->len >= s->checkpoint.len && ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            /* a rewound checkpoint keeps its cache rows; later rows are rewritten,
+             * and the MTP chain re-runs its last rows to recover the carried hidden */
+            start = s->checkpoint.len;
+            if (e->glm_mtp && !g->mtp_carry_ok[0] && start > 0) {
+                start -= start < (int)DS4_N_NEXTN_PREDICT ? start : (int)DS4_N_NEXTN_PREDICT;
+                s->checkpoint.len = start;
+            }
+            g->pos = (uint32_t)start;
+        } else {
+            mimo_graph_reset(g);
+            s->checkpoint.len = 0;
+            s->checkpoint_valid = false;
+        }
+        for (int i = start; i < prompt->len; i++) {
+            if (prompt->v[i] < 0 || prompt->v[i] >= (int)DS4_N_VOCAB) {
+                snprintf(err, errlen, "token id %d at position %d is outside the vocabulary", prompt->v[i], i);
+                return 1;
+            }
+        }
+        int prefill_rc = 0;
+        g->vis_spans = s->sync_images;
+        g->vis_span_count = s->sync_image_count;
+        for (int i = start; i < prompt->len;) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = s->checkpoint.len > 0;
+                prefill_rc = DS4_SESSION_SYNC_INTERRUPTED;
+                break;
+            }
+            uint32_t chunk = (uint32_t)(prompt->len - i);
+            if (chunk > g->cap_tokens) chunk = g->cap_tokens;
+            s->checkpoint_valid = false;
+            if (!mimo_graph_forward_tokens(g, &e->model, &e->weights, prompt->v + i, chunk, s->logits, false) ||
+                (e->glm_mtp && !mimo_graph_mtp_rows(g, &e->model, &e->weights, prompt->v + i, chunk, (uint32_t)i,
+                                                    -1, NULL, 0u, NULL)) ||
+                (e->dflash_ready && !mimo_graph_dflash_inject(g, chunk, (uint32_t)i))) {
+                snprintf(err, errlen, "MiMo prefill failed at token %d", i);
+                prefill_rc = 1;
+                break;
+            }
+            for (uint32_t j = 0; j < chunk; j++) token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
+            i += (int)chunk;
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
+        }
+        g->vis_spans = NULL;
+        g->vis_span_count = 0;
         if (prefill_rc != 0) return prefill_rc;
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
@@ -77328,6 +79451,44 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         }
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
+        return 0;
+    }
+#endif
+#ifdef DS4_HAS_MIMO_GPU
+    if (ds4_session_is_mimo(s)) {
+        ds4_mimo_gpu_graph *g = &s->mimo_graph;
+        if (!s->mimo_graph_ready || (!s->checkpoint_valid && s->checkpoint.len != 0) ||
+            g->pos < (uint32_t)s->checkpoint.len) {
+            if (errlen) snprintf(err, errlen, "MiMo graph is not in step with the checkpoint");
+            return 1;
+        }
+        g->pos = (uint32_t)s->checkpoint.len;   /* a rewind only moves the write position back */
+        if (g->pos >= g->ctx_cap) {
+            if (errlen) snprintf(err, errlen, "context is full");
+            return 1;
+        }
+        if (!s->glm_spec_inside) g->mtp_draft_valid = false;
+        /* after a rewind the MTP chain re-runs its last rows to recover the carried hidden */
+        uint32_t back = 0;
+        if (e->glm_mtp && !g->mtp_carry_ok[0] && g->pos > 0) {
+            back = g->pos < DS4_N_NEXTN_PREDICT ? g->pos : DS4_N_NEXTN_PREDICT;
+        }
+        int toks[DS4_MIMO_MAX_MTP + 1];
+        for (uint32_t i = 0; i < back; i++) toks[i] = s->checkpoint.v[g->pos - back + i];
+        toks[back] = token;
+        g->pos -= back;
+        if (!mimo_graph_forward_tokens(g, &e->model, &e->weights, toks, back + 1u, s->logits, false) ||
+            (e->glm_mtp && !mimo_graph_mtp_rows(g, &e->model, &e->weights, toks, back + 1u, g->pos - back - 1u,
+                                                -1, NULL, 0u, NULL)) ||
+            (e->dflash_ready && !mimo_graph_dflash_inject(g, 1u, g->pos - 1u))) {
+            s->checkpoint_valid = false;
+            if (errlen) snprintf(err, errlen, "MiMo decode failed at position %d", s->checkpoint.len);
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        (void)probe_mtp;
         return 0;
     }
 #endif
@@ -84170,6 +86331,20 @@ static int ds4_session_eval_speculative_argmax_impl(
         accepted[0] = first_token;
         return 1;
     }
+    if (ds4_session_is_mimo(s)) {
+        (void)max_tokens;
+        (void)eos_token;
+        if (!accepted || accepted_cap <= 0) return 0;
+#ifdef DS4_HAS_MIMO_GPU
+        if (((s->engine->glm_mtp && DS4_N_NEXTN_PREDICT != 0) || s->engine->dflash_ready) && s->mimo_graph_ready) {
+            return ds4_session_mimo_spec_cycle(s, first_token, 0.0f, 0, 0.0f, 0.0f, NULL, false,
+                                               accepted, accepted_cap, err, errlen);
+        }
+#endif
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
     if (ds4_session_is_glm(s)) {
         (void)max_tokens;
         (void)eos_token;
@@ -85038,6 +87213,18 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
             s, first_token, max_tokens, eos_token,
             accepted, accepted_cap, err, errlen);
     }
+    if (ds4_session_is_mimo(s)) {
+#ifdef DS4_HAS_MIMO_GPU
+        if (((s->engine->glm_mtp && DS4_N_NEXTN_PREDICT != 0) || s->engine->dflash_ready) && s->mimo_graph_ready) {
+            return ds4_session_mimo_spec_cycle(s, first_token, temperature, top_k, top_p, min_p, rng,
+                                               s->engine->dspark_exact_sampling,
+                                               accepted, accepted_cap, err, errlen);
+        }
+#endif
+        return ds4_session_eval_speculative_argmax(
+            s, first_token, max_tokens, eos_token,
+            accepted, accepted_cap, err, errlen);
+    }
 #ifdef DS4_NO_GPU
     (void)eos_token; (void)top_k; (void)top_p; (void)min_p;
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
@@ -85211,6 +87398,24 @@ void ds4_session_rewind(ds4_session *s, int pos) {
         /* Qwen eval replays the kept transcript if reset left the graph behind. */
         state_ok = true;
         s->qwen4_rewound = logit_row < 0;
+    }
+#endif
+#ifdef DS4_HAS_MIMO_GPU
+    /* position-indexed rings: the next forward simply rewrites from pos; a
+     * rewind into the last verify block restores that row's logits */
+    if (s->checkpoint_valid && ds4_session_is_mimo(s)) {
+        ds4_mimo_gpu_graph *g = &s->mimo_graph;
+        state_ok = true;
+        if (g->verify_rows && (uint32_t)pos >= g->verify_pos && (uint32_t)pos <= g->verify_pos + g->verify_rows) {
+            const uint32_t row = (uint32_t)pos == g->verify_pos ? g->n_verify : (uint32_t)pos - g->verify_pos - 1u;
+            memcpy(s->logits, g->host_logits + (size_t)row * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float));
+        }
+        if (getenv("DS4_MIMO_SPEC_TRACE")) {
+            fprintf(stderr, "ds4: spec rewind %d -> %d, block %u+%u\n", s->checkpoint.len, pos, g->verify_pos,
+                    g->verify_rows);
+        }
+        memset(g->mtp_carry_ok, 0, sizeof(g->mtp_carry_ok));
+        g->mtp_draft_valid = false;
     }
 #endif
     if (s->checkpoint_valid && ds4_session_is_glm(s)) {

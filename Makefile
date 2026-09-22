@@ -90,6 +90,8 @@ help:
 	@echo "  make test-qwen4-kernels  Run the Qwen3.8 Metal kernel tests"
 	@echo "  make test-qwen4-q2       Check exact low-bit decode and prefill tile parity"
 	@echo "  make test-qwen4-vision  Compare the Qwen3.8 vision tower with HF (set DS4_QWEN4_SNAPSHOT, DS4_QWEN4_MMPROJ, DS4_QWEN4_IMAGE)"
+	@echo "  make test-mimo-mtp       Check MiMo MTP/DFlash speculative cycles against plain decoding (set DS4_TEST_MODEL, optional DS4_TEST_DFLASH)"
+	@echo "  make test-mimo-vision    Compare the MiMo vision tower with HF (set DS4_MIMO_SNAPSHOT, DS4_MIMO_MMPROJ, DS4_MIMO_IMAGE)"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth  Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean        Remove build outputs"
@@ -120,6 +122,29 @@ tests/test_metal_session_batch: tests/test_metal_session_batch.o $(CORE_OBJS)
 
 tests/test_metal_tp_spec.o: tests/test_metal_tp_spec.c ds4.h ds4_tp.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_mimo_mtp.o: tests/test_mimo_mtp.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_mimo_mtp: tests/test_mimo_mtp.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+tests/test_mimo_vision.o: tests/test_mimo_vision.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_mimo_vision: tests/test_mimo_vision.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+# DS4_MIMO_SNAPSHOT=<HF checkpoint dir> DS4_MIMO_MMPROJ=<mmproj.gguf> DS4_MIMO_IMAGE=<image>
+.PHONY: test-mimo-vision
+test-mimo-vision: tests/test_mimo_vision
+	@test -n "$(DS4_MIMO_SNAPSHOT)" -a -n "$(DS4_MIMO_MMPROJ)" -a -n "$(DS4_MIMO_IMAGE)" || \
+		{ echo "set DS4_MIMO_SNAPSHOT, DS4_MIMO_MMPROJ and DS4_MIMO_IMAGE"; exit 1; }
+	python3 tests/mimo_vision_ref.py --snapshot "$(DS4_MIMO_SNAPSHOT)" --mmproj "$(DS4_MIMO_MMPROJ)" \
+		--image "$(DS4_MIMO_IMAGE)"
+
+test-mimo-mtp: tests/test_mimo_mtp
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_mimo_mtp
 
 tests/test_metal_tp_spec: tests/test_metal_tp_spec.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)

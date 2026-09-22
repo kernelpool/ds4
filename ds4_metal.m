@@ -4786,6 +4786,8 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
         @[@"DS4_METAL_QWEN4_SOURCE",      @"metal/qwen4.metal"],
         @[@"DS4_METAL_QWEN4_VISION_SOURCE", @"metal/qwen4_vision.metal"],
+        @[@"DS4_METAL_MIMO_SOURCE",       @"metal/mimo.metal"],
+        @[@"DS4_METAL_MIMO_VISION_SOURCE", @"metal/mimo_vision.metal"],
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
@@ -50208,6 +50210,258 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
                           MTLSizeMake((total + 7) / 8, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
 }
 
+/* MiMo-V2.6 kernels (metal/mimo.metal): the fused-qkv split and the GQA
+ * attention with sinks and windows; everything else reuses the Qwen3.8 and
+ * generic wrappers. */
+enum {
+    MIMO_K_ATTN_PREP = 0,
+    MIMO_K_ATTN_K6V4,
+    MIMO_K_ATTN_K3V2,
+    MIMO_K_ATTN_K4V4,
+    MIMO_K_ATTN_K1V1,
+    MIMO_K_MERGE_V4,
+    MIMO_K_MERGE_V2,
+    MIMO_K_MERGE_V1,
+    MIMO_K_ROUTER,
+    MIMO_K_MTP_CAT,
+    MIMO_K_DFLASH_PREP,
+    MIMO_K_SCATTER_COLS,
+    MIMO_K_VIS_QKV_ROPE,
+    MIMO_K_VIS_ATTENTION,
+    MIMO_K_VIS_SWIGLU,
+    MIMO_K_VIS_REORDER,
+    MIMO_K_COUNT,
+};
+
+static const char *const mimo_kernel_names[MIMO_K_COUNT] = {
+    "kernel_mimo_attn_prep",
+    "kernel_mimo_attn_k6v4",
+    "kernel_mimo_attn_k3v2",
+    "kernel_mimo_attn_k4v4",
+    "kernel_mimo_attn_k1v1",
+    "kernel_mimo_attn_merge_v4",
+    "kernel_mimo_attn_merge_v2",
+    "kernel_mimo_attn_merge_v1",
+    "kernel_mimo_router",
+    "kernel_mimo_mtp_cat",
+    "kernel_mimo_dflash_prep",
+    "kernel_mimo_scatter_cols",
+    "kernel_mimo_vis_qkv_rope",
+    "kernel_mimo_vis_attention",
+    "kernel_mimo_vis_swiglu",
+    "kernel_mimo_vis_reorder",
+};
+
+static id<MTLComputePipelineState> g_mimo_pipelines[MIMO_K_COUNT];
+#define MIMO_ATTN_MAX_SPLITS 64
+
+static int mimo_dispatch(int kernel, const void *args, size_t args_len,
+                         const qwen4_bind *binds, int n_binds, MTLSize grid, MTLSize tg) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        if (!g_mimo_pipelines[kernel]) {
+            g_mimo_pipelines[kernel] = ds4_gpu_get_pipeline(mimo_kernel_names[kernel]);
+            if (!g_mimo_pipelines[kernel]) {
+                fprintf(stderr, "ds4: MiMo kernel '%s' is absent from the compiled Metal sources "
+                                "(run from the matching checkout or point DS4_METAL_MIMO_SOURCE at it)\n",
+                        mimo_kernel_names[kernel]);
+                return 0;
+            }
+        }
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_mimo_pipelines[kernel]];
+        [enc setBytes:args length:args_len atIndex:0];
+        for (int i = 0; i < n_binds; i++) {
+            [enc setBuffer:binds[i].buf offset:binds[i].off atIndex:(NSUInteger)(i + 1)];
+        }
+        [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, mimo_kernel_names[kernel]);
+    }
+}
+
+int ds4_gpu_mimo_attn_prep_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *qkv,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t value_dim,
+        uint32_t n_rot, uint32_t pos0, uint32_t ring, float rope_base, float v_scale) {
+    struct {
+        uint32_t n_tokens, n_head, n_head_kv, head_dim, value_dim, n_rot, pos0, ring;
+        float v_scale; uint32_t pad0, pad1, pad2; float rope_freq[32];
+    } args = { n_tokens, n_head, n_head_kv, head_dim, value_dim, n_rot, pos0, ring, v_scale, 0, 0, 0, { 0 } };
+    for (uint32_t i = 0; i < n_rot / 2u && i < 32u; i++) {
+        args.rope_freq[i] = 1.0f / powf(rope_base, (float)(2u * i) / (float)n_rot);
+    }
+    const uint64_t width = (uint64_t)n_head * head_dim + (uint64_t)n_head_kv * (head_dim + value_dim);
+    qwen4_bind b[4];
+    if (n_tokens == 0 || ring == 0 || n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
+        head_dim < 32 || head_dim > 256 || (head_dim % 32) != 0 || value_dim < 32 || (value_dim % 32) != 0 ||
+        n_rot > 64 || (n_rot % 2) != 0 || n_rot > head_dim ||
+        !qwen4_bind_tensor(&b[0], qkv, (uint64_t)n_tokens * width * sizeof(float), "MiMo qkv projection") ||
+        !qwen4_bind_tensor(&b[1], q_out, (uint64_t)n_tokens * n_head * head_dim * sizeof(float), "MiMo q") ||
+        !qwen4_bind_tensor(&b[2], k_cache, (uint64_t)ring * n_head_kv * head_dim * 2u, "MiMo k cache") ||
+        !qwen4_bind_tensor(&b[3], v_cache, (uint64_t)ring * n_head_kv * value_dim * 2u, "MiMo v cache")) {
+        return 0;
+    }
+    return mimo_dispatch(MIMO_K_ATTN_PREP, &args, sizeof(args), b, 4,
+                         MTLSizeMake(n_head + n_head_kv, n_tokens, 1), MTLSizeMake(32, 1, 1));
+}
+
+uint64_t ds4_gpu_mimo_attn_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t value_dim) {
+    return (uint64_t)n_tokens * n_head * MIMO_ATTN_MAX_SPLITS * (2u + value_dim);
+}
+
+int ds4_gpu_mimo_attn_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        const void *model_map, uint64_t model_size, uint64_t sinks_offset, bool has_sink, ds4_gpu_tensor *part,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t value_dim,
+        uint32_t pos0, uint32_t ring, uint32_t n_swa, uint32_t first, uint32_t hi_end, float scale) {
+    int kd, km;
+    if (head_dim == 192u && value_dim == 128u) { kd = MIMO_K_ATTN_K6V4; km = MIMO_K_MERGE_V4; }
+    else if (head_dim == 96u && value_dim == 64u) { kd = MIMO_K_ATTN_K3V2; km = MIMO_K_MERGE_V2; }
+    else if (head_dim == 128u && value_dim == 128u) { kd = MIMO_K_ATTN_K4V4; km = MIMO_K_MERGE_V4; }
+    else if (head_dim == 32u && value_dim == 32u) { kd = MIMO_K_ATTN_K1V1; km = MIMO_K_MERGE_V1; }
+    else return 0;
+    if (n_tokens == 0 || n_head_kv == 0 || (n_head % n_head_kv) != 0 || n_head / n_head_kv > 16u || ring == 0 ||
+        (!n_swa && (uint64_t)pos0 + n_tokens > ring) || first > pos0 || (hi_end && hi_end < pos0 + n_tokens)) {
+        return 0;
+    }
+    /* splits follow the widest key range of the batch: the last row when
+     * causal, the first row when every row sees keys up to hi_end */
+    const uint32_t last = pos0 + n_tokens - 1u, widest = hi_end ? pos0 : last;
+    uint32_t lo = n_swa && widest + 1u > n_swa ? widest + 1u - n_swa : 0u;
+    if (lo < first) lo = first;
+    const uint32_t n_keys = (hi_end ? hi_end : last + 1u) - lo;
+    uint32_t n_splits = 1;
+    if (part) {
+        n_splits = (n_keys + qwen4_attn_split_keys() - 1) / qwen4_attn_split_keys();
+        if (n_splits < 1) n_splits = 1;
+        if (n_splits > MIMO_ATTN_MAX_SPLITS) n_splits = MIMO_ATTN_MAX_SPLITS;
+    }
+    const uint32_t keys_per_split = (n_keys + n_splits - 1) / n_splits;
+    struct { uint32_t n_tokens, n_head, n_head_kv, head_dim, value_dim, pos0, ring, n_swa, first, has_sink,
+             n_splits, keys_per_split; float scale; uint32_t hi_end, pad1, pad2; } args =
+        { n_tokens, n_head, n_head_kv, head_dim, value_dim, pos0, ring, n_swa, first, has_sink ? 1u : 0u,
+          n_splits, keys_per_split, scale, hi_end, 0, 0 };
+    const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    const uint64_t o_bytes = (uint64_t)n_tokens * n_head * value_dim * sizeof(float);
+    qwen4_bind b[6];
+    if (!qwen4_bind_tensor(&b[0], q, q_bytes, "MiMo attn q") ||
+        !qwen4_bind_tensor(&b[1], k_cache, (uint64_t)ring * n_head_kv * head_dim * 2u, "MiMo k cache") ||
+        !qwen4_bind_tensor(&b[2], v_cache, (uint64_t)ring * n_head_kv * value_dim * 2u, "MiMo v cache") ||
+        !qwen4_bind_tensor(&b[4], out, o_bytes, "MiMo attn out")) {
+        return 0;
+    }
+    if (has_sink) {
+        if (!qwen4_bind_weight(&b[3], model_map, model_size, sinks_offset, (uint64_t)n_head * sizeof(float),
+                               "MiMo attention sinks")) return 0;
+    } else {
+        b[3] = b[0];
+    }
+    if (n_splits > 1) {
+        if (!qwen4_bind_tensor(&b[5], part, (uint64_t)n_tokens * n_head * n_splits * (2u + value_dim) * sizeof(float),
+                               "MiMo attn partials")) return 0;
+    } else {
+        b[5] = b[4];
+    }
+    if (!mimo_dispatch(kd, &args, sizeof(args), b, 6,
+                       MTLSizeMake(n_splits, n_head_kv, n_tokens), MTLSizeMake(32 * 4, 1, 1))) {
+        return 0;
+    }
+    if (n_splits == 1) return 1;
+    qwen4_bind mb[2] = { b[5], b[4] };
+    return mimo_dispatch(km, &args, sizeof(args), mb, 2, MTLSizeMake(n_head, n_tokens, 1), MTLSizeMake(32, 1, 1));
+}
+
+int ds4_gpu_mimo_router_tensor(
+        ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, const ds4_gpu_tensor *logits,
+        const void *model_map, uint64_t model_size, uint64_t bias_offset,
+        uint32_t n_tokens, uint32_t n_expert, uint32_t n_used) {
+    struct { uint32_t n_tokens, n_expert, n_used, pad0; } args = { n_tokens, n_expert, n_used, 0 };
+    qwen4_bind b[4];
+    if (n_tokens == 0 || n_expert == 0 || n_expert > 512 || n_used == 0 || n_used > n_expert || n_used > 256 ||
+        !qwen4_bind_tensor(&b[0], logits, (uint64_t)n_tokens * n_expert * sizeof(float), "MiMo router logits") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, bias_offset, (uint64_t)n_expert * sizeof(float),
+                           "MiMo router bias") ||
+        !qwen4_bind_tensor(&b[2], selected, (uint64_t)n_tokens * n_used * sizeof(int32_t), "MiMo router picks") ||
+        !qwen4_bind_tensor(&b[3], weights, (uint64_t)n_tokens * n_used * sizeof(float), "MiMo router weights")) {
+        return 0;
+    }
+    return mimo_dispatch(MIMO_K_ROUTER, &args, sizeof(args), b, 4, MTLSizeMake(n_tokens, 1, 1), MTLSizeMake(256, 1, 1));
+}
+
+int ds4_gpu_mimo_mtp_cat_tensor(
+        ds4_gpu_tensor *cat, const ds4_gpu_tensor *e, const ds4_gpu_tensor *h,
+        const void *model_map, uint64_t model_size, uint64_t g_e_offset, uint64_t g_h_offset,
+        uint32_t n_tokens, uint32_t n_embd, float eps) {
+    struct { uint32_t n_tokens, n_embd; float eps; uint32_t pad0; } args = { n_tokens, n_embd, eps, 0 };
+    qwen4_bind b[5];
+    const uint64_t rows = (uint64_t)n_tokens * n_embd * sizeof(float);
+    if (n_tokens == 0 || n_embd == 0 ||
+        !qwen4_bind_tensor(&b[0], e, rows, "MiMo mtp embeddings") ||
+        !qwen4_bind_tensor(&b[1], h, rows, "MiMo mtp hidden") ||
+        !qwen4_bind_weight(&b[2], model_map, model_size, g_e_offset, (uint64_t)n_embd * sizeof(float), "MiMo enorm") ||
+        !qwen4_bind_weight(&b[3], model_map, model_size, g_h_offset, (uint64_t)n_embd * sizeof(float), "MiMo hnorm") ||
+        !qwen4_bind_tensor(&b[4], cat, 2u * rows, "MiMo mtp cat")) {
+        return 0;
+    }
+    return mimo_dispatch(MIMO_K_MTP_CAT, &args, sizeof(args), b, 5, MTLSizeMake(n_tokens, 2, 1), MTLSizeMake(256, 1, 1));
+}
+
+int ds4_gpu_mimo_dflash_prep_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        const void *model_map, uint64_t model_size, uint64_t q_norm_offset, uint64_t k_norm_offset,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t value_dim,
+        uint32_t n_rot, uint32_t pos0, uint32_t ring, float rope_base, float v_scale, float eps) {
+    struct {
+        uint32_t n_tokens, n_head, n_head_kv, head_dim, value_dim, n_rot, pos0, ring;
+        float v_scale, eps; uint32_t pad0, pad1; float rope_freq[32];
+    } args = { n_tokens, n_head, n_head_kv, head_dim, value_dim, n_rot, pos0, ring, v_scale, eps, 0, 0, { 0 } };
+    for (uint32_t i = 0; i < n_rot / 2u && i < 32u; i++) {
+        args.rope_freq[i] = 1.0f / powf(rope_base, (float)(2u * i) / (float)n_rot);
+    }
+    const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
+    qwen4_bind b[8];
+    if (n_tokens == 0 || ring == 0 || n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
+        head_dim < 32 || head_dim > 256 || (head_dim % 32) != 0 || value_dim < 32 || (value_dim % 32) != 0 ||
+        n_rot > 64 || (n_rot % 2) != 0 || n_rot > head_dim ||
+        !qwen4_bind_tensor(&b[1], k, (uint64_t)n_tokens * n_head_kv * head_dim * sizeof(float), "DFlash k") ||
+        !qwen4_bind_tensor(&b[2], v, (uint64_t)n_tokens * n_head_kv * value_dim * sizeof(float), "DFlash v") ||
+        !qwen4_bind_weight(&b[3], model_map, model_size, q_norm_offset, norm_bytes, "DFlash q norm") ||
+        !qwen4_bind_weight(&b[4], model_map, model_size, k_norm_offset, norm_bytes, "DFlash k norm") ||
+        !qwen4_bind_tensor(&b[6], k_cache, (uint64_t)ring * n_head_kv * head_dim * 2u, "DFlash k cache") ||
+        !qwen4_bind_tensor(&b[7], v_cache, (uint64_t)ring * n_head_kv * value_dim * 2u, "DFlash v cache")) {
+        return 0;
+    }
+    if (n_head) {
+        if (!qwen4_bind_tensor(&b[0], q, (uint64_t)n_tokens * n_head * head_dim * sizeof(float), "DFlash q") ||
+            !qwen4_bind_tensor(&b[5], q_out, (uint64_t)n_tokens * n_head * head_dim * sizeof(float), "DFlash q out")) {
+            return 0;
+        }
+    } else {
+        b[0] = b[1];
+        b[5] = b[2];
+    }
+    return mimo_dispatch(MIMO_K_DFLASH_PREP, &args, sizeof(args), b, 8,
+                         MTLSizeMake(n_head + n_head_kv, n_tokens, 1), MTLSizeMake(32, 1, 1));
+}
+
+int ds4_gpu_mimo_scatter_cols_tensor(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint32_t n_tokens,
+                                     uint32_t width, uint32_t dst_stride, uint32_t dst_col) {
+    struct { uint32_t n_tokens, width, dst_stride, dst_col; } args = { n_tokens, width, dst_stride, dst_col };
+    qwen4_bind b[2];
+    if (n_tokens == 0 || width == 0 || dst_col + width > dst_stride ||
+        !qwen4_bind_tensor(&b[0], src, (uint64_t)n_tokens * width * sizeof(float), "DFlash feature source") ||
+        !qwen4_bind_tensor(&b[1], dst, (uint64_t)n_tokens * dst_stride * sizeof(float), "DFlash feature rows")) {
+        return 0;
+    }
+    return mimo_dispatch(MIMO_K_SCATTER_COLS, &args, sizeof(args), b, 2, MTLSizeMake(n_tokens, 1, 1),
+                         MTLSizeMake(256, 1, 1));
+}
+
 static ds4_gpu_tensor *g_qwen4_dense_mm_partials;
 static uint64_t g_qwen4_dense_mm_partials_bytes;
 
@@ -50217,6 +50471,7 @@ static void qwen4_batch_release_scratch(void) {
     g_qwen4_dense_mm_partials = g_qwen4_gdn_slots = NULL;
     g_qwen4_dense_mm_partials_bytes = 0;
     for (unsigned i = 0; i < QWEN4_K_COUNT; i++) g_qwen4_pipelines[i] = nil;
+    for (unsigned i = 0; i < MIMO_K_COUNT; i++) g_mimo_pipelines[i] = nil;
 }
 
 /* Scratch for the k-split planes, allocated once and generously: the
@@ -50495,6 +50750,206 @@ cleanup:
     ds4_gpu_tensor_free(a1);
     ds4_gpu_tensor_free(a0);
     ds4_gpu_tensor_free(patch);
+    return ok;
+}
+
+typedef struct { uint32_t rows, width, n_head, n_head_kv, head_dim, window, has_sink, n_units; float scale;
+                 uint32_t pad0, pad1, pad2; } mimo_vis_args;
+
+static int mimo_vis_dispatch(int kernel, const mimo_vis_args *a, qwen4_bind *b, int n_bind, MTLSize grid, MTLSize tg) {
+    const int ok = mimo_dispatch(kernel, a, sizeof(*a), b, n_bind, grid, tg);
+    if (!ok) fprintf(stderr, "ds4: MiMo vision kernel %s failed\n", mimo_kernel_names[kernel]);
+    return ok;
+}
+
+/* Reorder x (and its positions) at merge-unit granularity into scratch and swap */
+static int mimo_vis_reorder(mimo_vis_args *a, ds4_gpu_tensor **x, ds4_gpu_tensor **scratch, const ds4_gpu_tensor *idx,
+                            uint32_t width) {
+    qwen4_bind b[3];
+    a->width = width;
+    if (!qwen4_vis_t(&b[0], *x, (uint64_t)a->n_units * 4u * width, "vision reorder src") ||
+        !qwen4_bind_tensor(&b[1], idx, (uint64_t)a->n_units * sizeof(uint32_t), "vision reorder index") ||
+        !qwen4_vis_t(&b[2], *scratch, (uint64_t)a->n_units * 4u * width, "vision reorder dst") ||
+        !mimo_vis_dispatch(MIMO_K_VIS_REORDER, a, b, 3, MTLSizeMake(a->n_units * 4u, 1, 1), MTLSizeMake(256, 1, 1))) {
+        return 0;
+    }
+    ds4_gpu_tensor *t = *x;
+    *x = *scratch;
+    *scratch = t;
+    return 1;
+}
+
+int ds4_gpu_mimo_vision_encode(float *out, const float *patches, uint32_t n_patches, uint32_t grid_w,
+                               const void *map, uint64_t size, const ds4_mimo_vision_weights *w) {
+    if (!out || !patches || !map || !w) return 0;
+    const uint32_t E = w->n_embd, FF = w->n_ff, H = w->n_head, Hkv = w->n_head_kv, D = w->head_dim, P = w->n_patch;
+    const uint32_t in_patch = 3u * P * P, ME = 4u * E, O = w->n_out, n_units = n_patches / 4u;
+    const uint32_t QW = H * D, KW = Hkv * D, QKV = QW + 2u * KW;
+    if (n_patches == 0 || (n_patches % 4u) != 0 || grid_w == 0 || (grid_w % 2u) != 0 || (n_patches % grid_w) != 0 ||
+        ((n_patches / grid_w) % 2u) != 0 || (D != 32u && D != 64u) || Hkv == 0 || (H % Hkv) != 0 || FF == 0 || O == 0 ||
+        (in_patch % 32) != 0 || (E % 32) != 0 || w->n_merge != 2u || w->n_layer == 0 ||
+        w->n_layer > DS4_MIMO_VISION_MAX_LAYERS || n_patches > 65535u || ds4_gpu_commands_active()) {
+        fprintf(stderr, "ds4: invalid MiMo vision encoder input\n");
+        return 0;
+    }
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint32_t llm_w = grid_w / 2u, llm_h = n_patches / grid_w / 2u;
+    const uint64_t N = n_patches;
+    ds4_gpu_tensor *patch = NULL, *a0 = NULL, *a1 = NULL, *x = NULL, *tmp = NULL, *qkv = NULL, *q = NULL, *k = NULL;
+    ds4_gpu_tensor *v = NULL, *attn = NULL, *g = NULL, *u = NULL, *ffn = NULL, *pos_row = NULL, *pos_col = NULL;
+    ds4_gpu_tensor *idx_col = NULL, *idx_row = NULL, *zero = NULL, *m0 = NULL, *res = NULL, *pos = NULL, *scratch = NULL;
+    float *hpos = NULL;
+    uint32_t *hidx = NULL;
+    mimo_vis_args a = { n_patches, E, H, Hkv, D, 0, 0, n_units, 1.0f / sqrtf((float)D), 0, 0, 0 };
+    qwen4_vis_args qa = { n_patches, E, grid_w, H, D, 1, 1e-6f, 1.0f };
+    qwen4_bind b[6];
+    int ok = 0;
+#define MIMO_VISION_ALLOC(name_, count_) do { \
+        name_ = ds4_gpu_tensor_alloc((uint64_t)(count_) * sizeof(float)); \
+        if (!(name_)) goto cleanup; \
+    } while (0)
+    MIMO_VISION_ALLOC(patch, N * in_patch);
+    MIMO_VISION_ALLOC(a0, N * E);
+    MIMO_VISION_ALLOC(a1, N * E);
+    MIMO_VISION_ALLOC(x, N * E);
+    MIMO_VISION_ALLOC(tmp, N * E);
+    MIMO_VISION_ALLOC(scratch, N * E);
+    MIMO_VISION_ALLOC(qkv, N * QKV);
+    MIMO_VISION_ALLOC(q, N * QW);
+    MIMO_VISION_ALLOC(k, N * KW);
+    MIMO_VISION_ALLOC(v, N * KW);
+    MIMO_VISION_ALLOC(attn, N * QW);
+    MIMO_VISION_ALLOC(g, N * FF);
+    MIMO_VISION_ALLOC(u, N * FF);
+    MIMO_VISION_ALLOC(ffn, N * FF);
+    MIMO_VISION_ALLOC(pos_row, N * 2u);
+    MIMO_VISION_ALLOC(pos_col, N * 2u);
+    MIMO_VISION_ALLOC(idx_col, n_units);
+    MIMO_VISION_ALLOC(idx_row, n_units);
+    MIMO_VISION_ALLOC(zero, ME > E ? ME : E);
+    MIMO_VISION_ALLOC(m0, (uint64_t)n_units * ME);
+    MIMO_VISION_ALLOC(res, (uint64_t)n_units * O);
+#undef MIMO_VISION_ALLOC
+    /* row order: merge units row-major; column order: units transposed.
+     * idx_col[u_col] = u_row, idx_row its inverse. */
+    hpos = malloc(N * 2u * sizeof(float));
+    hidx = malloc((size_t)n_units * 2u * sizeof(uint32_t));
+    if (!hpos || !hidx) goto cleanup;
+    for (uint32_t r = 0; r < llm_h; r++) {
+        for (uint32_t c = 0; c < llm_w; c++) {
+            hidx[c * llm_h + r] = r * llm_w + c;
+            hidx[n_units + r * llm_w + c] = c * llm_h + r;
+        }
+    }
+    for (uint32_t i = 0; i < n_patches; i++) {
+        const uint32_t unit = i / 4u, within = i % 4u;
+        hpos[i * 2u] = (float)((unit / llm_w) * 2u + within / 2u);
+        hpos[i * 2u + 1u] = (float)((unit % llm_w) * 2u + within % 2u);
+    }
+    if (!ds4_gpu_tensor_write(patch, 0, patches, N * in_patch * sizeof(float)) ||
+        !ds4_gpu_tensor_write(pos_row, 0, hpos, N * 2u * sizeof(float)) ||
+        !ds4_gpu_tensor_write(idx_col, 0, hidx, (size_t)n_units * sizeof(uint32_t)) ||
+        !ds4_gpu_tensor_write(idx_row, 0, hidx + n_units, (size_t)n_units * sizeof(uint32_t))) goto cleanup;
+    {
+        float *col = malloc(N * 2u * sizeof(float));
+        if (!col) goto cleanup;
+        for (uint32_t i = 0; i < n_patches; i++) {
+            const uint32_t from = hidx[i / 4u] * 4u + i % 4u;
+            col[i * 2u] = hpos[from * 2u];
+            col[i * 2u + 1u] = hpos[from * 2u + 1u];
+        }
+        ok = ds4_gpu_tensor_write(pos_col, 0, col, N * 2u * sizeof(float));
+        free(col);
+        if (!ok) goto cleanup;
+    }
+    {
+        float *zeros = calloc(ME > E ? ME : E, sizeof(float));
+        ok = zeros && ds4_gpu_tensor_write(zero, 0, zeros, (uint64_t)(ME > E ? ME : E) * sizeof(float));
+        free(zeros);
+        if (!ok) goto cleanup;
+    }
+    if (!ds4_gpu_begin_commands()) { ok = 0; goto cleanup; }
+    ok = ds4_gpu_qwen4_dense_mm_tensor(a0, patch, map, size, w->patch_w0, w->patch_type, n_patches, in_patch, E) &&
+         ds4_gpu_qwen4_dense_mm_tensor(a1, patch, map, size, w->patch_w1, w->patch_type, n_patches, in_patch, E) &&
+         ds4_gpu_add_tensor(x, a0, a1, N * E);
+    pos = pos_row;
+    int prev_mode = -1;
+    for (uint32_t il = 0; ok && il < w->n_layer; il++) {
+        const ds4_mimo_vision_layer_weights *l = &w->layer[il];
+        const bool col = l->mode == 1;
+        if (col && prev_mode != 1) {
+            ok = mimo_vis_reorder(&a, &x, &scratch, idx_col, E);
+            pos = pos_col;
+        } else if (!col && prev_mode == 1) {
+            ok = mimo_vis_reorder(&a, &x, &scratch, idx_row, E);
+            pos = pos_row;
+        }
+        prev_mode = l->mode;
+        a.width = E;
+        a.window = l->mode == -1 ? 0u : w->window;
+        a.has_sink = l->mode != -1;
+        ok = ok &&
+             ds4_gpu_rms_norm_weight_rows_tensor(tmp, x, map, size, l->ln1_w, E, n_patches, w->eps) &&
+             ds4_gpu_qwen4_dense_mm_tensor(qkv, tmp, map, size, l->qkv_w, l->qkv_type, n_patches, E, QKV) &&
+             qwen4_vis_t(&b[0], qkv, N * QKV, "vision qkv") &&
+             qwen4_vis_w(&b[1], map, size, l->qkv_b, QKV, "vision qkv bias") &&
+             qwen4_vis_t(&b[2], pos, N * 2u, "vision positions") &&
+             qwen4_vis_t(&b[3], q, N * QW, "vision q") &&
+             qwen4_vis_t(&b[4], k, N * KW, "vision k") &&
+             qwen4_vis_t(&b[5], v, N * KW, "vision v") &&
+             mimo_vis_dispatch(MIMO_K_VIS_QKV_ROPE, &a, b, 6, MTLSizeMake(n_patches, 1, 1), MTLSizeMake(256, 1, 1)) &&
+             qwen4_vis_t(&b[0], q, N * QW, "vision q") &&
+             qwen4_vis_t(&b[1], k, N * KW, "vision k") &&
+             qwen4_vis_t(&b[2], v, N * KW, "vision v") &&
+             (a.has_sink ? qwen4_vis_w(&b[3], map, size, l->sinks, H, "vision sinks") : (b[3] = b[0], true)) &&
+             qwen4_vis_t(&b[4], attn, N * QW, "vision attn") &&
+             mimo_vis_dispatch(MIMO_K_VIS_ATTENTION, &a, b, 5, MTLSizeMake(n_patches, H, 1), MTLSizeMake(32, 1, 1)) &&
+             ds4_gpu_qwen4_dense_mm_tensor(tmp, attn, map, size, l->out_w, l->out_type, n_patches, QW, E) &&
+             qwen4_vis_t(&b[0], x, N * E, "vision x") &&
+             qwen4_vis_t(&b[1], tmp, N * E, "vision tmp") &&
+             qwen4_vis_w(&b[2], map, size, l->out_b, E, "vision out bias") &&
+             qwen4_vis_elems(QWEN4_K_VIS_BIAS_RESIDUAL, &qa, b, 3) &&
+             ds4_gpu_rms_norm_weight_rows_tensor(tmp, x, map, size, l->ln2_w, E, n_patches, w->eps) &&
+             ds4_gpu_qwen4_dense_mm_tensor(g, tmp, map, size, l->gate_w, l->gate_type, n_patches, E, FF) &&
+             ds4_gpu_qwen4_dense_mm_tensor(u, tmp, map, size, l->up_w, l->up_type, n_patches, E, FF);
+        if (!ok) break;
+        a.width = FF;
+        ok = qwen4_vis_t(&b[0], g, N * FF, "vision gate") &&
+             qwen4_vis_t(&b[1], u, N * FF, "vision up") &&
+             qwen4_vis_w(&b[2], map, size, l->gate_b, FF, "vision gate bias") &&
+             qwen4_vis_w(&b[3], map, size, l->up_b, FF, "vision up bias") &&
+             qwen4_vis_t(&b[4], ffn, N * FF, "vision ffn") &&
+             mimo_vis_dispatch(MIMO_K_VIS_SWIGLU, &a, b, 5, MTLSizeMake((N * FF + 255) / 256, 1, 1), MTLSizeMake(256, 1, 1)) &&
+             ds4_gpu_qwen4_dense_mm_tensor(tmp, ffn, map, size, l->down_w, l->down_type, n_patches, FF, E) &&
+             qwen4_vis_t(&b[0], x, N * E, "vision x") &&
+             qwen4_vis_t(&b[1], tmp, N * E, "vision tmp") &&
+             qwen4_vis_w(&b[2], map, size, l->down_b, E, "vision down bias") &&
+             qwen4_vis_elems(QWEN4_K_VIS_BIAS_RESIDUAL, &qa, b, 3);
+    }
+    if (ok && prev_mode == 1) ok = mimo_vis_reorder(&a, &x, &scratch, idx_row, E);
+    if (ok) {
+        /* merger: LayerNorm (weight only), 4-row groups through mm.0, GELU, mm.2 */
+        qa.rows = n_patches; qa.width = E;
+        ok = qwen4_vis_t(&b[0], x, N * E, "vision x") &&
+             qwen4_vis_w(&b[1], map, size, w->post_ln_w, E, "vision post ln") &&
+             qwen4_vis_t(&b[2], zero, E, "vision zero bias") &&
+             qwen4_vis_t(&b[3], tmp, N * E, "vision tmp") &&
+             qwen4_vis_rows(QWEN4_K_VIS_LAYERNORM, &qa, b, 4, n_patches, 1) &&
+             ds4_gpu_qwen4_dense_mm_tensor(m0, tmp, map, size, w->mm0_w, w->mm0_type, n_units, ME, ME);
+        qa.rows = n_units; qa.width = ME; qa.mode = 1;
+        ok = ok && qwen4_vis_t(&b[0], m0, (uint64_t)n_units * ME, "vision merger") &&
+             qwen4_vis_t(&b[1], zero, ME, "vision zero bias") &&
+             qwen4_vis_elems(QWEN4_K_VIS_BIAS_ACT, &qa, b, 2) &&
+             ds4_gpu_qwen4_dense_mm_tensor(res, m0, map, size, w->mm2_w, w->mm2_type, n_units, ME, O);
+    }
+    if (!ds4_gpu_end_commands()) ok = 0;
+    if (ok) ok = ds4_gpu_tensor_read(res, 0, out, (uint64_t)n_units * O * sizeof(float));
+cleanup:
+    free(hidx);
+    free(hpos);
+    ds4_gpu_tensor *fields[] = { patch, a0, a1, x, tmp, scratch, qkv, q, k, v, attn, g, u, ffn, pos_row, pos_col,
+                                 idx_col, idx_row, zero, m0, res };
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) ds4_gpu_tensor_free(fields[i]);
     return ok;
 }
 

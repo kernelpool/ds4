@@ -564,11 +564,13 @@ int ds4_image_preprocess_glm53(
     return 1;
 }
 
-int ds4_image_preprocess_qwen4(
+static int image_preprocess_qwen2vl(
         ds4_image_patches *out,
         const ds4_image *image,
         uint32_t min_image_tokens,
         uint32_t max_image_tokens,
+        const float *mean,
+        const float *std,
         char *error,
         size_t error_cap) {
     const uint32_t patch = 16, factor = 32;
@@ -576,7 +578,7 @@ int ds4_image_preprocess_qwen4(
     memset(out, 0, sizeof(*out));
     if (!image || !image->rgb || image->width == 0 || image->height == 0 ||
         min_image_tokens == 0 || max_image_tokens < min_image_tokens) {
-        ds4_image_error(error, error_cap, "invalid Qwen3.8 image preprocessing parameters");
+        ds4_image_error(error, error_cap, "invalid image preprocessing parameters");
         return 0;
     }
     const double h = image->height, w = image->width;
@@ -616,7 +618,7 @@ int ds4_image_preprocess_qwen4(
                                canvas, target_width, target_height, target_width);
     }
     for (size_t i = 0; i < (size_t)target_height * target_width * 3; i++) {
-        canvas[i] = (canvas[i] / 255.0f - 0.5f) / 0.5f;
+        canvas[i] = (canvas[i] / 255.0f - mean[i % 3]) / std[i % 3];
     }
     const uint32_t grid_height = target_height / patch, grid_width = target_width / patch;
     const uint32_t patch_count = grid_height * grid_width;
@@ -656,6 +658,29 @@ int ds4_image_preprocess_qwen4(
     out->image_token_count = patch_count / 4;
     out->patches = patches;
     return 1;
+}
+
+int ds4_image_preprocess_qwen4(
+        ds4_image_patches *out,
+        const ds4_image *image,
+        uint32_t min_image_tokens,
+        uint32_t max_image_tokens,
+        char *error,
+        size_t error_cap) {
+    static const float mean[3] = { 0.5f, 0.5f, 0.5f }, std[3] = { 0.5f, 0.5f, 0.5f };
+    return image_preprocess_qwen2vl(out, image, min_image_tokens, max_image_tokens, mean, std, error, error_cap);
+}
+
+int ds4_image_preprocess_mimo(
+        ds4_image_patches *out,
+        const ds4_image *image,
+        uint32_t min_image_tokens,
+        uint32_t max_image_tokens,
+        char *error,
+        size_t error_cap) {
+    static const float mean[3] = { 0.48145466f, 0.4578275f, 0.40821073f };
+    static const float std[3] = { 0.26862954f, 0.26130258f, 0.27577711f };
+    return image_preprocess_qwen2vl(out, image, min_image_tokens, max_image_tokens, mean, std, error, error_cap);
 }
 
 void ds4_image_patches_free(ds4_image_patches *patches) {

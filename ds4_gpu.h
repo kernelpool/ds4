@@ -3540,6 +3540,63 @@ int ds4_gpu_qwen4_mtp_stage_tensor(
 int ds4_gpu_qwen4_mtp_combine_tensor(
         ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_embd, uint32_t n_hc);
 
+/* MiMo-V2.6 (metal/mimo.metal): split the fused [Q | K | V] projection rows
+ * into roped q rows and the half K/V ring caches (row = pos % ring, V
+ * scaled), then GQA attention with per-head sinks and an n_swa window over
+ * key splits; part (optional) is ds4_gpu_mimo_attn_part_floats() floats. */
+int ds4_gpu_mimo_attn_prep_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *qkv,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t value_dim,
+        uint32_t n_rot, uint32_t pos0, uint32_t ring, float rope_base, float v_scale);
+uint64_t ds4_gpu_mimo_attn_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t value_dim);
+int ds4_gpu_mimo_attn_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        const void *model_map, uint64_t model_size, uint64_t sinks_offset, bool has_sink, ds4_gpu_tensor *part,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t value_dim,
+        uint32_t pos0, uint32_t ring, uint32_t n_swa, uint32_t first, uint32_t hi_end, float scale);
+/* DFlash attention inputs from separate q/k/v rows: per-head q/k norm, rope,
+ * K/V ring writes (n_head 0: context rows, no q) */
+int ds4_gpu_mimo_dflash_prep_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        const void *model_map, uint64_t model_size, uint64_t q_norm_offset, uint64_t k_norm_offset,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t value_dim,
+        uint32_t n_rot, uint32_t pos0, uint32_t ring, float rope_base, float v_scale, float eps);
+/* dst[t][dst_col..] = src[t][0..width) for the DFlash feature rows */
+int ds4_gpu_mimo_scatter_cols_tensor(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint32_t n_tokens,
+                                     uint32_t width, uint32_t dst_stride, uint32_t dst_col);
+#ifndef DS4_MIMO_VISION_TYPES_DEFINED
+#define DS4_MIMO_VISION_TYPES_DEFINED
+#define DS4_MIMO_VISION_MAX_LAYERS 32u
+typedef struct {
+    uint64_t ln1_w, ln2_w, qkv_w, qkv_b, out_w, out_b, gate_w, gate_b, up_w, up_b, down_w, down_b, sinks;
+    uint32_t qkv_type, out_type, gate_type, up_type, down_type;
+    int32_t mode;   /* -1 full attention, 0 row window, 1 column window */
+} ds4_mimo_vision_layer_weights;
+typedef struct {
+    uint64_t patch_w0, patch_w1, post_ln_w, mm0_w, mm2_w;
+    uint32_t patch_type, mm0_type, mm2_type;
+    uint32_t n_layer, n_embd, n_ff, n_head, n_head_kv, head_dim, n_patch, n_merge, n_out, window;
+    float eps;
+    ds4_mimo_vision_layer_weights layer[DS4_MIMO_VISION_MAX_LAYERS];
+} ds4_mimo_vision_weights;
+#endif
+/* MiMo vision tower over one image's patches (2x2 merge-window order);
+ * out gets [n_patches / 4][n_out] */
+int ds4_gpu_mimo_vision_encode(float *out, const float *patches, uint32_t n_patches, uint32_t grid_w,
+                               const void *map, uint64_t size, const ds4_mimo_vision_weights *w);
+/* MTP input rows: cat = [rms(e) * enorm | rms(h) * hnorm] */
+int ds4_gpu_mimo_mtp_cat_tensor(
+        ds4_gpu_tensor *cat, const ds4_gpu_tensor *e, const ds4_gpu_tensor *h,
+        const void *model_map, uint64_t model_size, uint64_t g_e_offset, uint64_t g_h_offset,
+        uint32_t n_tokens, uint32_t n_embd, float eps);
+/* sigmoid router: experts by sigmoid(logit) + bias, weights = unbiased
+ * probabilities renormalised over the picks */
+int ds4_gpu_mimo_router_tensor(
+        ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, const ds4_gpu_tensor *logits,
+        const void *model_map, uint64_t model_size, uint64_t bias_offset,
+        uint32_t n_tokens, uint32_t n_expert, uint32_t n_used);
+
 #ifdef __cplusplus
 }
 #endif
