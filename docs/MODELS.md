@@ -144,6 +144,15 @@ llama.cpp's Q8_0 mmproj from
 [ggml-org/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/ggml-org/Qwen3.8-Flash-Next-GGUF);
 pass it at runtime with `--vision`.
 
+## MiMo-V2.6 Flash
+
+MiMo-V2.6 Flash runs on Metal from the `mimo2` GGUFs written by
+`gguf-tools/mimo26_quantize.py`: an MXFP4 release that keeps the checkpoint's
+experts unchanged. The MTP blocks are part of the
+main GGUF (`--mtp`); the DFlash drafter is a separate sidecar passed with
+`--mtp-model`, and the vision encoder another one passed with `--vision`.
+See [MiMo setup](MIMO_V26.md).
+
 ## GLM 5.3 Flash
 
 | Target | Approximate file size | Use |

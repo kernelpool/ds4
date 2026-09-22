@@ -77,6 +77,16 @@ perfect, disengaging after repeated second-draft rejections.
 `DS4_QWEN4_MTP_DEPTH=2` or `=3` fixes the depth;
 `0` (default) is the adaptive policy.
 
+## MiMo-V2.6: built-in MTP or the DFlash sidecar
+
+`./ds4 --mtp` drafts with the three chained MTP blocks in the main GGUF
+(`DS4_MIMO_MTP_DEPTH=1..3` limits the drafts per cycle);
+`./ds4 --mtp-model MiMo-V2.6-Flash-DFlash-Q8_0.gguf` drafts seven-token
+blocks with the DFlash sidecar instead. Both verify a whole block in one
+target pass and keep the longest accepted prefix; the position-indexed
+caches simply rewrite rejected rows, so no state snapshot is needed on
+rejection or rewind. See [MiMo setup](MIMO_V26.md).
+
 ## Sampling and reproducibility
 
 At temperature zero, accepted drafts must match the target's greedy

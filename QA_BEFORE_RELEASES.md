@@ -200,6 +200,13 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   GLM-5.3 Z.AI FP8 continuations and must not be replaced by GLM 5.2 fixtures.
   For the Q4 layout with Q8 KDA projections, embedding, and output head,
   the M3 Ultra reference is `0.300804038`, `90/100`, and `9.48`.
+- Run the 100-case MiMo-V2.6 Flash Xiaomi fixture for every released MiMo GGUF:
+  `gguf-tools/quality-testing/score_official /path/to/MiMo-V2.6-Flash-MXFP4.gguf gguf-tools/quality-testing/mimo-v2.6-flash-20260922/manifest.tsv /tmp/mimo-mxfp4.tsv 4096`.
+  The MXFP4 reference is average NLL `0.260312004`, first-token match
+  `95/100`, and average greedy prefix `17.03`. The platform supplies no
+  logprobs; do not report the empty `api_*` columns. Also confirm that
+  `--mtp` and `--mtp-model` greedy outputs equal plain decoding on a short
+  and a long prompt.
 - For GLM 5.3 attention changes, also run the eight long Z.AI FP8 cases.
   First run `python3 gguf-tools/quality-testing/render_glm_references.py
   gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-long`, then
