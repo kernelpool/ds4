@@ -64024,6 +64024,132 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
 }
 #endif
 
+#ifdef DS4_HAS_MIMO_GPU
+#define DS4_MIMO_PAYLOAD_TAG 0x4d494d31u
+
+/* Every layer's live K/V rows: the whole ring of a windowed layer, the used
+ * prefix of a global one (the ring is the context there). */
+static uint32_t mimo_payload_rows(const ds4_mimo_gpu_graph *g, uint32_t il, uint32_t rows) {
+    return g->ring[il] < rows ? g->ring[il] : rows;
+}
+
+static int mimo_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    ds4_mimo_gpu_graph *g = &s->mimo_graph;
+    const uint32_t rows = (uint32_t)s->checkpoint.len;
+    if (!s->mimo_graph_ready || g->pos != rows) {
+        payload_set_err(err, errlen, "MiMo snapshot requires a synced session");
+        return 1;
+    }
+    if (g->df) {
+        payload_set_err(err, errlen, "MiMo checkpoints do not cover the DFlash drafter");
+        return 1;
+    }
+    if (!mimo_graph_flush_draft(g) || ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen, "failed to synchronize accelerator before MiMo snapshot");
+        return 1;
+    }
+    const uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
+        DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION, (uint32_t)s->ctx_size, s->prefill_cap,
+        g->ctx_cap, g->ctx_cap, DS4_N_EMBD, rows, DS4_N_LAYER, DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, DS4_N_VOCAB,
+        DS4_MIMO_PAYLOAD_TAG,
+    };
+    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
+        if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
+    }
+    for (int i = 0; i < s->checkpoint.len; i++) {
+        if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
+    }
+    if (payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = 0;
+    const uint32_t n_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT + (g->mtp_a ? DS4_N_NEXTN_PREDICT : 0u);
+    for (uint32_t il = 0; rc == 0 && il < n_layers; il++) {
+        const uint64_t n = mimo_payload_rows(g, il, rows), kv = mimo_layer_kv(il);
+        rc = payload_write_u32(fp, g->ring[il], err, errlen);
+        if (rc == 0) rc = payload_write_u32(fp, g->first[il], err, errlen);
+        if (rc == 0) rc = payload_write_tensor_span(fp, g->k_cache[il], 0, n * kv * DS4_N_HEAD_DIM * 2u,
+                                                    buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        if (rc == 0) rc = payload_write_tensor_span(fp, g->v_cache[il], 0, n * kv * DS4_N_VALUE_DIM * 2u,
+                                                    buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    }
+    free(buf);
+    return rc;
+}
+
+static int mimo_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h, uint64_t *remaining,
+                                     char *err, size_t errlen) {
+    ds4_mimo_gpu_graph *g = &s->mimo_graph;
+    const uint32_t rows = h[7];
+    if (!s->mimo_graph_ready) {
+        payload_set_err(err, errlen, "MiMo graph is not ready for restore");
+        return 1;
+    }
+    if (h[12] != DS4_MIMO_PAYLOAD_TAG || h[6] != DS4_N_EMBD || h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
+        h[10] != DS4_N_VALUE_DIM || h[11] != DS4_N_VOCAB) {
+        payload_set_err(err, errlen, "KV checkpoint was written by a different model family or shape");
+        return 1;
+    }
+    if (rows > g->ctx_cap || rows > (uint32_t)s->ctx_size) {
+        payload_set_err(err, errlen, "KV checkpoint is longer than this session's context");
+        return 1;
+    }
+    if (g->df) {
+        payload_set_err(err, errlen, "MiMo checkpoints do not cover the DFlash drafter");
+        return 1;
+    }
+    token_vec new_checkpoint = {0};
+    for (uint32_t i = 0; i < rows; i++) {
+        uint32_t tok;
+        if (payload_read_u32(fp, &tok, remaining, err, errlen) != 0 || tok >= DS4_N_VOCAB) {
+            token_vec_free(&new_checkpoint);
+            if (tok >= DS4_N_VOCAB) payload_set_err(err, errlen, "KV checkpoint token id is outside the vocabulary");
+            return 1;
+        }
+        token_vec_push(&new_checkpoint, (int)tok);
+    }
+    s->checkpoint_valid = false;
+    s->mtp_draft_valid = false;
+    if (!mimo_graph_flush_draft(g) || ds4_gpu_synchronize() == 0 ||
+        payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), remaining, err, errlen) != 0) {
+        token_vec_free(&new_checkpoint);
+        return 1;
+    }
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = 0;
+    const uint32_t n_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT + (g->mtp_a ? DS4_N_NEXTN_PREDICT : 0u);
+    for (uint32_t il = 0; rc == 0 && il < n_layers; il++) {
+        const uint64_t n = mimo_payload_rows(g, il, rows), kv = mimo_layer_kv(il);
+        uint32_t ring = 0, first = 0;
+        rc = payload_read_u32(fp, &ring, remaining, err, errlen);
+        if (rc == 0) rc = payload_read_u32(fp, &first, remaining, err, errlen);
+        if (rc == 0 && (ring != g->ring[il] || first > rows)) {
+            payload_set_err(err, errlen, "KV checkpoint ring geometry does not match this session");
+            rc = 1;
+        }
+        if (rc == 0) g->first[il] = first;
+        if (rc == 0) rc = payload_read_tensor_span(fp, g->k_cache[il], 0, n * kv * DS4_N_HEAD_DIM * 2u,
+                                                   buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+        if (rc == 0) rc = payload_read_tensor_span(fp, g->v_cache[il], 0, n * kv * DS4_N_VALUE_DIM * 2u,
+                                                   buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+    }
+    free(buf);
+    if (rc != 0) {
+        token_vec_free(&new_checkpoint);
+        mimo_graph_reset(g);
+        s->checkpoint.len = 0;
+        return 1;
+    }
+    /* the MTP chain replays its rows on the next draft */
+    g->pos = rows;
+    g->verify_rows = 0;
+    memset(g->mtp_carry_ok, 0, sizeof(g->mtp_carry_ok));
+    token_vec_free(&s->checkpoint);
+    s->checkpoint = new_checkpoint;
+    s->checkpoint_valid = true;
+    return 0;
+}
+#endif
+
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
@@ -64035,10 +64161,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) return ds41_save_payload(s, fp, err, errlen);
 #endif
-    if (ds4_session_is_mimo(s)) {
-        payload_set_err(err, errlen, "MiMo sessions do not support KV checkpoints yet");
-        return 1;
-    }
+#ifdef DS4_HAS_MIMO_GPU
+    if (ds4_session_is_mimo(s)) return mimo_session_save_payload(s, fp, err, errlen);
+#endif
     if (ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         payload_set_err(err, errlen, "graph backend support is not compiled in");
@@ -64423,11 +64548,10 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         ds4_tokens_free(&tokens);
         return rc;
     }
+#ifdef DS4_HAS_MIMO_GPU
+    if (ds4_session_is_mimo(s)) return mimo_session_load_payload(s, fp, h, &remaining, err, errlen);
+#endif
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_mimo(s)) {
-        payload_set_err(err, errlen, "MiMo sessions do not support KV checkpoints yet");
-        return 1;
-    }
     if (ds4_session_is_ds41(s)) return ds41_load_payload(s, fp, h, remaining, err, errlen);
 #endif
     if (ds4_session_is_qwen4(s)) {

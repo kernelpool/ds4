@@ -122,7 +122,38 @@ int main(void) {
     }
     ds4_session_free(s);
 
+    /* KV checkpoint round trip: save after eight generated tokens, restore
+     * into fresh sessions, continue plain and speculative; both must follow ref */
     int got[N_REF];
+    {
+        const int saved = 8;
+        s = session_at(e, &prompt);
+        for (int i = 0; i < saved; i++) {
+            if (ds4_session_eval(s, ref[i], err, sizeof(err)) != 0) fail(err);
+        }
+        FILE *fp = tmpfile();
+        if (!fp || ds4_session_save_payload(s, fp, err, sizeof(err)) != 0) fail(err[0] ? err : "checkpoint save");
+        const long bytes = ftell(fp);
+        ds4_session_free(s);
+        for (int spec = 0; spec < 2; spec++) {
+            rewind(fp);
+            if (ds4_session_create(&s, e, TEST_CTX) != 0) fail("session create");
+            if (ds4_session_load_payload(s, fp, (uint64_t)bytes, err, sizeof(err)) != 0) fail(err);
+            if (ds4_session_argmax(s) != ref[saved]) fail("checkpoint logits differ");
+            if (spec) {
+                decode_spec(s, N_GEN - saved, got);
+            } else {
+                for (int i = saved; i < N_GEN; i++) {
+                    got[i - saved] = ds4_session_argmax(s);
+                    if (ds4_session_eval(s, got[i - saved], err, sizeof(err)) != 0) fail(err);
+                }
+            }
+            expect_tokens(got, ref + saved, N_GEN - saved, spec ? "checkpoint + drafts" : "checkpoint");
+            ds4_session_free(s);
+        }
+        fclose(fp);
+        printf("checkpoint round trip: plain and speculative continuations match\n");
+    }
     s = session_at(e, &prompt);
     int drafts = decode_spec(s, N_GEN, got);
     expect_tokens(got, ref, N_GEN, "own drafts");
