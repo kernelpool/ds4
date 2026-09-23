@@ -541,6 +541,8 @@ typedef enum {
     DS4_VARIANT_QWEN4_MINI = 6,
     DS4_VARIANT_MIMO26_FLASH = 7,
     DS4_VARIANT_MIMO_MINI = 8,
+    DS4_VARIANT_MIMO26_PRO = 9,
+    DS4_VARIANT_MIMO_PRO_MINI = 10,
 } ds4_variant;
 
 typedef struct {
@@ -939,6 +941,63 @@ static const ds4_shape DS4_SHAPE_MIMO_MINI = {
     .n_leading_dense = 1,
     .attn_value_scale = 0.707f,
     .rms_eps = 1.0e-6f,
+    .expert_weight_scale = 1.0f,
+    .rope_freq_base = 10000000.0f,
+    .rope_freq_base_swa = 10000.0f,
+    .rope_orig_ctx = 1048576,
+};
+
+static const ds4_shape DS4_SHAPE_MIMO26_PRO = {
+    .name = "MiMo V2.6 Pro",
+    .family = DS4_MODEL_FAMILY_MIMO,
+    .variant = DS4_VARIANT_MIMO26_PRO,
+    .n_layer = 73,
+    .n_embd = 6144,
+    .n_vocab = 152576,
+    .n_head = 128,
+    .n_head_kv = 8,
+    .n_head_kv_swa = 8,
+    .n_head_dim = 192,
+    .n_value_dim = 128,
+    .n_rot = 64,
+    .n_expert = 384,
+    .n_expert_used = 8,
+    .n_ff_exp = 2048,
+    .n_ff_dense = 16384,
+    .n_swa = 128,
+    .n_nextn_predict = 3,
+    .n_leading_dense = 1,
+    .attn_value_scale = 0.612f,
+    .rms_eps = 1.0e-5f,
+    .expert_weight_scale = 1.0f,
+    .rope_freq_base = 10000000.0f,
+    .rope_freq_base_swa = 10000.0f,
+    .rope_orig_ctx = 1048576,
+};
+
+/* Synthetic test model with Pro's attention geometry at a toy width. */
+static const ds4_shape DS4_SHAPE_MIMO_PRO_MINI = {
+    .name = "MiMo V2.6 Pro mini",
+    .family = DS4_MODEL_FAMILY_MIMO,
+    .variant = DS4_VARIANT_MIMO_PRO_MINI,
+    .n_layer = 11,
+    .n_embd = 128,
+    .n_vocab = 152576,
+    .n_head = 128,
+    .n_head_kv = 8,
+    .n_head_kv_swa = 8,
+    .n_head_dim = 192,
+    .n_value_dim = 128,
+    .n_rot = 64,
+    .n_expert = 32,
+    .n_expert_used = 8,
+    .n_ff_exp = 32,
+    .n_ff_dense = 256,
+    .n_swa = 8,
+    .n_nextn_predict = 3,
+    .n_leading_dense = 1,
+    .attn_value_scale = 0.612f,
+    .rms_eps = 1.0e-5f,
     .expert_weight_scale = 1.0f,
     .rope_freq_base = 10000000.0f,
     .rope_freq_base_swa = 10000.0f,
@@ -7352,6 +7411,10 @@ static void config_validate_mimo_model(const ds4_model *m) {
         g_ds4_shape = DS4_SHAPE_MIMO26;
     } else if (n_embd == DS4_SHAPE_MIMO_MINI.n_embd) {
         g_ds4_shape = DS4_SHAPE_MIMO_MINI;
+    } else if (n_embd == DS4_SHAPE_MIMO26_PRO.n_embd) {
+        g_ds4_shape = DS4_SHAPE_MIMO26_PRO;
+    } else if (n_embd == DS4_SHAPE_MIMO_PRO_MINI.n_embd) {
+        g_ds4_shape = DS4_SHAPE_MIMO_PRO_MINI;
     } else {
         fprintf(stderr, "ds4: unsupported mimo2 embedding_length %u\n", n_embd);
         exit(1);

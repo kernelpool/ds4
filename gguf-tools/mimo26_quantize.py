@@ -366,6 +366,12 @@ def tokenizer_records(hf_dir, vocab_size):
     ]
 
 
+def source_repo(hf_dir):
+    """The Hugging Face repository of a cache snapshot (models--ORG--NAME/snapshots/REV)."""
+    m = re.search(r"models--([^/]+)--([^/]+)/snapshots/", os.path.abspath(hf_dir) + "/")
+    return f"{m.group(1)}/{m.group(2)}" if m else "XiaomiMiMo/MiMo-V2.6-Flash-RL"
+
+
 def model_records(hf_dir, layout, revision, name):
     c = layout.c
     n_all = layout.n_layer + layout.n_nextn
@@ -375,7 +381,7 @@ def model_records(hf_dir, layout, revision, name):
     records = [
         kv_string("general.architecture", ARCH),
         kv_string("general.name", name),
-        kv_string("general.source.url", "https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL"),
+        kv_string("general.source.url", "https://huggingface.co/" + source_repo(hf_dir)),
         kv_string("general.source.revision", revision),
         kv_u32("general.alignment", GGUF_ALIGNMENT),
         kv_u32(f"{ARCH}.block_count", n_all),

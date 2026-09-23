@@ -372,7 +372,8 @@ python3 gguf-tools/mimo26_quantize.py --hf /path/to/MiMo-V2.6-Flash-RL \
 stores the dequantized fp8 attention/dense weights as Q8_0; `--quant q8`
 and `--quant f32` dequantize the experts too. The fused QKV projection is
 de-interleaved from its tensor-parallel chunks. `--resume` continues an
-interrupted run and `--dry-run` prints the plan.
+interrupted run and `--dry-run` prints the plan. The same command converts
+MiMo-V2.6 Pro RL; `general.source.url` follows the snapshot's repository.
 
 `mimo26_vision.py` writes the vision tower as a llama.cpp clip mmproj
 (`mimovl`), splitting the Conv3D patch embedding into its two temporal taps:
