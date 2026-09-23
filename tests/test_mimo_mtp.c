@@ -134,6 +134,9 @@ int main(void) {
         FILE *fp = tmpfile();
         if (!fp || ds4_session_save_payload(s, fp, err, sizeof(err)) != 0) fail(err[0] ? err : "checkpoint save");
         const long bytes = ftell(fp);
+        /* DFlash restores its context exactly, so it must draft as if never saved */
+        const char *dflash = getenv("DS4_TEST_DFLASH");
+        const int want_drafts = dflash && dflash[0] ? decode_spec(s, N_GEN - saved, got) : -1;
         ds4_session_free(s);
         for (int spec = 0; spec < 2; spec++) {
             rewind(fp);
@@ -141,7 +144,8 @@ int main(void) {
             if (ds4_session_load_payload(s, fp, (uint64_t)bytes, err, sizeof(err)) != 0) fail(err);
             if (ds4_session_argmax(s) != ref[saved]) fail("checkpoint logits differ");
             if (spec) {
-                decode_spec(s, N_GEN - saved, got);
+                const int drafts = decode_spec(s, N_GEN - saved, got);
+                if (want_drafts >= 0 && drafts != want_drafts) fail("restored DFlash context drafts differently");
             } else {
                 for (int i = saved; i < N_GEN; i++) {
                     got[i - saved] = ds4_session_argmax(s);

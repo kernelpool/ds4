@@ -64033,15 +64033,52 @@ static uint32_t mimo_payload_rows(const ds4_mimo_gpu_graph *g, uint32_t il, uint
     return g->ring[il] < rows ? g->ring[il] : rows;
 }
 
+#define DS4_MIMO_DFLASH_TAG 0x44464c31u
+
+/* rows of positions p0..p0+n-1, which live at p % ring; remaining selects a load */
+static int mimo_dflash_span_io(FILE *fp, ds4_gpu_tensor *t, uint32_t p0, uint32_t n, uint32_t ring, uint64_t row,
+                               uint8_t *buf, uint64_t *remaining, char *err, size_t errlen) {
+    const uint32_t s0 = p0 % ring, n0 = n < ring - s0 ? n : ring - s0;
+    const uint64_t off[2] = { (uint64_t)s0 * row, 0 }, len[2] = { (uint64_t)n0 * row, (uint64_t)(n - n0) * row };
+    for (int i = 0; i < 2; i++) {
+        if (!len[i]) continue;
+        const int rc = remaining ?
+            payload_read_tensor_span(fp, t, off[i], len[i], buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen) :
+            payload_write_tensor_span(fp, t, off[i], len[i], buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        if (rc != 0) return rc;
+    }
+    return 0;
+}
+
+/* The DFlash context of the last window positions, every key the next draft
+ * block can reach; stored by position, so the ring sizes may differ. */
+static int mimo_dflash_payload(ds4_mimo_gpu_graph *g, FILE *fp, uint32_t rows, uint8_t *buf,
+                               uint64_t *remaining, char *err, size_t errlen) {
+    const ds4_dflash_weights *d = g->df;
+    const uint32_t n = rows < d->window ? rows : d->window;
+    const uint64_t kb = (uint64_t)d->n_head_kv * d->head_dim * 2u, vb = (uint64_t)d->n_head_kv * d->value_dim * 2u;
+    const uint32_t head[4] = { DS4_MIMO_DFLASH_TAG, d->n_layer, n, (uint32_t)(kb + vb) };
+    for (int i = 0; i < 4; i++) {
+        uint32_t v = head[i];
+        if (remaining && *remaining < sizeof(uint32_t)) v = ~head[i];
+        else if (remaining ? payload_read_u32(fp, &v, remaining, err, errlen) : payload_write_u32(fp, v, err, errlen)) return 1;
+        if (v != head[i]) {
+            payload_set_err(err, errlen, "KV checkpoint does not carry this DFlash drafter's context");
+            return 1;
+        }
+    }
+    for (uint32_t il = 0; il < d->n_layer; il++) {
+        if (mimo_dflash_span_io(fp, g->df_k_cache[il], rows - n, n, g->df_ring, kb, buf, remaining, err, errlen) ||
+            mimo_dflash_span_io(fp, g->df_v_cache[il], rows - n, n, g->df_ring, vb, buf, remaining, err, errlen)) return 1;
+    }
+    return 0;
+}
+
 static int mimo_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
     ds4_mimo_gpu_graph *g = &s->mimo_graph;
     const uint32_t rows = (uint32_t)s->checkpoint.len;
     if (!s->mimo_graph_ready || g->pos != rows) {
         payload_set_err(err, errlen, "MiMo snapshot requires a synced session");
-        return 1;
-    }
-    if (g->df) {
-        payload_set_err(err, errlen, "MiMo checkpoints do not cover the DFlash drafter");
         return 1;
     }
     if (!mimo_graph_flush_draft(g) || ds4_gpu_synchronize() == 0) {
@@ -64072,6 +64109,7 @@ static int mimo_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t
         if (rc == 0) rc = payload_write_tensor_span(fp, g->v_cache[il], 0, n * kv * DS4_N_VALUE_DIM * 2u,
                                                     buf, DS4_SESSION_IO_CHUNK, err, errlen);
     }
+    if (rc == 0 && g->df) rc = mimo_dflash_payload(g, fp, rows, buf, NULL, err, errlen);
     free(buf);
     return rc;
 }
@@ -64091,10 +64129,6 @@ static int mimo_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h
     }
     if (rows > g->ctx_cap || rows > (uint32_t)s->ctx_size) {
         payload_set_err(err, errlen, "KV checkpoint is longer than this session's context");
-        return 1;
-    }
-    if (g->df) {
-        payload_set_err(err, errlen, "MiMo checkpoints do not cover the DFlash drafter");
         return 1;
     }
     token_vec new_checkpoint = {0};
@@ -64132,6 +64166,7 @@ static int mimo_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h
         if (rc == 0) rc = payload_read_tensor_span(fp, g->v_cache[il], 0, n * kv * DS4_N_VALUE_DIM * 2u,
                                                    buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
     }
+    if (rc == 0 && g->df) rc = mimo_dflash_payload(g, fp, rows, buf, remaining, err, errlen);
     free(buf);
     if (rc != 0) {
         token_vec_free(&new_checkpoint);

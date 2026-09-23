@@ -90,8 +90,8 @@ the reference prompts must stay identical to plain decoding.
 
 Tensor parallelism, SSD streaming, DSpark and CUDA are not supported yet.
 The server's disk KV cache saves and restores MiMo sessions (the MTP chain
-replays its rows after a restore; sessions with the DFlash drafter are not
-saved). `ds4-server --batched-session N` decodes the slots
+replays its rows after a restore; the DFlash context of the last window
+positions is saved with the session). `ds4-server --batched-session N` decodes the slots
 together on shared transients, reading the experts once per batch; the
 drafters stay off while batching, as for the other families. Each slot's
 logits equal its single-session decode bit for bit, because the batched Q8
