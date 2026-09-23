@@ -50483,9 +50483,7 @@ int ds4_gpu_mimo_attn_tensor(
     const uint32_t n_keys = (hi_end ? hi_end : last + 1u) - lo;
     uint32_t n_splits = 1;
     if (part) {
-        /* one token: shorter splits spread the SWA window over more threadgroups */
-        const uint32_t split_keys = n_tokens == 1u ? 16u : qwen4_attn_split_keys();
-        n_splits = (n_keys + split_keys - 1) / split_keys;
+        n_splits = (n_keys + qwen4_attn_split_keys() - 1) / qwen4_attn_split_keys();
         if (n_splits < 1) n_splits = 1;
         if (n_splits > MIMO_ATTN_MAX_SPLITS) n_splits = MIMO_ATTN_MAX_SPLITS;
     }
