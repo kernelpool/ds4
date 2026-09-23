@@ -29,6 +29,10 @@ int ds4_gpu_tp_failed(void);
 int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate);
 void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn);
 int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows);
+/* A verify-block gate of either kind: its rows sit in slab batch slot
+ * batch_slot (payload, the slot's out view, when the gate releases inline). */
+int ds4_gpu_tp_batch_gate_encode_slot(uint32_t layer, uint32_t gate, uint32_t batch_slot,
+                                      uint32_t rows, const ds4_gpu_tensor *payload);
 void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn);
 int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
                               const ds4_gpu_tensor *out_t,

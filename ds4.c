@@ -8990,6 +8990,8 @@ static DS4_MAYBE_UNUSED bool weights_model_map_sharded_spans(
         /* Dense/attention/router tensors only — the plain decode include
          * would map the full expert blobs in non-streaming mode. */
         model_map_span_vec_include_layer_decode_static(spans, l);
+        /* MiMo's MTP blocks run whole on both ranks (its trunk reads rank slices) */
+        if (il >= (uint32_t)(DS4_N_LAYER - DS4_N_NEXTN_PREDICT)) model_map_span_vec_include_one(spans, l->attn_qkv);
         const ds4_tensor *exps[3] = { l->ffn_gate_exps, l->ffn_up_exps,
                                       l->ffn_down_exps };
         for (int t = 0; t < 3; t++) {
@@ -42671,7 +42673,7 @@ typedef struct {
     void *host_slab;             /* CUDA's registered network staging */
     ds4_gpu_tensor **out_views;
     ds4_gpu_tensor **in_views;
-    ds4_gpu_tensor **batch_out_views;   /* [layer] verify-block row partials */
+    ds4_gpu_tensor **batch_out_views;   /* [2 * layer] verify-block row partials */
     ds4_gpu_tensor **batch_in_views;
     ds4_gpu_tensor *zero_vec;
     uint64_t eval_seq;          /* leader: mirrored eval counter */
@@ -59507,6 +59509,9 @@ typedef struct ds4_mimo_gpu_graph {
      * o_proj and expert sums meet at the layer's gates in rank order */
     uint32_t tp_world, tp_rank;
     ds4_gpu_tensor **tp_out, **tp_in;          /* one-row slab slots per (layer, gate) */
+    ds4_gpu_tensor **tp_batch_out, **tp_batch_in;   /* verify-block slots, one per gate in order */
+    uint32_t tp_block_gate;                    /* next slot of an open verify block, else UINT32_MAX */
+    bool tp_vocab_split;
     ds4_gpu_tensor *tp_peer;                   /* a chunk's peer partial */
     const struct ds4_mimo_tp_slices *tp_slices;
 } ds4_mimo_gpu_graph;
@@ -59524,9 +59529,14 @@ static uint32_t mimo_layer_kv(uint32_t il) {
     return ds4_mimo_layer_is_swa(il) ? DS4_N_HEAD_KV_SWA : DS4_N_HEAD_KV;
 }
 
+/* A TP rank splits the trunk; the MTP blocks run whole on both ranks. */
+static bool mimo_tp_layer(const ds4_mimo_gpu_graph *g, uint32_t il) {
+    return g->tp_world == 2u && il < DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+}
+
 /* the KV heads a graph holds: half of them on a TP rank */
 static uint32_t mimo_graph_kv(const ds4_mimo_gpu_graph *g, uint32_t il) {
-    return mimo_layer_kv(il) / (g->tp_world ? g->tp_world : 1u);
+    return mimo_layer_kv(il) / (mimo_tp_layer(g, il) ? 2u : 1u);
 }
 
 /* A batched decode reads each Q8 matrix once per four rows with the
@@ -59623,6 +59633,7 @@ static bool mimo_graph_alloc(ds4_mimo_gpu_graph *g, const ds4_weights *w, uint32
                              const ds4_mimo_gpu_graph *shared, uint32_t tp_world) {
     memset(g, 0, sizeof(*g));
     g->tp_world = tp_world;
+    g->tp_block_gate = UINT32_MAX;
     if (!mimo_graph_weights_supported(w)) return false;
     if (mtp && DS4_N_NEXTN_PREDICT > DS4_MIMO_MAX_MTP) {
         fprintf(stderr, "ds4: MiMo MTP supports at most %u depths\n", DS4_MIMO_MAX_MTP);
@@ -59746,11 +59757,20 @@ static void mimo_graph_reset(ds4_mimo_gpu_graph *g) {
  * both ranks hold the same bits.  A single row's producer writes straight
  * into its slab slot (mimo_tp_out) and the sum lands in x. */
 static ds4_gpu_tensor *mimo_tp_out(ds4_mimo_gpu_graph *g, ds4_gpu_tensor *x, uint32_t il, uint32_t gate, uint32_t T) {
-    return g->tp_world == 2u && T == 1u ? g->tp_out[il * DS4_TP_GATES_PER_LAYER + gate] : x;
+    if (!mimo_tp_layer(g, il)) return x;
+    if (g->tp_block_gate != UINT32_MAX) return g->tp_batch_out[g->tp_block_gate];
+    return T == 1u ? g->tp_out[il * DS4_TP_GATES_PER_LAYER + gate] : x;
 }
 
 static bool mimo_tp_sum(ds4_mimo_gpu_graph *g, ds4_gpu_tensor *x, uint32_t il, uint32_t gate, uint32_t T) {
     const uint64_t E = DS4_N_EMBD;
+    if (g->tp_block_gate != UINT32_MAX) {
+        /* a verify block's rows cross the RDMA window, one batch slot per gate */
+        const uint32_t k = g->tp_block_gate++;
+        ds4_gpu_tensor *out = g->tp_batch_out[k], *in = g->tp_batch_in[k];
+        return ds4_gpu_tp_batch_gate_encode_slot(il, gate, k, T, out) &&
+               ds4_gpu_add_tensor(x, g->tp_rank ? in : out, g->tp_rank ? out : in, T * (uint32_t)E) != 0;
+    }
     if (T == 1u) {
         const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + gate;
         return ds4_gpu_tp_gate_encode(il, gate) &&
@@ -59768,7 +59788,7 @@ static bool mimo_graph_attention(ds4_mimo_gpu_graph *g, const ds4_model *m, cons
     const uint32_t kv = mimo_graph_kv(g, il);
     const float base = swa ? DS4_ROPE_FREQ_BASE_SWA : DS4_ROPE_FREQ_BASE;
     /* a TP rank runs its half of the heads from its sliced weights */
-    const ds4_mimo_tp_slices *tp = g->tp_world == 2u ? g->tp_slices : NULL;
+    const ds4_mimo_tp_slices *tp = mimo_tp_layer(g, il) ? g->tp_slices : NULL;
     const ds4_model *am = tp ? &tp->map : m;
     const ds4_tensor *wqkv = tp ? &tp->qkv[il] : l->attn_qkv, *wo = tp ? &tp->o[il] : l->attn_output;
     const uint32_t H = DS4_N_HEAD / (tp ? 2u : 1u);
@@ -59865,7 +59885,7 @@ static bool mimo_graph_head(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4
     /* TP: each rank projects its half of the vocabulary, the engine merges them */
     ds4_tensor head = *w->output;
     ds4_gpu_tensor *out = g->logits;
-    if (g->tp_world == 2u && n == 1u) {
+    if (g->tp_vocab_split && n == 1u) {
         head.dim[1] /= 2u; head.elements /= 2u; head.bytes /= 2u;
         head.abs_offset += g->tp_rank * head.bytes;
         out = ds4_gpu_tensor_view(g->logits, g->tp_rank * head.dim[1] * sizeof(float), head.dim[1] * sizeof(float));
@@ -59912,15 +59932,25 @@ static bool mimo_graph_forward_tokens(ds4_mimo_gpu_graph *g, const ds4_model *m,
         }
         if (!ds4_gpu_tensor_write(g->h, 0, g->host_row, (uint64_t)T * E * sizeof(float))) return false;
     }
+    /* TP: a few rows (a verify block) cross the RDMA verify window, one
+     * batch slot per gate; longer chunks take the big gates */
+    const bool tp_block = g->tp_world == 2u && T > 1u && T <= DS4_TP_BATCH_MAX_ROWS && g_tp_block_ctx;
+    if (tp_block) {
+        uint32_t n_gates = 0;
+        for (uint32_t il = 0; il < n_trunk; il++) n_gates += ds4_mimo_layer_is_dense(il) ? 1u : 2u;
+        if (!ds4_tp_batch_block_begin(g_tp_block_ctx, T, n_gates)) return false;
+        g->tp_block_gate = 0;
+    }
     if (!glm_graph_begin_commands_if_needed()) return false;
     const uint32_t pos0 = g->pos;
     g->verify_rows = 0;
     bool ok = true;
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
         ok = mimo_graph_layer(g, m, &w->layer[il], il, g->h, pos0, T);
-        /* TP decode gates release inside the command buffer: commit every
-         * two layers so the GPU starts while the rest of the token encodes */
-        if (ok && T == 1u && g->tp_world == 2u && ds4_gpu_tp_decode_inline_gates() && (il == 0 || (il + 1u) % 2u == 0))
+        /* TP gates of a token or verify block release inside the command buffer:
+         * commit every two layers so the GPU starts while the rest encodes */
+        if (ok && (T == 1u || tp_block) && g->tp_world == 2u && ds4_gpu_tp_decode_inline_gates() &&
+            (il == 0 || (il + 1u) % 2u == 0))
             ok = ds4_gpu_flush_commands() != 0;
         /* DFlash features: the residual outputs of the target layers */
         for (uint32_t t = 0; ok && g->df && t < g->df->n_target; t++) {
@@ -59934,6 +59964,10 @@ static bool mimo_graph_forward_tokens(ds4_mimo_gpu_graph *g, const ds4_model *m,
                       : mimo_graph_head(g, m, w, g->h, w->output_norm, T - 1u, 1u);
     }
     if (!ds4_gpu_end_commands()) ok = false;
+    if (tp_block) {
+        g->tp_block_gate = UINT32_MAX;
+        if (!ds4_tp_batch_block_end(g_tp_block_ctx)) ok = false;
+    }
     if (ok && logits_out) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits_out,
                                  (uint64_t)(all_rows ? T : 1u) * DS4_N_VOCAB * sizeof(float)) != 0;
@@ -72698,13 +72732,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #endif
             (opt->first_token_test && e->backend == DS4_BACKEND_CPU);
         const bool tp_extra = opt->tp.role != DS4_TP_NONE &&
-            (opt->glm_mtp || (opt->mtp_path && opt->mtp_path[0]) || (opt->vision_path && opt->vision_path[0]));
+            ((opt->mtp_path && opt->mtp_path[0]) || (opt->vision_path && opt->vision_path[0]));
         if (!backend_ok || tp_extra || opt->cuda_tensor_parallel ||
             (gpu_cfg && gpu_cfg->n_gpus > 1) ||
             opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
             e->ssd_streaming || opt->dspark || e->power_percent != 100) {
             fprintf(stderr, "ds4: MiMo-V2.6 requires Metal (or --cpu --first-token-test); "
-                            "vision or drafters under tensor parallelism, pipeline execution, SSD streaming, "
+                            "vision or DFlash under tensor parallelism, pipeline execution, SSD streaming, "
                             "DSpark and power throttling are not supported\n");
             ds4_engine_close(e);
             *out = NULL;
@@ -74718,7 +74752,7 @@ static int ds4_engine_tp_batch_exchange(void *ud, uint32_t layer,
                                         uint32_t rows, uint64_t seq) {
     ds4_engine *e = ud;
     ds4_tp *tp = e->tp.ctx;
-    if (layer >= DS4_N_LAYER || !rows || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
+    if (layer >= 2u * DS4_N_LAYER || !rows || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
     const uint64_t bytes = (uint64_t)rows * DS4_N_EMBD * sizeof(float);
     const uint64_t out = ds4_tp_slab_batch_out_offset(tp, layer);
     const uint64_t in = ds4_tp_slab_batch_in_offset(tp, layer);
@@ -74846,8 +74880,8 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     e->tp.zero_vec = ds4_gpu_tensor_alloc(vec_bytes);
     e->tp.out_views = calloc(slots, sizeof(*e->tp.out_views));
     e->tp.in_views = calloc(slots, sizeof(*e->tp.in_views));
-    e->tp.batch_out_views = calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_out_views));
-    e->tp.batch_in_views = calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_in_views));
+    e->tp.batch_out_views = calloc(2u * (size_t)DS4_N_LAYER, sizeof(*e->tp.batch_out_views));
+    e->tp.batch_in_views = calloc(2u * (size_t)DS4_N_LAYER, sizeof(*e->tp.batch_in_views));
     if (!e->tp.batch_out_views || !e->tp.batch_in_views) {
         snprintf(err, errlen, "tp: batch view table allocation failed");
         goto fail;
@@ -74883,15 +74917,18 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
                 goto fail;
             }
         }
-        e->tp.batch_out_views[l] = ds4_gpu_tensor_view(
-                e->tp.slab, ds4_tp_slab_batch_out_offset(tp, l),
-                (uint64_t)DS4_TP_BATCH_MAX_ROWS * vec_bytes);
-        e->tp.batch_in_views[l] = ds4_gpu_tensor_view(
-                e->tp.slab, ds4_tp_slab_batch_in_offset(tp, l),
-                (uint64_t)DS4_TP_BATCH_MAX_ROWS * vec_bytes);
-        if (!e->tp.batch_out_views[l] || !e->tp.batch_in_views[l]) {
-            snprintf(err, errlen, "tp: batch slab view creation failed");
-            goto fail;
+        /* two batch slots per layer: the second block lies above the first */
+        for (uint32_t b = l; b < 2u * (uint32_t)DS4_N_LAYER; b += (uint32_t)DS4_N_LAYER) {
+            e->tp.batch_out_views[b] = ds4_gpu_tensor_view(
+                    e->tp.slab, ds4_tp_slab_batch_out_offset(tp, b),
+                    (uint64_t)DS4_TP_BATCH_MAX_ROWS * vec_bytes);
+            e->tp.batch_in_views[b] = ds4_gpu_tensor_view(
+                    e->tp.slab, ds4_tp_slab_batch_in_offset(tp, b),
+                    (uint64_t)DS4_TP_BATCH_MAX_ROWS * vec_bytes);
+            if (!e->tp.batch_out_views[b] || !e->tp.batch_in_views[b]) {
+                snprintf(err, errlen, "tp: batch slab view creation failed");
+                goto fail;
+            }
         }
     }
 #ifdef DS4_HAS_MIMO_GPU
@@ -74910,12 +74947,19 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
 #endif
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
     /* Reuse the existing half-logit frames for V4.1 on CUDA as well. */
-    e->tp.vocab_split = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 || ds4_model_is_mimo() ||
+    /* MiMo's MTP drafts from the argmax of whole logits on both ranks */
+    e->tp.vocab_split = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 || (ds4_model_is_mimo() && !e->glm_mtp) ||
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && e->backend == DS4_BACKEND_CUDA);
 #ifdef DS4_HAS_MIMO_GPU
     if (ds4_model_is_mimo() && !e->mimo_tp_slices &&
         !(e->mimo_tp_slices = mimo_tp_slices_build(e, (uint32_t)ds4_tp_rank(tp), err, errlen))) {
         goto fail;
+    }
+    /* both ranks run MiMo's MTP cycle, so both need --mtp */
+    if (ds4_model_is_mimo()) {
+        const int same = ds4_tp_hash_check(tp, 0, e->glm_mtp ? 1u : 0u, err, errlen);
+        if (same < 0) snprintf(err, errlen, "tp: MiMo needs --mtp on both ranks or on neither");
+        if (same != 1) goto fail;
     }
 #endif
     e->tp.ctx = tp;
@@ -74945,7 +74989,7 @@ void ds4_engine_tp_unbind(ds4_engine *e) {
         if (e->tp.out_views) ds4_gpu_tensor_free(e->tp.out_views[i]);
         if (e->tp.in_views) ds4_gpu_tensor_free(e->tp.in_views[i]);
     }
-    for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER; i++) {
+    for (uint32_t i = 0; i < 2u * (uint32_t)DS4_N_LAYER; i++) {
         if (e->tp.batch_out_views) ds4_gpu_tensor_free(e->tp.batch_out_views[i]);
         if (e->tp.batch_in_views) ds4_gpu_tensor_free(e->tp.batch_in_views[i]);
     }
@@ -75343,6 +75387,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             s->mimo_graph.tp_rank = (uint32_t)e->tp.rank;
             s->mimo_graph.tp_out = e->tp.out_views;
             s->mimo_graph.tp_in = e->tp.in_views;
+            s->mimo_graph.tp_batch_out = e->tp.batch_out_views;
+            s->mimo_graph.tp_batch_in = e->tp.batch_in_views;
+            s->mimo_graph.tp_vocab_split = e->tp.vocab_split;
             s->mimo_graph.tp_slices = e->mimo_tp_slices;
         }
         mimo_graph_reset(&s->mimo_graph);
@@ -76982,6 +77029,38 @@ static int ds4_session_mimo_spec_cycle(ds4_session *s, int first_token, float te
     if (replacement >= 0) accepted[a + 1u] = replacement;
     return (int)a + 1 + (replacement >= 0 ? 1 : 0);
 }
+
+/* Under TP both ranks run the cycle: the leader announces its token and
+ * cap, and argmax acceptance over the same logits keeps the worker in step.
+ * Exact sampling draws from the leader's RNG, so it decodes plainly there. */
+static int ds4_session_mimo_spec(ds4_session *s, int first_token, float temperature, int top_k, float top_p,
+                                 float min_p, uint64_t *rng, bool exact_sampling, int *accepted, int accepted_cap,
+                                 char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    if (!ds4_session_tp_leader(s)) {
+        return ds4_session_mimo_spec_cycle(s, first_token, temperature, top_k, top_p, min_p, rng, exact_sampling,
+                                           accepted, accepted_cap, err, errlen);
+    }
+    if (exact_sampling || e->dflash_ready) {
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+    const int cap = accepted_cap < DS4_TP_BATCH_MAX_ROWS ? accepted_cap : DS4_TP_BATCH_MAX_ROWS;
+    if (!ds4_tp_send_glm_mtp(e->tp.ctx, s->tp_session_id, ++e->tp.eval_seq, first_token, cap)) {
+        snprintf(err, errlen, "tp: worker eval send failed");
+        return -1;
+    }
+    const int rc = ds4_session_mimo_spec_cycle(s, first_token, temperature, top_k, top_p, min_p, rng, false,
+                                               accepted, cap, err, errlen);
+    const bool worker_ok = ds4_tp_wait_command_ack(e->tp.ctx, s->tp_session_id, "MiMo MTP", err, errlen);
+    if (rc < 0 || !worker_ok || ds4_gpu_tp_failed()) {
+        if (rc >= 0 && worker_ok) snprintf(err, errlen, "tp: gate transport failed");
+        ds4_session_invalidate(s);
+        return -1;
+    }
+    return rc;
+}
 #endif
 
 int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
@@ -76994,6 +77073,14 @@ int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
         int accepted[2];
         return ds4_session_glm_spec_cycle(s, token, accepted, limit, err, errlen);
     }
+#ifdef DS4_HAS_MIMO_GPU
+    if (s && s->engine && s->engine->tp.active && s->engine->tp.rank == 1 && s->checkpoint_valid &&
+        ds4_session_is_mimo(s) && s->mimo_graph_ready && s->engine->glm_mtp &&
+        limit >= 1 && limit <= DS4_TP_BATCH_MAX_ROWS && token >= 0 && token < (int)DS4_N_VOCAB) {
+        int accepted[DS4_TP_BATCH_MAX_ROWS];
+        return ds4_session_mimo_spec_cycle(s, token, 0.0f, 0, 0.0f, 0.0f, NULL, false, accepted, limit, err, errlen);
+    }
+#endif
 #else
     (void)s; (void)token; (void)limit;
 #endif
@@ -86984,7 +87071,7 @@ static int ds4_session_eval_speculative_argmax_impl(
         if (!accepted || accepted_cap <= 0) return 0;
 #ifdef DS4_HAS_MIMO_GPU
         if (((s->engine->glm_mtp && DS4_N_NEXTN_PREDICT != 0) || s->engine->dflash_ready) && s->mimo_graph_ready) {
-            return ds4_session_mimo_spec_cycle(s, first_token, 0.0f, 0, 0.0f, 0.0f, NULL, false,
+            return ds4_session_mimo_spec(s, first_token, 0.0f, 0, 0.0f, 0.0f, NULL, false,
                                                accepted, accepted_cap, err, errlen);
         }
 #endif
@@ -87863,7 +87950,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
     if (ds4_session_is_mimo(s)) {
 #ifdef DS4_HAS_MIMO_GPU
         if (((s->engine->glm_mtp && DS4_N_NEXTN_PREDICT != 0) || s->engine->dflash_ready) && s->mimo_graph_ready) {
-            return ds4_session_mimo_spec_cycle(s, first_token, temperature, top_k, top_p, min_p, rng,
+            return ds4_session_mimo_spec(s, first_token, temperature, top_k, top_p, min_p, rng,
                                                s->engine->dspark_exact_sampling,
                                                accepted, accepted_cap, err, errlen);
         }

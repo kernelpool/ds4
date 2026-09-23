@@ -649,7 +649,7 @@ uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
            slots * 8 * 2 +      /* in flags + out flag staging */
            16 +                 /* token slot */
            slots * 4 +          /* GPU-written gate-ready flags */
-           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in */
+           (uint64_t)n_layer * 2 * DS4_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in, two gates per layer */
 }
 
 static void tp_slab_layout(ds4_tp *tp) {
@@ -663,9 +663,9 @@ static void tp_slab_layout(ds4_tp *tp) {
     tp->gpu_flags_off = tp->out_flags_off + slots * 8;
     tp->batch_out_off = tp->gpu_flags_off + slots * 4;
     tp->batch_in_off = tp->batch_out_off +
-                       (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+                       (uint64_t)tp->n_layer * 2 * DS4_TP_BATCH_MAX_ROWS * vec;
     tp->slab_bytes = tp->batch_in_off +
-                     (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+                     (uint64_t)tp->n_layer * 2 * DS4_TP_BATCH_MAX_ROWS * vec;
 }
 
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp) {
@@ -2514,7 +2514,7 @@ int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
 
 int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
                        uint64_t seq, int token, int limit) {
-    if (limit < 1 || limit > 2) return 0;
+    if (limit < 1 || limit > DS4_TP_BATCH_MAX_ROWS) return 0;
     ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, (uint32_t)limit };
     return tp_send_frame(tp->control_fd, DS4_TP_FRAME_GLM_MTP, &msg, sizeof(msg));
 }
@@ -2803,7 +2803,7 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
         command->seq = msg.seq;
         command->value = msg.token;
         if (ftype == DS4_TP_FRAME_GLM_MTP) {
-            if (msg.reserved < 1 || msg.reserved > 2) { ok = 0; break; }
+            if (msg.reserved < 1 || msg.reserved > DS4_TP_BATCH_MAX_ROWS) { ok = 0; break; }
             command->limit = (int)msg.reserved;
         } else if (msg.reserved != 0) {
             ok = 0;
