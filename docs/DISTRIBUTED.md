@@ -93,7 +93,7 @@ to both for image input.
 For GLM MTP, enable `--mtp` on both. For DeepSeek DSpark, both need the
 matching support model and DSpark options. V4.1 supports vision but not
 speculative decoding. MiMo-V2.6 splits its attention heads too and runs
-text-only, without its drafters.
+text-only; for its MTP drafting pass `--mtp` to both (DFlash is not supported).
 
 TP disk-cache restore currently rebuilds the exact saved token prefix on both
 ranks rather than restoring the coordinator alone. Expect prefill on restore.

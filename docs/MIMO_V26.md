@@ -35,8 +35,11 @@ each rank keeps half of the attention heads (their QKV rows and output
 columns are copied into rank-local buffers at startup), the KV cache of
 those heads, half of the routed experts and half of the vocabulary head.
 Decode gates release inside the command buffer, which is committed every two
-layers. Under tensor parallelism MiMo runs without vision, drafters and
-session batching.
+layers. `--mtp` on both ranks drafts with the MTP blocks, which each rank
+runs whole; the verify rows cross the RDMA verify window, and the vocabulary
+head stays whole on both ranks because the drafts follow its argmax. Exact
+sampling decodes plainly under tensor parallelism, and vision, DFlash and
+session batching stay off.
 
 ## Speculative decoding
 
