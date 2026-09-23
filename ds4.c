@@ -59862,9 +59862,18 @@ static bool mimo_graph_head(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4
                             const ds4_tensor *norm, uint32_t row0, uint32_t n) {
     const uint64_t E = DS4_N_EMBD;
     ds4_gpu_tensor *rows = row0 ? ds4_gpu_tensor_view(h, row0 * E * sizeof(float), (uint64_t)n * E * sizeof(float)) : h;
-    const bool ok = rows &&
+    /* TP: each rank projects its half of the vocabulary, the engine merges them */
+    ds4_tensor head = *w->output;
+    ds4_gpu_tensor *out = g->logits;
+    if (g->tp_world == 2u && n == 1u) {
+        head.dim[1] /= 2u; head.elements /= 2u; head.bytes /= 2u;
+        head.abs_offset += g->tp_rank * head.bytes;
+        out = ds4_gpu_tensor_view(g->logits, g->tp_rank * head.dim[1] * sizeof(float), head.dim[1] * sizeof(float));
+    }
+    const bool ok = rows && out &&
         ds4_gpu_rms_norm_weight_rows_tensor(g->xn, rows, m->map, m->size, norm->abs_offset, (uint32_t)E, n, DS4_RMS_EPS) &&
-        mimo_gemv(g, g->logits, m, w->output, g->xn, n);
+        mimo_gemv(g, out, m, &head, g->xn, n);
+    if (out != g->logits) ds4_gpu_tensor_free(out);
     if (row0) ds4_gpu_tensor_free(rows);
     return ok;
 }
@@ -74901,7 +74910,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
 #endif
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
     /* Reuse the existing half-logit frames for V4.1 on CUDA as well. */
-    e->tp.vocab_split = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 ||
+    e->tp.vocab_split = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 || ds4_model_is_mimo() ||
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && e->backend == DS4_BACKEND_CUDA);
 #ifdef DS4_HAS_MIMO_GPU
     if (ds4_model_is_mimo() && !e->mimo_tp_slices &&
