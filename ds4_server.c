@@ -6617,7 +6617,8 @@ static bool parse_qwen_generated_message_ex(const char *text,
                                             char **content_out,
                                             char **reasoning_out,
                                             tool_calls *calls,
-                                            const tool_schema_orders *orders) {
+                                            const tool_schema_orders *orders,
+                                            bool mimo) {
     static const char tool_start[] = "<tool_call>";
     static const char tool_end[] = "</tool_call>";
     static const char fn_start[] = "<function=";
@@ -6707,7 +6708,9 @@ static bool parse_qwen_generated_message_ex(const char *text,
                 buf_free(&args);
                 return false;
             }
-            char *value = qwen_strip_value_newlines(value_start, value_end);
+            /* MiMo writes values inline, so edge newlines are part of the value */
+            char *value = mimo ? xstrndup(value_start, (size_t)(value_end - value_start)) :
+                                 qwen_strip_value_newlines(value_start, value_end);
             const bool is_string = qwen_param_declared_string(orders, name, key) ||
                                    !qwen_param_value_is_json(value);
             if (is_string) ds4_tool_text_unescape(value, param_end);
@@ -6767,7 +6770,8 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
     }
     if (syntax_is_chatml(syntax)) {
         return parse_qwen_generated_message_ex(text, require_thinking_closed,
-                                               content_out, reasoning_out, calls, NULL);
+                                               content_out, reasoning_out, calls, NULL,
+                                               syntax == SERVER_MODEL_SYNTAX_MIMO);
     }
     return parse_deepseek_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out,
@@ -6884,7 +6888,8 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
 
     bool parsed_ok = syntax_is_chatml(syntax) ?
         parse_qwen_generated_message_ex(text, require_thinking_closed,
-                                         content_out, reasoning_out, calls, orders) :
+                                         content_out, reasoning_out, calls, orders,
+                                         syntax == SERVER_MODEL_SYNTAX_MIMO) :
         parse_generated_message_ex_for_syntax(syntax,
                                                            text ? text : "",
                                                            require_thinking_closed,
@@ -18777,6 +18782,18 @@ static void test_parse_qwen_tool_call_message(void) {
     free(content);
     free(reasoning);
     tool_calls_free(&bad);
+
+    content = NULL;
+    reasoning = NULL;
+    tool_calls mimo = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_MIMO,
+        "x</think><tool_call><function=write><parameter=content>\na\nb\n</parameter></function></tool_call>",
+        true, &content, &reasoning, &mimo));
+    TEST_ASSERT(mimo.len == 1 && strstr(mimo.v[0].arguments, "\"content\": \"\\na\\nb\\n\"") != NULL);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&mimo);
 }
 
 static void test_qwen_literal_tool_end_in_argument(void) {
