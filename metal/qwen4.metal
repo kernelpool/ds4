@@ -2776,7 +2776,14 @@ kernel void kernel_qwen4_moe_mid(
     const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
     device const char *gb = shared ? sh_gate : gate_base;
     device const char *ub = shared ? sh_up : up_base;
-    const uint64_t ebase = shared ? 0 : (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    const int expert = shared ? 0 : selected[(uint64_t)tok * args.n_slots + slot];
+    if (expert < 0 || (!shared && (uint)expert >= args.n_total_expert)) {   /* a peer rank's expert under TP */
+        for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
+            if (tiisg == 0) mid[((uint64_t)tok * n_out + slot) * args.out_rows + r] = 0.0f;
+        }
+        return;
+    }
+    const uint64_t ebase = (uint64_t)(uint)expert * args.expert_bytes;
     device const float *xt = x + (uint64_t)tok * args.in_dim;
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
         const uint64_t off = ebase + (uint64_t)r * row_bytes;
@@ -3055,7 +3062,12 @@ kernel void kernel_qwen4_moe_down(
     const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
     device const char *db = shared ? sh_down : down_base;
     const uint64_t pair = (uint64_t)tok * n_out + slot;
-    const uint64_t ebase = shared ? 0 : (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    const int expert = shared ? 0 : selected[(uint64_t)tok * args.n_slots + slot];
+    if (expert < 0 || (!shared && (uint)expert >= args.n_total_expert)) {   /* a peer rank's expert under TP */
+        for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) if (tiisg == 0) part[pair * args.out_rows + r] = 0.0f;
+        return;
+    }
+    const uint64_t ebase = (uint64_t)(uint)expert * args.expert_bytes;
     device const float *m = mid + pair * args.in_dim;
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
         const float v = qwen4_row_dot(db + ebase + (uint64_t)r * row_bytes, m, type, dim, tiisg);
@@ -3110,7 +3122,12 @@ kernel void kernel_qwen4_moe_down_mxfp4_pf(
         }
         return;
     }
-    const uint64_t ebase = (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    const int expert = selected[(uint64_t)tok * args.n_slots + slot];
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {   /* a peer rank's expert under TP */
+        for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) if (tiisg == 0) part[pair * args.out_rows + r] = 0.0f;
+        return;
+    }
+    const uint64_t ebase = (uint64_t)(uint)expert * args.expert_bytes;
     const uint ix = tiisg / 8, it = tiisg % 8;
     const uint nb = dim / 32;
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
@@ -3565,8 +3582,9 @@ kernel void kernel_qwen4_moe_reduce(
     if (d >= args.dim) return;
     float acc = 0.0f;
     for (uint s = 0; s < args.n_slots; s++) {
-        acc += weights[(uint64_t)tok * args.n_slots + s] *
-               part[((uint64_t)tok * args.part_stride + s) * args.dim + d];
+        const float w = weights[(uint64_t)tok * args.n_slots + s];
+        if (w == 0.0f) continue;   /* a peer rank's expert under TP: its part row is never written */
+        acc += w * part[((uint64_t)tok * args.part_stride + s) * args.dim + d];
     }
     if (args.shared_src == 1) {
         acc += qwen4_sigmoid(shared_gate[tok]) * part[((uint64_t)tok * args.part_stride + args.n_slots) * args.dim + d];

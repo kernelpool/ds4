@@ -314,7 +314,9 @@ struct ds4_metal_args_mimo_router {
     uint32_t n_tokens;
     uint32_t n_expert;
     uint32_t n_used;
-    uint32_t pad0;
+    uint32_t own_lo;    /* TP: this rank's experts [own_lo, own_lo + own_n); own_n 0 owns all */
+    uint32_t own_n;
+    uint32_t pad0, pad1, pad2;
 };
 
 /* Sigmoid router for one token per threadgroup: experts are picked by
@@ -372,8 +374,15 @@ kernel void kernel_mimo_router(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (tid < args.n_used) {
-        const uint e = (uint)selected[(uint64_t)tok * args.n_used + tid];
-        weights[(uint64_t)tok * args.n_used + tid] = prob[e] / (wsum + 1e-20f);
+        const uint64_t at = (uint64_t)tok * args.n_used + tid;
+        const uint e = (uint)selected[at];
+        float w = prob[e] / (wsum + 1e-20f);
+        if (args.own_n) {   /* owned picks rebased, a peer's marked -1 with no weight */
+            const uint r = e - args.own_lo;
+            selected[at] = r < args.own_n ? (int32_t)r : -1;
+            if (r >= args.own_n) w = 0.0f;
+        }
+        weights[at] = w;
     }
 }
 

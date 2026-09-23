@@ -49618,7 +49618,7 @@ int ds4_gpu_qwen4_moe_down_tensor(
     const uint64_t experts_bytes = expert_bytes * n_total_expert;
     const uint64_t shared_bytes = (uint64_t)sh_row_bytes * out_dim;
     qwen4_moe_args args = { n_tokens, n_slots, ff_dim, out_dim, weight_type, row_bytes, expert_bytes,
-                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, 0u, 0u, 0u };
+                            has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, n_total_expert, 0u, 0u };
     qwen4_bind b[5];
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || (ff_dim % 32u) != 0 ||
         out_dim == 0 || (has_shared && sh_row_bytes == 0) ||
@@ -50433,8 +50433,9 @@ int ds4_gpu_mimo_attn_tensor(
 int ds4_gpu_mimo_router_tensor(
         ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, const ds4_gpu_tensor *logits,
         const void *model_map, uint64_t model_size, uint64_t bias_offset,
-        uint32_t n_tokens, uint32_t n_expert, uint32_t n_used) {
-    struct { uint32_t n_tokens, n_expert, n_used, pad0; } args = { n_tokens, n_expert, n_used, 0 };
+        uint32_t n_tokens, uint32_t n_expert, uint32_t n_used, uint32_t own_lo, uint32_t own_n) {
+    struct { uint32_t n_tokens, n_expert, n_used, own_lo, own_n, pad0, pad1, pad2; } args = {
+        n_tokens, n_expert, n_used, own_lo, own_n, 0, 0, 0 };
     qwen4_bind b[4];
     if (n_tokens == 0 || n_expert == 0 || n_expert > 512 || n_used == 0 || n_used > n_expert || n_used > 256 ||
         !qwen4_bind_tensor(&b[0], logits, (uint64_t)n_tokens * n_expert * sizeof(float), "MiMo router logits") ||

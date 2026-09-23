@@ -3607,11 +3607,12 @@ int ds4_gpu_mimo_mtp_cat_tensor(
         const void *model_map, uint64_t model_size, uint64_t g_e_offset, uint64_t g_h_offset,
         uint32_t n_tokens, uint32_t n_embd, float eps);
 /* sigmoid router: experts by sigmoid(logit) + bias, weights = unbiased
- * probabilities renormalised over the picks */
+ * probabilities renormalised over the picks; with own_n (TP) picks in
+ * [own_lo, own_lo + own_n) are rebased and the others become -1 with no weight */
 int ds4_gpu_mimo_router_tensor(
         ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, const ds4_gpu_tensor *logits,
         const void *model_map, uint64_t model_size, uint64_t bias_offset,
-        uint32_t n_tokens, uint32_t n_expert, uint32_t n_used);
+        uint32_t n_tokens, uint32_t n_expert, uint32_t n_used, uint32_t own_lo, uint32_t own_n);
 
 #ifdef __cplusplus
 }

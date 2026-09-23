@@ -42764,6 +42764,7 @@ struct ds4_engine {
     uint32_t qwen4_arena_users;   /* live sessions borrowing the shared workspace */
     struct ds4_mimo_gpu_graph *mimo_shared_workspace;
     uint32_t mimo_arena_users;
+    struct ds4_mimo_tp_slices *mimo_tp_slices;   /* TP: this rank's attention weights */
     /* batched speculative policy: the drafts' measured acceptance and the
      * wall time of a plain and of a speculative batched cycle */
     float qwen4_batch_p, qwen4_batch_ms[2];
@@ -59502,12 +59503,30 @@ typedef struct ds4_mimo_gpu_graph {
     ds4_gpu_tensor *df_feat, *df_c, *df_cn, *df_x, *df_xn, *df_blk, *df_q, *df_qo, *df_k, *df_v, *df_o, *df_g, *df_u, *df_m, *df_part;
     ds4_gpu_tensor *df_k_cache[DS4_DFLASH_MAX_LAYER];
     ds4_gpu_tensor *df_v_cache[DS4_DFLASH_MAX_LAYER];
+    /* two-Mac TP: this rank's half of the heads and experts; the partial
+     * o_proj and expert sums meet at the layer's gates in rank order */
+    uint32_t tp_world, tp_rank;
+    ds4_gpu_tensor **tp_out, **tp_in;          /* one-row slab slots per (layer, gate) */
+    ds4_gpu_tensor *tp_peer;                   /* a chunk's peer partial */
+    const struct ds4_mimo_tp_slices *tp_slices;
 } ds4_mimo_gpu_graph;
+
+/* A TP rank's attention weights: its fused-qkv rows [Q | K | V] and its
+ * o_proj input columns, copied contiguous so the unsplit kernels run them */
+typedef struct ds4_mimo_tp_slices {
+    ds4_model map;
+    ds4_tensor qkv[DS4_MAX_LAYER], o[DS4_MAX_LAYER];
+} ds4_mimo_tp_slices;
 
 static bool mimo_graph_flush_draft(ds4_mimo_gpu_graph *g);
 
 static uint32_t mimo_layer_kv(uint32_t il) {
     return ds4_mimo_layer_is_swa(il) ? DS4_N_HEAD_KV_SWA : DS4_N_HEAD_KV;
+}
+
+/* the KV heads a graph holds: half of them on a TP rank */
+static uint32_t mimo_graph_kv(const ds4_mimo_gpu_graph *g, uint32_t il) {
+    return mimo_layer_kv(il) / (g->tp_world ? g->tp_world : 1u);
 }
 
 /* A batched decode reads each Q8 matrix once per four rows with the
@@ -59565,7 +59584,7 @@ static void mimo_graph_free(ds4_mimo_gpu_graph *g) {
     }
     ds4_gpu_tensor *fields[] = { g->mtp_a, g->mtp_b, g->mtp_e, g->mtp_carry, g->argmax, g->argmax_tmp, g->tok_id,
                                  g->df_feat, g->df_c, g->df_cn, g->df_x, g->df_xn, g->df_blk, g->df_q, g->df_qo, g->df_k,
-                                 g->df_v, g->df_o, g->df_g, g->df_u, g->df_m, g->df_part };
+                                 g->df_v, g->df_o, g->df_g, g->df_u, g->df_m, g->df_part, g->tp_peer };
     for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) ds4_gpu_tensor_free(fields[i]);
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(g->k_cache[il]);
@@ -59601,8 +59620,9 @@ static void mimo_graph_transfer_scratch(ds4_mimo_gpu_graph *dst, ds4_mimo_gpu_gr
  * drafter's feature rows, block scratch and rings instead. */
 static bool mimo_graph_alloc(ds4_mimo_gpu_graph *g, const ds4_weights *w, uint32_t ctx_cap, uint32_t cap_tokens,
                              bool mtp, const ds4_dflash_weights *df, const ds4_model *dm,
-                             const ds4_mimo_gpu_graph *shared) {
+                             const ds4_mimo_gpu_graph *shared, uint32_t tp_world) {
     memset(g, 0, sizeof(*g));
+    g->tp_world = tp_world;
     if (!mimo_graph_weights_supported(w)) return false;
     if (mtp && DS4_N_NEXTN_PREDICT > DS4_MIMO_MAX_MTP) {
         fprintf(stderr, "ds4: MiMo MTP supports at most %u depths\n", DS4_MIMO_MAX_MTP);
@@ -59654,6 +59674,7 @@ private_state:
         MIMO_ALLOC(mtp_e, (uint64_t)g->mtp_rows * E);
         MIMO_ALLOC(mtp_carry, (uint64_t)n_mtp * E);
     }
+    if (tp_world == 2u) MIMO_ALLOC(tp_peer, (uint64_t)cap_tokens * E);
     if (mtp || df) {
         /* verify rows, the logits before the block, the draft rows */
         g->host_logits = xmalloc((uint64_t)(g->n_verify + 1u + DS4_DFLASH_BLOCK) * DS4_N_VOCAB * sizeof(float));
@@ -59694,7 +59715,7 @@ private_state:
         const bool swa = ds4_mimo_layer_is_swa(il);
         uint32_t ring = swa ? DS4_N_SWA + (uint32_t)T : ctx_cap;
         if (ring > ctx_cap) ring = ctx_cap;
-        const uint64_t kv = mimo_layer_kv(il);
+        const uint64_t kv = mimo_graph_kv(g, il);
         g->ring[il] = ring;
         /* half rows, sized in floats */
         MIMO_ALLOC(k_cache[il], (uint64_t)ring * kv * DS4_N_HEAD_DIM / 2u);
@@ -59721,24 +59742,50 @@ static void mimo_graph_reset(ds4_mimo_gpu_graph *g) {
     g->verify_rows = 0;
 }
 
+/* TP: this rank's partial of T rows plus the peer's, added in rank order so
+ * both ranks hold the same bits.  A single row's producer writes straight
+ * into its slab slot (mimo_tp_out) and the sum lands in x. */
+static ds4_gpu_tensor *mimo_tp_out(ds4_mimo_gpu_graph *g, ds4_gpu_tensor *x, uint32_t il, uint32_t gate, uint32_t T) {
+    return g->tp_world == 2u && T == 1u ? g->tp_out[il * DS4_TP_GATES_PER_LAYER + gate] : x;
+}
+
+static bool mimo_tp_sum(ds4_mimo_gpu_graph *g, ds4_gpu_tensor *x, uint32_t il, uint32_t gate, uint32_t T) {
+    const uint64_t E = DS4_N_EMBD;
+    if (T == 1u) {
+        const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + gate;
+        return ds4_gpu_tp_gate_encode(il, gate) &&
+               ds4_gpu_add_tensor(x, g->tp_rank ? g->tp_in[slot] : g->tp_out[slot],
+                                  g->tp_rank ? g->tp_out[slot] : g->tp_in[slot], (uint32_t)E) != 0;
+    }
+    return ds4_gpu_tp_big_gate_encode(il, T, x, g->tp_peer, (uint64_t)T * E * sizeof(float)) &&
+           ds4_gpu_flush_commands() &&
+           ds4_gpu_add_tensor(x, g->tp_rank ? g->tp_peer : x, g->tp_rank ? x : g->tp_peer, T * (uint32_t)E) != 0;
+}
+
 static bool mimo_graph_attention(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                  uint32_t il, uint32_t pos0, uint32_t T) {
     const bool swa = ds4_mimo_layer_is_swa(il);
-    const uint32_t kv = mimo_layer_kv(il);
+    const uint32_t kv = mimo_graph_kv(g, il);
     const float base = swa ? DS4_ROPE_FREQ_BASE_SWA : DS4_ROPE_FREQ_BASE;
+    /* a TP rank runs its half of the heads from its sliced weights */
+    const ds4_mimo_tp_slices *tp = g->tp_world == 2u ? g->tp_slices : NULL;
+    const ds4_model *am = tp ? &tp->map : m;
+    const ds4_tensor *wqkv = tp ? &tp->qkv[il] : l->attn_qkv, *wo = tp ? &tp->o[il] : l->attn_output;
+    const uint32_t H = DS4_N_HEAD / (tp ? 2u : 1u);
+    const uint64_t sinks = swa ? l->attn_sinks->abs_offset + (uint64_t)(tp ? g->tp_rank : 0u) * H * sizeof(float) : 0u;
     /* a single token lets the attention kernel do the prep itself */
-    return mimo_gemv(g, g->qkv, m, l->attn_qkv, g->xn, T) &&
+    return mimo_gemv(g, g->qkv, am, wqkv, g->xn, T) &&
            (T == 1u ||
-            ds4_gpu_mimo_attn_prep_tensor(g->q, g->k_cache[il], g->v_cache[il], g->qkv, T, DS4_N_HEAD, kv,
+            ds4_gpu_mimo_attn_prep_tensor(g->q, g->k_cache[il], g->v_cache[il], g->qkv, T, H, kv,
                                           DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, DS4_N_ROT, pos0, g->ring[il], base,
                                           DS4_ATTN_VALUE_SCALE)) &&
            ds4_gpu_mimo_attn_tensor(g->attn_o, g->q, g->k_cache[il], g->v_cache[il], m->map, m->size,
-                                    swa ? l->attn_sinks->abs_offset : 0u, swa,
-                                    T <= DS4_MIMO_PART_ROWS ? g->attn_part : NULL, T, DS4_N_HEAD, kv,
+                                    sinks, swa, T <= DS4_MIMO_PART_ROWS ? g->attn_part : NULL, T, H, kv,
                                     DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, pos0, g->ring[il], swa ? DS4_N_SWA : 0u,
                                     g->first[il], 0u, 1.0f / sqrtf((float)DS4_N_HEAD_DIM),
                                     T == 1u ? g->qkv : NULL, DS4_N_ROT, base, DS4_ATTN_VALUE_SCALE) &&
-           mimo_gemv(g, g->blk, m, l->attn_output, g->attn_o, T);
+           mimo_gemv(g, mimo_tp_out(g, g->blk, il, DS4_TP_GATE_ATTN, T), am, wo, g->attn_o, T) &&
+           (!tp || mimo_tp_sum(g, g->blk, il, DS4_TP_GATE_ATTN, T));
 }
 
 static bool mimo_graph_dense_ffn(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
@@ -59751,11 +59798,19 @@ static bool mimo_graph_dense_ffn(ds4_mimo_gpu_graph *g, const ds4_model *m, cons
 /* router GEMV + sigmoid top-k, experts per (token, slot) rows or, for
  * prefill-sized batches, the expert-grouped tiled GEMMs, weighted reduce */
 static bool mimo_graph_moe(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, ds4_gpu_tensor *h,
-                           uint32_t T) {
-    const uint32_t NE = DS4_N_EXPERT, K = DS4_N_EXPERT_USED, E = DS4_N_EMBD, FF = DS4_N_FF_EXP;
+                           uint32_t il, uint32_t T) {
+    const uint32_t K = DS4_N_EXPERT_USED, E = DS4_N_EMBD, FF = DS4_N_FF_EXP;
+    /* a TP rank binds its half of the experts; the router rebases its picks
+     * and gives the peer's none, so the reduce yields this rank's partial */
+    const bool tp = g->tp_world == 2u;
+    const uint32_t own_n = tp ? DS4_N_EXPERT / 2u : 0u, own_lo = tp ? g->tp_rank * own_n : 0u;
+    const uint32_t NE = tp ? own_n : DS4_N_EXPERT;
+    const uint64_t gate_off = l->ffn_gate_exps->abs_offset + own_lo * (l->ffn_gate_exps->bytes / DS4_N_EXPERT);
+    const uint64_t up_off = l->ffn_up_exps->abs_offset + own_lo * (l->ffn_up_exps->bytes / DS4_N_EXPERT);
+    const uint64_t down_off = l->ffn_down_exps->abs_offset + own_lo * (l->ffn_down_exps->bytes / DS4_N_EXPERT);
     bool ok = mimo_gemv(g, g->router, m, l->ffn_gate_inp, g->xn, T) &&
               ds4_gpu_mimo_router_tensor(g->selected, g->weights, g->router, m->map, m->size,
-                                         l->ffn_exp_probs_b->abs_offset, T, NE, K);
+                                         l->ffn_exp_probs_b->abs_offset, T, DS4_N_EXPERT, K, own_lo, own_n);
     const bool mm = T > 64u && (E % 64u) == 0 && (FF % 64u) == 0 &&
         qwen4_expert_type_has_mm(l->ffn_gate_exps->type) && l->ffn_up_exps->type == l->ffn_gate_exps->type &&
         qwen4_expert_type_has_mm(l->ffn_down_exps->type);
@@ -59768,27 +59823,26 @@ static bool mimo_graph_moe(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_
     if (ok && mm) {
         ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, K, NE, g->cap_tokens) &&
              ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->xn, g->moe_lists, g->moe_counts, m->map, m->size,
-                                             l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
-                                             l->ffn_gate_exps->type, NE, T, K, K, E, FF, g->cap_tokens) &&
+                                             gate_off, up_off, l->ffn_gate_exps->type, NE, T, K, K, E, FF, g->cap_tokens) &&
              ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->moe_lists, g->moe_counts, m->map, m->size,
-                                              l->ffn_down_exps->abs_offset, l->ffn_down_exps->type, NE, T, K, K,
-                                              FF, E, g->cap_tokens);
+                                              down_off, l->ffn_down_exps->type, NE, T, K, K, FF, E, g->cap_tokens);
     } else if (ok && grouped) {
         ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, K, NE, g->cap_tokens) &&
              ds4_gpu_qwen4_moe_mid_grouped_tensor(g->mid, g->xn, g->selected, g->moe_lists, g->moe_counts, g->cap_tokens,
-                                                  m->map, m->size, l->ffn_gate_exps->abs_offset,
-                                                  l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, NE, T, K, E, FF) &&
+                                                  m->map, m->size, gate_off, up_off, l->ffn_gate_exps->type, NE, T, K, E, FF) &&
              ds4_gpu_qwen4_moe_down_grouped_tensor(g->part, g->mid, g->selected, g->moe_lists, g->moe_counts,
-                                                   g->cap_tokens, m->map, m->size, l->ffn_down_exps->abs_offset,
+                                                   g->cap_tokens, m->map, m->size, down_off,
                                                    l->ffn_down_exps->type, NE, T, K, FF, E);
     } else if (ok) {
-        ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->xn, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
-                                          l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, NE, T, K, E, FF,
-                                          0u, 0u, UINT32_MAX) != 0 &&
-             ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
+        ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->xn, g->selected, m->map, m->size, gate_off, up_off,
+                                          l->ffn_gate_exps->type, NE, T, K, E, FF, 0u, 0u, UINT32_MAX) != 0 &&
+             ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, down_off,
                                            l->ffn_down_exps->type, NE, T, K, FF, E, 0u, UINT32_MAX) != 0;
     }
-    return ok && ds4_gpu_qwen4_moe_reduce_add_tensor(h, g->part, g->weights, T, K, E) != 0;
+    if (!tp) return ok && ds4_gpu_qwen4_moe_reduce_add_tensor(h, g->part, g->weights, T, K, E) != 0;
+    return ok && ds4_gpu_qwen4_moe_reduce_tensor(mimo_tp_out(g, g->blk, il, DS4_TP_GATE_FFN, T), g->part, g->weights,
+                                                 NULL, NULL, NULL, NULL, T, K, K, E, 0u) &&
+           mimo_tp_sum(g, g->blk, il, DS4_TP_GATE_FFN, T) && ds4_gpu_add_tensor(h, h, g->blk, T * E);
 }
 
 /* pre-norm block on the T rows of residual h at pos0.. */
@@ -59800,7 +59854,7 @@ static bool mimo_graph_layer(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds
            ds4_gpu_add_rms_norm_weight_rows_tensor(g->xn, h, h, g->blk, m->map, m->size, l->ffn_norm->abs_offset, E, T,
                                                    DS4_RMS_EPS) &&
            (ds4_mimo_layer_is_dense(il) ? mimo_graph_dense_ffn(g, m, l, T) && ds4_gpu_add_tensor(h, h, g->blk, T * E)
-                                        : mimo_graph_moe(g, m, l, h, T));
+                                        : mimo_graph_moe(g, m, l, h, il, T));
 }
 
 /* norm + head over rows [row0, row0 + n) of h into logit rows 0..n-1 */
@@ -64089,6 +64143,7 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
 
 #ifdef DS4_HAS_MIMO_GPU
 #define DS4_MIMO_PAYLOAD_TAG 0x4d494d31u
+#define DS4_MIMO_PAYLOAD_TAG_TP 0x4d494d32u   /* a TP rank's half heads: only its tokens can be restored */
 
 /* Every layer's live K/V rows: the whole ring of a windowed layer, the used
  * prefix of a global one (the ring is the context there). */
@@ -64151,7 +64206,7 @@ static int mimo_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t
     const uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
         DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION, (uint32_t)s->ctx_size, s->prefill_cap,
         g->ctx_cap, g->ctx_cap, DS4_N_EMBD, rows, DS4_N_LAYER, DS4_N_HEAD_DIM, DS4_N_VALUE_DIM, DS4_N_VOCAB,
-        DS4_MIMO_PAYLOAD_TAG,
+        g->tp_world == 2u ? DS4_MIMO_PAYLOAD_TAG_TP : DS4_MIMO_PAYLOAD_TAG,
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
@@ -64164,7 +64219,7 @@ static int mimo_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t
     int rc = 0;
     const uint32_t n_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT + (g->mtp_a ? DS4_N_NEXTN_PREDICT : 0u);
     for (uint32_t il = 0; rc == 0 && il < n_layers; il++) {
-        const uint64_t n = mimo_payload_rows(g, il, rows), kv = mimo_layer_kv(il);
+        const uint64_t n = mimo_payload_rows(g, il, rows), kv = mimo_graph_kv(g, il);
         rc = payload_write_u32(fp, g->ring[il], err, errlen);
         if (rc == 0) rc = payload_write_u32(fp, g->first[il], err, errlen);
         if (rc == 0) rc = payload_write_tensor_span(fp, g->k_cache[il], 0, n * kv * DS4_N_HEAD_DIM * 2u,
@@ -64215,7 +64270,7 @@ static int mimo_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h
     int rc = 0;
     const uint32_t n_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT + (g->mtp_a ? DS4_N_NEXTN_PREDICT : 0u);
     for (uint32_t il = 0; rc == 0 && il < n_layers; il++) {
-        const uint64_t n = mimo_payload_rows(g, il, rows), kv = mimo_layer_kv(il);
+        const uint64_t n = mimo_payload_rows(g, il, rows), kv = mimo_graph_kv(g, il);
         uint32_t ring = 0, first = 0;
         rc = payload_read_u32(fp, &ring, remaining, err, errlen);
         if (rc == 0) rc = payload_read_u32(fp, &first, remaining, err, errlen);
@@ -69866,7 +69921,7 @@ static int mimo_first_token_test(const ds4_engine *e, const ds4_tokens *prompt, 
         if (chunk > n_seq) chunk = n_seq;
         ds4_mimo_gpu_graph *g = xcalloc(1, sizeof(*g));
         if (!mimo_graph_alloc(g, weights, n_seq + 8u, chunk, mtp_ref != NULL, n_anchor ? &e->dflash : NULL,
-                              &e->mtp_model, NULL)) {
+                              &e->mtp_model, NULL, 0u)) {
             free(g);
             free(df_ref); free(mtp_ref); free(layer_streams); free(post); free(logits); free(seq);
             return 1;
@@ -72629,13 +72684,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
             e->backend == DS4_BACKEND_METAL ||
 #endif
             (opt->first_token_test && e->backend == DS4_BACKEND_CPU);
-        if (!backend_ok || opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel ||
+        const bool tp_extra = opt->tp.role != DS4_TP_NONE &&
+            (opt->glm_mtp || (opt->mtp_path && opt->mtp_path[0]) || (opt->vision_path && opt->vision_path[0]));
+        if (!backend_ok || tp_extra || opt->cuda_tensor_parallel ||
             (gpu_cfg && gpu_cfg->n_gpus > 1) ||
             opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
             e->ssd_streaming || opt->dspark || e->power_percent != 100) {
             fprintf(stderr, "ds4: MiMo-V2.6 requires Metal (or --cpu --first-token-test); "
-                            "tensor parallelism, pipeline execution, SSD streaming, DSpark "
-                            "and power throttling are not supported\n");
+                            "vision or drafters under tensor parallelism, pipeline execution, SSD streaming, "
+                            "DSpark and power throttling are not supported\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -74018,6 +74075,20 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
             *step = 1;
             *per_token = sparse_layers * DS4_TP_GATES_PER_LAYER;
         }
+    } else if (ds4_model_is_mimo()) {
+        /* every trunk layer's attention, every MoE layer's experts; the MTP blocks fire none */
+        uint32_t count = 0;
+        for (uint32_t il = 0; il < DS4_N_LAYER - DS4_N_NEXTN_PREDICT; il++) {
+            for (uint32_t gate = 0; gate < DS4_TP_GATES_PER_LAYER; gate++) {
+                if (gate == DS4_TP_GATE_FFN && ds4_mimo_layer_is_dense(il)) continue;
+                const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + gate;
+                mask[slot / 64u] |= UINT64_C(1) << (slot % 64u);
+                count++;
+            }
+        }
+        *start = 0;
+        *step = 1;
+        *per_token = count;
     } else {
         *start = 0;
         *step = 1;
@@ -74669,6 +74740,76 @@ static int ds4_engine_tp_big_exchange(void *ud, uint32_t layer, uint64_t seq,
 }
 #endif
 
+#ifdef DS4_HAS_MIMO_GPU
+/* A TP rank's attention weights, copied once from the mapped model into
+ * page-aligned memory the GPU maps like a model: per trunk layer the fused
+ * qkv rows of its heads [Q | K | V] and the o_proj input columns of those
+ * heads.  Metal keeps views of the copy, so it lives as long as the process. */
+static ds4_mimo_tp_slices *mimo_tp_slices_build(const ds4_engine *e, uint32_t rank, char *err, size_t errlen) {
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const uint64_t H = DS4_N_HEAD, Hl = H / 2u, Dk = DS4_N_HEAD_DIM, Dv = DS4_N_VALUE_DIM, E = DS4_N_EMBD;
+    ds4_mimo_tp_slices *sl = xcalloc(1, sizeof(*sl));
+    uint8_t *base = NULL;
+    uint64_t total = 0, max_bytes = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        uint64_t off = 0;
+        for (uint32_t il = 0; il < n_trunk; il++) {
+            const ds4_tensor *qkv = e->weights.layer[il].attn_qkv, *o = e->weights.layer[il].attn_output;
+            const uint64_t kv = mimo_layer_kv(il), kvl = kv / 2u;
+            const uint64_t qrb = qkv->bytes / qkv->dim[1], orb = o->bytes / o->dim[1];
+            const uint64_t cols = o->dim[0], lcols = Hl * Dv, lrb = orb * lcols / cols, c0 = orb * rank * lcols / cols;
+            const uint64_t rows[3] = { Hl * Dk, kvl * Dk, kvl * Dv };
+            const uint64_t src0[3] = { rank * Hl * Dk, H * Dk + rank * kvl * Dk, H * Dk + kv * Dk + rank * kvl * Dv };
+            if (orb * lcols % cols || orb * rank * lcols % cols || H % 2u || kv % 2u) {
+                snprintf(err, errlen, "MiMo TP: layer %u attention does not split into block-aligned halves", il);
+                free(sl);
+                return NULL;
+            }
+            off = (off + 255u) & ~(uint64_t)255u;
+            ds4_tensor *t = &sl->qkv[il];
+            *t = (ds4_tensor){ .ndim = 2, .dim = { qkv->dim[0], rows[0] + rows[1] + rows[2] }, .type = qkv->type,
+                               .abs_offset = off, .bytes = (rows[0] + rows[1] + rows[2]) * qrb };
+            t->elements = t->dim[0] * t->dim[1];
+            for (int i = 0; pass && i < 3; i++) {
+                memcpy(base + off, e->model.map + qkv->abs_offset + src0[i] * qrb, rows[i] * qrb);
+                off += rows[i] * qrb;
+            }
+            if (!pass) off += t->bytes;
+            if (t->bytes > max_bytes) max_bytes = t->bytes;
+            off = (off + 255u) & ~(uint64_t)255u;
+            t = &sl->o[il];
+            *t = (ds4_tensor){ .ndim = 2, .dim = { lcols, E }, .type = o->type, .abs_offset = off, .bytes = E * lrb };
+            t->elements = t->dim[0] * t->dim[1];
+            for (uint64_t r = 0; pass && r < E; r++) {
+                memcpy(base + off + r * lrb, e->model.map + o->abs_offset + r * orb + c0, lrb);
+            }
+            off += E * lrb;
+            if (t->bytes > max_bytes) max_bytes = t->bytes;
+        }
+        if (pass) break;
+        total = (off + 16383u) & ~(uint64_t)16383u;
+        base = mmap(NULL, (size_t)total, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (base == MAP_FAILED) {
+            snprintf(err, errlen, "MiMo TP: cannot allocate %" PRIu64 " bytes of attention slices", total);
+            free(sl);
+            return NULL;
+        }
+    }
+    sl->map.map = base;
+    sl->map.size = total;
+    sl->map.max_tensor_bytes = max_bytes;
+    if (!ds4_gpu_set_model_map_range(base, total, 0, total, max_bytes)) {
+        snprintf(err, errlen, "MiMo TP: attention slices map setup failed");
+        munmap(base, (size_t)total);
+        free(sl);
+        return NULL;
+    }
+    ds4_log(stderr, DS4_LOG_OK, "MiMo TP rank %u: %u heads, %.2f GiB of attention slices", rank, (uint32_t)Hl,
+            (double)total / 1073741824.0);
+    return sl;
+}
+#endif
+
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen) {
 #ifndef DS4_HAS_DEEPSEEK41_GPU
     (void)e; (void)tp;
@@ -74755,6 +74896,12 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     /* Reuse the existing half-logit frames for V4.1 on CUDA as well. */
     e->tp.vocab_split = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 ||
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && e->backend == DS4_BACKEND_CUDA);
+#ifdef DS4_HAS_MIMO_GPU
+    if (ds4_model_is_mimo() && !e->mimo_tp_slices &&
+        !(e->mimo_tp_slices = mimo_tp_slices_build(e, (uint32_t)ds4_tp_rank(tp), err, errlen))) {
+        goto fail;
+    }
+#endif
     e->tp.ctx = tp;
     e->tp.rank = ds4_tp_rank(tp);
     e->tp.eval_seq = 0;
@@ -75167,7 +75314,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         if (!mimo_graph_alloc(&s->mimo_graph, &e->weights, (uint32_t)ctx_size, cap_tokens, e->glm_mtp,
                               e->dflash_ready ? &e->dflash : NULL, &e->mtp_model,
-                              share && arena_fits ? e->mimo_shared_workspace : NULL)) {
+                              share && arena_fits ? e->mimo_shared_workspace : NULL, e->tp.active ? 2u : 0u)) {
             free(s);
             return 1;
         }
@@ -75176,6 +75323,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             mimo_graph_transfer_scratch(e->mimo_shared_workspace, &s->mimo_graph);
         }
         if (!s->mimo_graph.owns_scratch) e->mimo_arena_users++;
+        if (e->tp.active) {
+            s->mimo_graph.tp_rank = (uint32_t)e->tp.rank;
+            s->mimo_graph.tp_out = e->tp.out_views;
+            s->mimo_graph.tp_in = e->tp.in_views;
+            s->mimo_graph.tp_slices = e->mimo_tp_slices;
+        }
         mimo_graph_reset(&s->mimo_graph);
         s->mimo_graph_ready = true;
         s->prefill_cap = (uint32_t)ctx_size;
@@ -76631,7 +76784,7 @@ static bool mimo_graph_forward_batch(ds4_decode_item *items, int count, ds4_mimo
              ds4_gpu_add_rms_norm_weight_rows_tensor(a->xn, a->h, a->h, a->blk, m->map, m->size, l->ffn_norm->abs_offset,
                                                      E, N, DS4_RMS_EPS) &&
              (ds4_mimo_layer_is_dense(il) ? mimo_graph_dense_ffn(a, m, l, N) && ds4_gpu_add_tensor(a->h, a->h, a->blk, N * E)
-                                          : mimo_graph_moe(a, m, l, a->h, N));
+                                          : mimo_graph_moe(a, m, l, a->h, il, N));
     }
     return ok && mimo_graph_head(a, m, w, a->h, w->output_norm, 0u, N);
 }
@@ -76639,8 +76792,9 @@ static bool mimo_graph_forward_batch(ds4_decode_item *items, int count, ds4_mimo
 /* DS4_MIMO_SESSION_BATCH=0 keeps the ordered fallback */
 static bool mimo_graph_native_session_batch_check(ds4_decode_item *items, int count, const ds4_engine *e) {
     const char *env = getenv("DS4_MIMO_SESSION_BATCH");
+    /* TP ranks decode sessions one by one: the worker's gates follow the leader's order */
     if ((env && env[0] && strcmp(env, "0") == 0) || count < 2 || count > (int)DS4_MIMO_BATCH_MAX_ROWS ||
-        !e->mimo_shared_workspace || e->mimo_shared_workspace->cap_tokens < (uint32_t)count) {
+        e->tp.active || !e->mimo_shared_workspace || e->mimo_shared_workspace->cap_tokens < (uint32_t)count) {
         return false;
     }
     for (int i = 0; i < count; i++) {
