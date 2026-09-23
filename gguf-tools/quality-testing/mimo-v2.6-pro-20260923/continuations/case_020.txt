@@ -1,0 +1,5 @@
+# Binary Search: Finding the Insertion Point
+
+## Core Concept
+
+Binary search finds the insertion point in a sorted array

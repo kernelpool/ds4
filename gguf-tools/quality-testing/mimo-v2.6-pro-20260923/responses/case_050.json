@@ -1,0 +1,28 @@
+{
+  "id": "a7e42bee-40df-4f84-b71c-ee88fe9eb8ef_daa2393b44f14b318ae0080592673876",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Ecco cinque misure iniziali per diagnosticare e mitigare il problema di decodifica lenta a",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146814,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 35,
+    "total_tokens": 59,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

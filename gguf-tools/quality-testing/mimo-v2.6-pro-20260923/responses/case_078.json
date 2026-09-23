@@ -1,0 +1,28 @@
+{
+  "id": "e8a7464d-5ed7-4ce1-be95-80c514896a2e_1094d49c90bd4e548933461a5a22a486",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. Spieghiamo questo concetto in modo chiaro e approfondito.\n\nL'errore",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146917,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 33,
+    "total_tokens": 57,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,3 @@
+# How a Hash Table Handles Collisions
+
+A **collision** occurs when two different keys produce the same hash index.

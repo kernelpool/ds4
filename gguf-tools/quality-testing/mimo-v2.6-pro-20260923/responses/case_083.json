@@ -1,0 +1,28 @@
+{
+  "id": "46b318d7-b977-43f3-8d90-a8cb56af02ef_b144a1f03aed432fa97dd9fcadae00e8",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Here are a few ways to translate this into Italian, depending on the context (formal vs. informal):\n\n**Most",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146932,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 24,
+    "total_tokens": 48,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

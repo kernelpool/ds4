@@ -1,0 +1,28 @@
+{
+  "id": "139d7421-1246-45d5-9581-7e02a9a4c77b_4cfe146f48454d8998819ad99d9b079a",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. La differenza tra righe KV (Key-Value) raw e compresse è fondamentale nell",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146842,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 27,
+    "total_tokens": 51,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "40a1c5e0-21df-4459-8727-d5cf555317a9_a7c41fce7ede4d9cb1da17c105b37e0e",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Here are the first five measurements to take when diagnosing slow generation at long context:\n\n1. **Time-to-first-token",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146784,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 26,
+    "total_tokens": 50,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

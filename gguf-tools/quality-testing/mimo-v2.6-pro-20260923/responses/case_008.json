@@ -1,0 +1,28 @@
+{
+  "id": "82ff2978-1bbd-4fbb-8615-729629b8a89d_31eca32082cd46f4a584649d09f164e8",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "At first glance, this seems counter-intuitive. **Prefill** processes thousands of tokens at once (high compute load",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146683,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 25,
+    "total_tokens": 49,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,1 @@
+Certamente. Spieghiamo perché un array ordinato rende la ricerca di appartenenza (cioè ver

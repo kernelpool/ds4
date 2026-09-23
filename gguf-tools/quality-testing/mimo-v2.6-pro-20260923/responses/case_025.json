@@ -1,0 +1,28 @@
+{
+  "id": "94f6c6f1-d311-4334-a0ef-90b73f40f270_34440488700a4363a501aa09e822a710",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "# Ring Buffer (Circular Buffer)\n\n## Core Concept\n\nA ring buffer is a fixed-size array treated as if the two",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146739,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 25,
+    "total_tokens": 49,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

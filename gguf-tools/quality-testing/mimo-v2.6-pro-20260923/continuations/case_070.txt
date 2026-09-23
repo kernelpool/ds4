@@ -1,0 +1,1 @@
+Ecco una soluzione semplice ed efficace che utilizza la funzione `sorted()` per ordinare i numer

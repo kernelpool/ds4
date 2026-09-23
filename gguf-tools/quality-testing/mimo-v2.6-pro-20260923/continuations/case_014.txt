@@ -1,0 +1,5 @@
+# Cache KV su disco nelle sessioni agentiche
+
+## Il problema fondamentale
+
+Le sessioni agentic

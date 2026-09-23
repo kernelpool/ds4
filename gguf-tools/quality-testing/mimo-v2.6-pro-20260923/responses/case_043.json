@@ -1,0 +1,28 @@
+{
+  "id": "c3a8d2c9-eb9a-4711-be0d-da6d6cb0b5bd_9ddc523059684ab494c1c3685466d71b",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "```json\n{\n  \"$schema\": \"http://json-schema.org/draft-07/schema#\",\n  \"",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146790,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 23,
+    "total_tokens": 47,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

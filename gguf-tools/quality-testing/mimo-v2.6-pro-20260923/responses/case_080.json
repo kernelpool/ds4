@@ -1,0 +1,28 @@
+{
+  "id": "9292908e-27ca-4bbd-8e90-999c9cae483b_b14036b9fc0c4810918121e6a7ceb282",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "A good benchmark should measure **what matters.**\n\nHere is a breakdown of what that means in different contexts:\n\n*  ",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146925,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 18,
+    "total_tokens": 42,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

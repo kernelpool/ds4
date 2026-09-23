@@ -1,0 +1,1 @@
+In Metal (and graphics programming in general), the instinct is often to allocate one massive buffer to minimize draw calls and memory

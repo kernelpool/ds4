@@ -1,0 +1,28 @@
+{
+  "id": "a8d24c3c-5a1a-49ed-9c13-4b2b23297dba_e7df88ece2f842669c1f705d4e51340f",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "# Binary Search on Sorted Arrays\n\n## The Core Idea\n\nA **membership test** asks: *\"Is this value in",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146860,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 22,
+    "total_tokens": 46,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

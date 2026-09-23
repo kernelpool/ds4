@@ -1,0 +1,28 @@
+{
+  "id": "9cf27313-e863-4ffc-8ec8-2c8c9150115f_17f35c0b15684a7893b12958fd5f93de",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "La **ricerca binaria del punto di inserimento** (spesso chiamata *binary search for insertion point",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146756,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 27,
+    "total_tokens": 51,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

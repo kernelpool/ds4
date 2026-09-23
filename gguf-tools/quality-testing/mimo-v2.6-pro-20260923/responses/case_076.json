@@ -1,0 +1,28 @@
+{
+  "id": "09d265eb-2ef9-426f-95c4-82e6dc85b95e_3e355b0ab54c4563a34d22819ab2f1cc",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Testare un parser da riga di comando (CLI) è fondamentale perché è il punto di ingresso dell",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146911,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 26,
+    "total_tokens": 50,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

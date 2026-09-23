@@ -1,0 +1,28 @@
+{
+  "id": "503b61b8-26ee-4a9d-b4bf-2ff54dab4693_7f5e8ae752af43d38a6c495cada88b1a",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "The fundamental difference between a **mutex** and an **atomic counter** lies in their **scope** and **complexity",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146732,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 21,
+    "total_tokens": 45,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

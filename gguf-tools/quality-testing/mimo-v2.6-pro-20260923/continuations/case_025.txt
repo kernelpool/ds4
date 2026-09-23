@@ -1,0 +1,5 @@
+# Ring Buffer (Circular Buffer)
+
+## Core Concept
+
+A ring buffer is a fixed-size array treated as if the two

@@ -1,0 +1,1 @@
+Of course. This is an excellent and subtle question that gets to the heart of how quantization interacts with model architecture and

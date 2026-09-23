@@ -1,0 +1,28 @@
+{
+  "id": "2c44c9b6-fbbb-48ed-8346-0d085370572e_71d8ae1a652b447382f416ffd4a5fa4a",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Speculative decoding preserves exact greedy output through a **verification step** that ensures the final tokens match what the target model would",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146681,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 20,
+    "total_tokens": 44,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,7 @@
+# Latency vs. Throughput
+
+These are two fundamental performance metrics that measure different aspects of a system.
+
+---
+
+##

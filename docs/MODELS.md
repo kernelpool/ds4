@@ -151,7 +151,8 @@ MiMo-V2.6 Flash runs on Metal from the `mimo2` GGUFs written by
 experts unchanged. The MTP blocks are part of the
 main GGUF (`--mtp`); the DFlash drafter is a separate sidecar passed with
 `--mtp-model`, and the vision encoder another one passed with `--vision`.
-See [MiMo setup](MIMO_V26.md).
+MiMo-V2.6 Pro uses the same converter and runs over two-Mac tensor
+parallelism. See [MiMo setup](MIMO_V26.md).
 
 ## GLM 5.3 Flash
 

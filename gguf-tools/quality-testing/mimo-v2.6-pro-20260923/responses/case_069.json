@@ -1,0 +1,28 @@
+{
+  "id": "6817632f-38f2-4626-a7b6-a8c4fa1fe1cf_ea7d00b98a084f50b8e7a7efe69092ef",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "- Ownership and lifetimes\n  - Are lifetimes tied to the right owner (not to a temporary or a shorter",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146887,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 24,
+    "total_tokens": 48,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

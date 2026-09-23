@@ -1,0 +1,28 @@
+{
+  "id": "c0cd0081-fc63-4059-b7dc-382a9f46e9d2_6cad7c2ce9af403fa42462f515d72e77",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "A **Trie** (pronounced \"try,\" derived from \"re**trie**val\") represents a set of",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146876,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 19,
+    "total_tokens": 43,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

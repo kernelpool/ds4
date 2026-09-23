@@ -1,0 +1,28 @@
+{
+  "id": "3e3bd78f-0d38-4dc7-94b5-5bb30d1387fb_fadc2dfdb5624d51932af1dc2cc3682a",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Of course. Here is a brief plan for testing long-context prompt chunking.\n\n---\n\n### **Plan for Testing Long-",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146742,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 21,
+    "total_tokens": 45,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

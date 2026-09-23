@@ -1,0 +1,1 @@
+Ecco un esempio classico di **Race Condition** in C utilizzando i thread POSIX (`pthreads

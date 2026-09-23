@@ -1,0 +1,28 @@
+{
+  "id": "02b15a36-ec80-401a-9f3b-7c5f0dad9cfe_edae50dc3dbe42dfbd39637ba4307ce3",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Here are three invariants for a tokenizer special-token table, ranging from structural integrity to semantic consistency.\n\n### 1.",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146687,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 20,
+    "total_tokens": 44,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

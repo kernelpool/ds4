@@ -1,0 +1,28 @@
+{
+  "id": "6f926cde-517a-46cd-b079-44b4bad82fdb_eaf5b9e81561456fb43c966ac60dc5ac",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "On macOS (specifically Apple Silicon), the difference between **mmaping** model weights and **copying** them",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146658,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 24,
+    "total_tokens": 48,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

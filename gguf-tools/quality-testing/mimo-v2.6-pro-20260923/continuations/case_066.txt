@@ -1,0 +1,1 @@
+Testing a command-line (CLI) parser is critical because the CLI is the primary interface for users and automation scripts. A

@@ -1,0 +1,28 @@
+{
+  "id": "27175f67-857f-4894-b35b-13681c7f01c3_f1132deb829140d5833fb97da28e697a",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. Ottima domanda, tocca un concetto fondamentale della gestione della memoria nei moderni",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146914,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 29,
+    "total_tokens": 53,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "18588abf-a8b7-423a-9ab7-fa168946eb54_a8662f0dedff4b55a341ca1db6baf6f0",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Un **trie** (pronunciato \"try\", dall'inglese *retrieval*) rappresenta un",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146907,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 22,
+    "total_tokens": 46,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

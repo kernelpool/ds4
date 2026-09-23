@@ -1,0 +1,1 @@
+Checksums catch accidental corruption because they create a compact, unique "fingerprint" of the original data based on its specific

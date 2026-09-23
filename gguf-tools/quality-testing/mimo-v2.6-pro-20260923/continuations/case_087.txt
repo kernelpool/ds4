@@ -1,0 +1,1 @@
+Of course. Here are three examples of useful server metrics, chosen because they cover the primary resources of a server: CPU

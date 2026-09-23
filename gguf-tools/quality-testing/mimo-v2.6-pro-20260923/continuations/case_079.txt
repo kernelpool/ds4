@@ -1,0 +1,1 @@
+Ecco una checklist sintetica e pratica per revisionare la gestione della memoria (lifetime) in una Pull

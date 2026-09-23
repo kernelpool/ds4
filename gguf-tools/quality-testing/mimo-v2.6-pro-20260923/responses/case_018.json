@@ -1,0 +1,28 @@
+{
+  "id": "27c6c1de-dc37-4b48-a5a1-7fc8692ed253_06762dcaabe3445ba9186b97f4ed4fe6",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Certamente. Spieghiamo perché il **prefill GPU** è quasi sempre molto più veloce del **decode",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146721,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 31,
+    "total_tokens": 55,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

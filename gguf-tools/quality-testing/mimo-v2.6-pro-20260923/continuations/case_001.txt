@@ -1,0 +1,3 @@
+Here is a concise design for a TCP echo server optimized for slow clients.
+
+### 1. Architecture: Non-Blocking

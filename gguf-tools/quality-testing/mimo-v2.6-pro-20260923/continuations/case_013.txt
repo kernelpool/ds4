@@ -1,0 +1,3 @@
+# Derivazione di RMSNorm: somma dei quadrati e riscalamento
+
+## 1. Obiet

@@ -1,0 +1,28 @@
+{
+  "id": "4f721151-165f-4453-a876-1394219f763d_f1d1ebf3a6b34263b0602d4e3608ba35",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Valutare 50 prompt (o un set ampio di prompt) è molto più utile di focalizz",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146852,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 31,
+    "total_tokens": 55,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,1 @@
+La **ricerca binaria del punto di inserimento** (spesso chiamata *binary search for insertion point

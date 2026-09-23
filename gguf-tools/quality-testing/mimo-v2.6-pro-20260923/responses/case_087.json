@@ -1,0 +1,28 @@
+{
+  "id": "31cfcc50-786f-4887-a353-2acd7633ffe7_18e3627491ec434f9249e7e6cbe3cdbc",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Of course. Here are three examples of useful server metrics, chosen because they cover the primary resources of a server: CPU",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146943,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 17,
+    "total_tokens": 41,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

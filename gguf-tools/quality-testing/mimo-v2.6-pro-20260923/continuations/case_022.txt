@@ -1,0 +1,1 @@
+The fundamental difference between a **mutex** and an **atomic counter** lies in their **scope** and **complexity

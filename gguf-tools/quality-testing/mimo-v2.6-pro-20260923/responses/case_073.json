@@ -1,0 +1,28 @@
+{
+  "id": "2ddee9f2-d8ec-4702-ac91-424b78f78be5_d912d3fc512a4791b9d1b1ee728d6440",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Ecco un esempio classico di **Race Condition** in C utilizzando i thread POSIX (`pthreads",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146902,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 22,
+    "total_tokens": 46,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

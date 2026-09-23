@@ -1,0 +1,1 @@
+The difference between **virtual address space size** and **page residency** in `mmap` stems from the fundamental design

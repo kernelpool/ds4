@@ -1,0 +1,28 @@
+{
+  "id": "af3950f9-aeab-4013-9528-613b08e5159f_694d5f1330654639aae6395bcb4f9ab8",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "In Metal (and graphics programming in general), the instinct is often to allocate one massive buffer to minimize draw calls and memory",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146797,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 24,
+    "total_tokens": 48,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

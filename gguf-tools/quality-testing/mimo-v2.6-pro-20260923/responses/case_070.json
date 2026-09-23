@@ -1,0 +1,28 @@
+{
+  "id": "8cf50fc7-1d52-4c8e-b08c-557f9223d056_06d5a32cff7e477db5c5352a5128c53b",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Ecco una soluzione semplice ed efficace che utilizza la funzione `sorted()` per ordinare i numer",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146891,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 30,
+    "total_tokens": 54,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "dd6c77ca-f1e3-426e-b95e-bd556ae5c932_cc2c5f59af7142419d3c4c991b3dac3e",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "When quantizing a neural network (converting it from high-precision floating-point, like FP32, to low",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146956,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 22,
+    "total_tokens": 46,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

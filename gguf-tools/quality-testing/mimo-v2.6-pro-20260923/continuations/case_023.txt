@@ -1,0 +1,1 @@
+In the context of a network server, **backpressure** is a mechanism used to handle situations where the server receives data

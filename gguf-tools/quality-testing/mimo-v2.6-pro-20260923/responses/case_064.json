@@ -1,0 +1,28 @@
+{
+  "id": "5aaaf1c5-985a-4aa0-9b7f-32799f096b37_ad0b3f6f37b14ee1ba96d3f84d2644a0",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "# Latency vs. Throughput\n\nThese are two fundamental performance metrics that measure different aspects of a system.\n\n---\n\n##",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146870,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 18,
+    "total_tokens": 42,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

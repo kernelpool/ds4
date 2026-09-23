@@ -1,0 +1,1 @@
+On macOS (specifically Apple Silicon), the difference between **mmaping** model weights and **copying** them

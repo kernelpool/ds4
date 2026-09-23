@@ -1,0 +1,1 @@
+Ecco uno schema JSON minimo per una tool call, che include il nome della funzione e i suoi argoment

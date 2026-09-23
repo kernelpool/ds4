@@ -1,0 +1,28 @@
+{
+  "id": "b9cfb03a-69be-4204-9eb7-5479bfa16909_77d0445c09fc4d7787a4c1f31a1e26f8",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "In the context of distributed databases and storage engines (such as TiKV, RocksDB, or similar Key-Value stores",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146803,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 21,
+    "total_tokens": 45,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

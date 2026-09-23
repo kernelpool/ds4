@@ -1,0 +1,28 @@
+{
+  "id": "7036ddf7-2a41-404d-9d42-3c423a4c2334_3a668a8941f44ee78712ec8fd2b84b6f",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Testing a command-line (CLI) parser is critical because the CLI is the primary interface for users and automation scripts. A",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146879,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 21,
+    "total_tokens": 45,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

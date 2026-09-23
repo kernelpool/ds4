@@ -1,0 +1,1 @@
+Ecco una funzione semplice ed efficiente che utilizza l'operatore ternario per limitare il valore

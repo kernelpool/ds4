@@ -1,0 +1,1 @@
+Certamente! Spieghiamo in dettaglio come funziona l'inserimento in un B-tree,

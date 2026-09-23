@@ -1,0 +1,28 @@
+{
+  "id": "5ab5f7da-7abc-4dff-8922-8709d25df7f1_e84b854cd4844ae0853071df4014c92e",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Of course! Here is a confidence interval explained in plain language.\n\n### The Simple Analogy: The Poll\n\nImagine you",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146963,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 19,
+    "total_tokens": 43,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

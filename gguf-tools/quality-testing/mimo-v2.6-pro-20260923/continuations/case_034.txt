@@ -1,0 +1,1 @@
+Salvare l'header di un checkpoint (che contiene metadati come versione del modello, iper

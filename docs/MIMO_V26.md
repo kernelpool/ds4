@@ -26,6 +26,18 @@ exposes `mimo-v2.6-flash`, `mimo-v2.6-flash-chat` and
 of their own and opens the assistant turn with `<think>`, which the model
 otherwise emits itself.
 
+## Pro
+
+MiMo-V2.6 Pro RL (70 layers, 6144 wide, 384 experts, 128 query heads) runs
+on the same graph. Its MXFP4 GGUF does not fit one Mac, so it runs over
+[tensor parallelism between two Macs](DISTRIBUTED.md#tensor-parallelism-between-two-macs):
+each rank keeps half of the attention heads (their QKV rows and output
+columns are copied into rank-local buffers at startup), the KV cache of
+those heads, half of the routed experts and half of the vocabulary head.
+Decode gates release inside the command buffer, which is committed every two
+layers. Under tensor parallelism MiMo runs without vision, drafters and
+session batching.
+
 ## Speculative decoding
 
 Two drafters are available; use one of them.
@@ -72,7 +84,8 @@ separately.
 ## Quality
 
 The release GGUFs are scored on official continuations collected from the
-Xiaomi platform with thinking disabled, using the shared scorer:
+Xiaomi platform with thinking disabled, using the shared scorer (Pro:
+`mimo-v2.6-pro-20260923`, with the tensor-parallel options added):
 
 ```sh
 gguf-tools/quality-testing/score_official MiMo-V2.6-Flash-MXFP4.gguf \
@@ -88,7 +101,8 @@ the reference prompts must stay identical to plain decoding.
 
 ## Limits
 
-Tensor parallelism, SSD streaming, DSpark and CUDA are not supported yet.
+SSD streaming, DSpark and CUDA are not supported yet; see [Pro](#pro) for
+what tensor parallelism leaves out.
 The server's disk KV cache saves and restores MiMo sessions (the MTP chain
 replays its rows after a restore; the DFlash context of the last window
 positions is saved with the session). `ds4-server --batched-session N` decodes the slots

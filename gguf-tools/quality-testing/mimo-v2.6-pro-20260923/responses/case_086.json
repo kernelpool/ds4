@@ -1,0 +1,28 @@
+{
+  "id": "c1853972-2300-466d-a9f8-5657beba2996_6c17c5af77994b1fadc26118d66c3157",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Checksums catch accidental corruption because they create a compact, unique \"fingerprint\" of the original data based on its specific",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146941,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 21,
+    "total_tokens": 45,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

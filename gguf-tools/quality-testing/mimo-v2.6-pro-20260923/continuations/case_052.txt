@@ -1,0 +1,1 @@
+Certamente! Spieghiamo l'**online softmax** (o **safe softmax**) in modo semplice,

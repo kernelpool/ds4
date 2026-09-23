@@ -207,6 +207,11 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   logprobs; do not report the empty `api_*` columns. Also confirm that
   `--mtp` and `--mtp-model` greedy outputs equal plain decoding on a short
   and a long prompt.
+- Run the 100-case MiMo-V2.6 Pro fixture over two-Mac tensor parallelism
+  (`gguf-tools/quality-testing/mimo-v2.6-pro-20260923`, the same command plus
+  `--tensor-parallel --role coordinator --listen HOST PORT --transport rdma`
+  and a `ds4` worker). The MXFP4 reference is average NLL `0.254160559`,
+  first-token match `94/100`, and average greedy prefix `17.16`.
 - For GLM 5.3 attention changes, also run the eight long Z.AI FP8 cases.
   First run `python3 gguf-tools/quality-testing/render_glm_references.py
   gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-long`, then

@@ -1,0 +1,28 @@
+{
+  "id": "42a4762d-0457-495d-9a7d-0b84f4d24080_9e2c977e117b4f32a7857e8d8c616a11",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "To derive why RMSNorm (Root Mean Square Normalization) requires a **sum of squares** and a **scaling pass",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146661,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 24,
+    "total_tokens": 48,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

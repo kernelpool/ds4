@@ -1,0 +1,28 @@
+{
+  "id": "8fa26846-d6da-4466-a387-8aeeb1dff92a_1f7b17fd34cc41a88dd719a79b925fcc",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "# Ring Buffer (Buffer Circolare)\n\n## Concetto Fondamentale\n\nUn **ring buffer** (o circular",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146769,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 30,
+    "total_tokens": 54,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

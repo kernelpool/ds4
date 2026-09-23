@@ -1,0 +1,28 @@
+{
+  "id": "bba6fdce-e576-441f-9740-f3ebdaec8ee7_1e160f0fdf19488d80a9b91857ade60c",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "To test that a file-backed `mmap` is not repeatedly remapped (i.e., the virtual memory mapping remains",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146795,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 24,
+    "total_tokens": 48,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

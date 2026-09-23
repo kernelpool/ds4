@@ -1,0 +1,5 @@
+# Binary Search on Sorted Arrays
+
+## The Core Idea
+
+A **membership test** asks: *"Is this value in

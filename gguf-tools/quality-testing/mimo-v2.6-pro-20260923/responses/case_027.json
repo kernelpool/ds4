@@ -1,0 +1,28 @@
+{
+  "id": "a73d1f5b-8904-4e23-9e30-9cc54a5a62d6_266539f94b1c4693b4d7a6884a88f330",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "In the context of low-bit quantization (specifically **Weight-Only Quantization**), an **Importance Matrix",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146745,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 20,
+    "total_tokens": 44,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

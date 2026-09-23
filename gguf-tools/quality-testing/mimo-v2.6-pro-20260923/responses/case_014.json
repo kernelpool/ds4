@@ -1,0 +1,28 @@
+{
+  "id": "19e6ee27-29ef-4c63-8d95-8a230acdbf44_04baa42e87ce46b792d767f3aac91d99",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "# Cache KV su disco nelle sessioni agentiche\n\n## Il problema fondamentale\n\nLe sessioni agentic",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146711,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 28,
+    "total_tokens": 52,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

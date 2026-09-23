@@ -1,0 +1,28 @@
+{
+  "id": "c0bc40ae-8336-4962-94ea-b2504a2a30c4_1814edf1c3a34075b0a6e36409ff4e33",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "# Derivazione di RMSNorm: somma dei quadrati e riscalamento\n\n## 1. Obiet",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146709,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 28,
+    "total_tokens": 52,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

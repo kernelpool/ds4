@@ -1,0 +1,28 @@
+{
+  "id": "8fd1b106-d97a-4831-8815-0a59666bb3e5_0febfde4334446acbc5c6fa0c9a5292f",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "# Online Softmax in Attention\n\n## The Problem: Memory\n\nStandard softmax requires **two passes** over the data:\n",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146788,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 19,
+    "total_tokens": 43,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

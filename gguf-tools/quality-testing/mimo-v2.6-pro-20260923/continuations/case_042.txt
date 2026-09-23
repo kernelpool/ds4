@@ -1,0 +1,5 @@
+# Online Softmax in Attention
+
+## The Problem: Memory
+
+Standard softmax requires **two passes** over the data:

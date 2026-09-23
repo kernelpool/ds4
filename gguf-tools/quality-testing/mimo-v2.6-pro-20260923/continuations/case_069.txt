@@ -1,0 +1,2 @@
+- Ownership and lifetimes
+  - Are lifetimes tied to the right owner (not to a temporary or a shorter

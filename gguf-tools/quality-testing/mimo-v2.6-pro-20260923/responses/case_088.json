@@ -1,0 +1,28 @@
+{
+  "id": "c72d85c5-0de4-4856-bcba-5625e5ecf334_1f0d4e1eeb444b9a900526cc1b4d37bd",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "A tokenizer must treat special tags (like `<s>`, `</s>`, `<pad>`, `<mask>",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146947,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 18,
+    "total_tokens": 42,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

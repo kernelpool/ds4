@@ -1,0 +1,28 @@
+{
+  "id": "1b06f01a-18fc-4bce-8b93-d9c0c5f96c5c_fa12af4cf6f24aef9e283ba72276aa2a",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "Nel contesto della quantizzazione low-bit (ad esempio da 16-bit a 4-bit o",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146777,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 24,
+    "total_tokens": 48,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

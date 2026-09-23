@@ -1,0 +1,1 @@
+Un **trie** (pronunciato "try", dall'inglese *retrieval*) rappresenta un

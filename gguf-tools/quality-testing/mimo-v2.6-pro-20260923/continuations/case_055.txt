@@ -1,0 +1,1 @@
+Certamente. Spieghiamo perché un grande buffer Metal (o di qualsiasi API grafica moderna)

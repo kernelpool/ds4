@@ -1,0 +1,1 @@
+Ecco un progetto conciso per un **Server TCP Echo** in **Python** che gestisce correttamente

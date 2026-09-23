@@ -1,0 +1,3 @@
+Here is a short example using **pthreads**.
+
+In this code, two threads try to increment the same global variable

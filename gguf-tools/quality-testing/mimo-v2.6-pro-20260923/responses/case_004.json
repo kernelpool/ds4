@@ -1,0 +1,28 @@
+{
+  "id": "39310378-c2d9-4e58-9bd0-ff0a26eca0a2_58257a70d7d4494b8bb7f3d33eb27213",
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "message": {
+        "content": "**KV (Key-Value) cache checkpointing** is a technique used to optimize Large Language Model (LLM)",
+        "role": "assistant",
+        "tool_calls": null
+      }
+    }
+  ],
+  "created": 1790146667,
+  "model": "mimo-v2.6-pro",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 24,
+    "prompt_tokens": 21,
+    "total_tokens": 45,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

@@ -1,0 +1,4 @@
+Here is a short, standard C function to clamp an integer.
+
+```c
+int clamp(int value, int min,

@@ -23,7 +23,8 @@ latency, but the gain depends on the model, link, and comparison setup.
 
 Two 128 GB Macs are useful for V4 Flash Q4/MXFP4 or GLM 5.3 Flash Q4.
 GLM 5.2 IQ2_XXS is another tested capacity setup. V4.1 Flash Q2 also runs
-on two 128 GB Macs, with disk-only Engram tables.
+on two 128 GB Macs, with disk-only Engram tables. MiMo-V2.6 Pro MXFP4 needs
+two 512 GB Macs.
 A larger quant may need larger machines even though its tensor layout is supported.
 
 ### Link setup
@@ -91,7 +92,8 @@ workers run `ds4`. For models with vision support, pass the same `--vision FILE`
 to both for image input.
 For GLM MTP, enable `--mtp` on both. For DeepSeek DSpark, both need the
 matching support model and DSpark options. V4.1 supports vision but not
-speculative decoding.
+speculative decoding. MiMo-V2.6 splits its attention heads too and runs
+text-only, without its drafters.
 
 TP disk-cache restore currently rebuilds the exact saved token prefix on both
 ranks rather than restoring the coordinator alone. Expect prefill on restore.
