@@ -1196,6 +1196,10 @@ static bool model_alias_disables_thinking(const char *model) {
             !strcmp(model, "mimo-v2.6-flash-no-think") ||
             !strcmp(model, "mimo-v2.6-flash-nothink") ||
             !strcmp(model, "xiaomi/mimo-v2.6-flash-chat") ||
+            !strcmp(model, "mimo-v2.6-pro-chat") ||
+            !strcmp(model, "mimo-v2.6-pro-no-think") ||
+            !strcmp(model, "mimo-v2.6-pro-nothink") ||
+            !strcmp(model, "xiaomi/mimo-v2.6-pro-chat") ||
             !strcmp(model, "glm-5.2-chat") ||
             !strcmp(model, "glm-5.2-no-think") ||
             !strcmp(model, "glm-5.2-nothink") ||
@@ -1213,6 +1217,8 @@ static bool model_alias_enables_thinking(const char *model) {
             !strcmp(model, "qwen/qwen3.8-flash-next-reasoner") ||
             !strcmp(model, "mimo-v2.6-flash-reasoner") ||
             !strcmp(model, "xiaomi/mimo-v2.6-flash-reasoner") ||
+            !strcmp(model, "mimo-v2.6-pro-reasoner") ||
+            !strcmp(model, "xiaomi/mimo-v2.6-pro-reasoner") ||
             !strcmp(model, "glm-5.2-reasoner") ||
             !strcmp(model, "zai/glm-5.2-reasoner") ||
             !strcmp(model, "glm-5.3-flash-reasoner") ||
@@ -1238,7 +1244,8 @@ static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
 static const char *server_model_id_from_engine(ds4_engine *engine) {
     if (ds4_engine_is_deepseek41(engine)) return "deepseek-v4.1-flash";
     if (ds4_engine_is_qwen4(engine)) return "qwen3.8-flash-next";
-    if (ds4_engine_is_mimo(engine)) return "mimo-v2.6-flash";
+    if (ds4_engine_is_mimo(engine))
+        return strstr(ds4_engine_model_name(engine), " Pro") ? "mimo-v2.6-pro" : "mimo-v2.6-flash";
     if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
     if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
     return ds4_engine_model_id(engine) == 1 ?
@@ -1265,6 +1272,14 @@ static bool server_model_alias_known(const char *id) {
             !strcmp(id, "xiaomi/mimo-v2.6-flash") ||
             !strcmp(id, "xiaomi/mimo-v2.6-flash-chat") ||
             !strcmp(id, "xiaomi/mimo-v2.6-flash-reasoner") ||
+            !strcmp(id, "mimo-v2.6-pro") ||
+            !strcmp(id, "mimo-v2.6-pro-chat") ||
+            !strcmp(id, "mimo-v2.6-pro-no-think") ||
+            !strcmp(id, "mimo-v2.6-pro-nothink") ||
+            !strcmp(id, "mimo-v2.6-pro-reasoner") ||
+            !strcmp(id, "xiaomi/mimo-v2.6-pro") ||
+            !strcmp(id, "xiaomi/mimo-v2.6-pro-chat") ||
+            !strcmp(id, "xiaomi/mimo-v2.6-pro-reasoner") ||
             !strcmp(id, "deepseek-v4-pro") ||
             !strcmp(id, "glm-5.2") ||
             !strcmp(id, "glm-5.2-chat") ||
@@ -15250,13 +15265,7 @@ static bool send_models(server *s, int fd) {
         append_model_json(&b, s, "qwen3.8-flash-next-chat");
         buf_putc(&b, ',');
         append_model_json(&b, s, "qwen3.8-flash-next-reasoner");
-    } else if (ds4_engine_is_mimo(s->engine)) {
-        append_model_json(&b, s, "mimo-v2.6-flash");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "mimo-v2.6-flash-chat");
-        buf_putc(&b, ',');
-        append_model_json(&b, s, "mimo-v2.6-flash-reasoner");
-    } else if (ds4_engine_is_glm_dsa(s->engine)) {
+    } else if (ds4_engine_is_mimo(s->engine) || ds4_engine_is_glm_dsa(s->engine)) {
         const char *base = server_model_id_from_engine(s->engine);
         char variant[64];
         append_model_json(&b, s, base);
@@ -18329,6 +18338,9 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(server_model_alias_known("glm-5.3-flash"));
     TEST_ASSERT(server_model_alias_known("glm-5.3-flash-chat"));
     TEST_ASSERT(server_model_alias_known("glm-5.3-flash-reasoner"));
+    TEST_ASSERT(model_alias_disables_thinking("mimo-v2.6-pro-chat"));
+    TEST_ASSERT(model_alias_enables_thinking("mimo-v2.6-pro-reasoner"));
+    TEST_ASSERT(server_model_alias_known("xiaomi/mimo-v2.6-pro"));
 }
 
 static void test_api_thinking_controls_parse(void) {

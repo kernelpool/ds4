@@ -20,7 +20,7 @@ The MXFP4 release keeps the checkpoint's own MXFP4 experts (the attention
 and dense weights are Q8_0); it is the lossless option. `--nothink` disables
 thinking. The server
 exposes `mimo-v2.6-flash`, `mimo-v2.6-flash-chat` and
-`mimo-v2.6-flash-reasoner` aliases; tool calls use the model's
+`mimo-v2.6-flash-reasoner` aliases (`mimo-v2.6-pro...` for Pro); tool calls use the model's
 `<tool_call><function=...><parameter=...>` format, and tool results are
 `tool` turns. The chat template puts tool schemas in a leading system turn
 of their own and opens the assistant turn with `<think>`, which the model
