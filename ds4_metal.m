@@ -10212,6 +10212,7 @@ typedef struct {
     void *big_in;
     uint64_t big_bytes;
     uint32_t poll;          /* release through the poll region */
+    uint32_t spin;          /* inline gate: release through the coherent spin word */
 } ds4_gpu_tp_request;
 
 enum { DS4_GPU_TP_QUEUE = 1024 };
@@ -10296,6 +10297,17 @@ static bool g_tp_poll_gates;
 static id<MTLBuffer> g_tp_poll_buffer;         /* release region + status words */
 static volatile uint32_t *g_tp_poll_region;   /* CPU view of the release lines */
 static volatile uint32_t *g_tp_poll_status;   /* per-slot poll result, GPU-written */
+/* Inline decode gates: the partial and the flag are published with
+ * system-coherent stores and kernel_dsv4_tp_release_wait spins inside the open
+ * command buffer on [0] of this buffer ([1] spin count of the last wait, [2]
+ * timeouts), so a token ends no command buffer per gate.
+ * DS4_TP_DISABLE_DECODE_POLL_GATES keeps the flushing poll gates;
+ * DS4_TP_INLINE_SPIN_ITERS bounds the spin (default 8M). */
+static id<MTLBuffer> g_tp_release_buffer;
+static volatile uint32_t *g_tp_release_ptr;
+static bool g_tp_inline_requested;
+int ds4_gpu_tp_decode_inline_gates(void);
+static uint32_t g_tp_spin_max_iters;
 static int g_tp_poll_prev_valid;
 static uint32_t g_tp_poll_prev_slot;
 static uint64_t g_tp_poll_prev_seq;
@@ -10678,7 +10690,16 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                 0.9 * g_tp_exchange_ewma_us[req.gate] + 0.1 * ex_us;
         }
         /* Release the GPU even on failure so end_commands can drain. */
-        if (req.rows > 0) {
+        if (req.spin && g_tp_release_ptr) {
+            __atomic_store_n(&g_tp_release_ptr[0], (uint32_t)req.seq, __ATOMIC_SEQ_CST);
+            /* a timed-out wait opened its gate without the peer partial */
+            if (g_tp_release_ptr[2] != 0 && !g_tp_shutdown) {
+                if (!g_tp_failed_flag)
+                    fprintf(stderr, "ds4: TP release spin timed out before seq %llu (%u gates); failing the eval\n",
+                            (unsigned long long)req.seq, g_tp_release_ptr[2]);
+                g_tp_failed_flag = 1;
+            }
+        } else if (req.rows > 0) {
             const double br0 = profile ? ds4_gpu_now_ms() : 0.0;
             g_tp_batch_cpu_event.signaledValue = req.seq;
             if (profile) g_tp_stat_batch_release_ms += ds4_gpu_now_ms() - br0;
@@ -10834,6 +10855,21 @@ int ds4_gpu_tp_init(uint32_t rank,
             fprintf(stderr, "ds4: TP poll gate buffer failed; using event gates\n");
         }
     }
+    g_tp_release_buffer = nil;
+    g_tp_release_ptr = NULL;
+    if (g_tp_inline_requested && g_tp_flag_gates && getenv("DS4_TP_DISABLE_DECODE_POLL_GATES") == NULL &&
+        ds4_gpu_get_pipeline("kernel_dsv4_tp_release_wait") != nil &&
+        ds4_gpu_get_pipeline("kernel_dsv4_tp_flag_publish") != nil &&
+        ds4_gpu_get_pipeline("kernel_dsv4_tp_payload_publish") != nil) {
+        g_tp_release_buffer = [g_device newBufferWithLength:8 * sizeof(uint32_t)
+                                                    options:MTLResourceStorageModeShared];
+        if (g_tp_release_buffer) {
+            memset(g_tp_release_buffer.contents, 0, 8 * sizeof(uint32_t));
+            g_tp_release_ptr = (volatile uint32_t *)g_tp_release_buffer.contents;
+            g_tp_spin_max_iters =
+                (uint32_t)ds4_gpu_env_u64("DS4_TP_INLINE_SPIN_ITERS", 8000000u, 100000u, 200000000u);
+        }
+    }
     g_tp_gpu_event = [g_device newSharedEvent];
     g_tp_cpu_event = [g_device newSharedEvent];
     g_tp_batch_gpu_event = [g_device newSharedEvent];
@@ -10869,7 +10905,9 @@ int ds4_gpu_tp_init(uint32_t rank,
     }
     pthread_attr_destroy(&attr);
     g_tp_thread_running = 1;
-    if (getenv("DS4_TP_NO_KEEPALIVE") == NULL) {
+    /* The spin kernel keeps the GPU busy; the keep-alive kernels would timeslice
+     * against it (measured ~10x decode regression on the prototype). */
+    if (getenv("DS4_TP_NO_KEEPALIVE") == NULL && !ds4_gpu_tp_decode_inline_gates()) {
         uint32_t ka_tgs = ds4_gpu_tp_keepalive_tgs_from_env();
         g_tp_keepalive_queue = [g_device newCommandQueue];
         g_tp_keepalive_buffer = [g_device newBufferWithLength:(NSUInteger)ka_tgs * 256u * sizeof(float)
@@ -10909,6 +10947,8 @@ void ds4_gpu_tp_shutdown(void) {
     g_tp_poll_buffer = nil;
     g_tp_poll_region = NULL;
     g_tp_poll_status = NULL;
+    g_tp_release_buffer = nil;
+    g_tp_release_ptr = NULL;
 }
 
 void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
@@ -10941,8 +10981,19 @@ static bool ds4_gpu_tp_fold_ctl_ready(void) {
     return true;
 }
 
+void ds4_gpu_tp_request_decode_inline_gates(void) {
+    g_tp_inline_requested = true;
+}
+
+int ds4_gpu_tp_decode_inline_gates(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_TP_DISABLE_DECODE_POLL_GATES") == NULL;
+    return on && g_tp_flag_gates && !g_tp_session_batch_mode && g_tp_release_ptr != NULL;
+}
+
 void ds4_gpu_tp_flag_fold_request(uint32_t layer, uint32_t gate) {
     g_tp_fold_req_active = 0;
+    if (ds4_gpu_tp_decode_inline_gates()) return;   /* the inline gate publishes coherently */
     const uint32_t slot = layer * DS4_GPU_TP_GATES_PER_LAYER + gate;
     static int debug_left = -1;
     if (debug_left < 0) debug_left = getenv("DS4_TP_FOLD_DEBUG") ? 8 : 0;
@@ -11000,6 +11051,7 @@ int ds4_gpu_add_tensor_tp_flag(
     const bool fold =
         g_initialized && g_batch_cb && g_tp_thread_running &&
         !g_tp_session_batch_mode && g_tp_flag_gates && g_tp_poll_gates &&
+        !ds4_gpu_tp_decode_inline_gates() &&   /* the inline gate publishes coherently */
         !g_ssd_streaming_mode && g_tp_check_words != NULL &&
         slot < DS4_TP_POLL_MAX_SLOTS && g_tp_vec_bytes == (uint64_t)n * 4u &&
         out && a && b && n != 0 && (n % 256u) == 0u &&
@@ -11037,6 +11089,45 @@ int ds4_gpu_add_tensor_tp_flag(
     return 1;
 }
 
+/* Inline gate: publish the partial (n_words at slab offset out_off) and the
+ * flag word of `slot` coherently, stream the next phase's weights while the
+ * exchange runs, then spin on the release word inside this command buffer. */
+static int ds4_gpu_tp_spin_gate_encode(uint32_t slot, uint32_t value,
+                                       uint64_t out_off, uint32_t n_words,
+                                       uint32_t prefetch_gate) {
+    id<MTLComputePipelineState> publish = ds4_gpu_get_pipeline("kernel_dsv4_tp_payload_publish");
+    id<MTLComputePipelineState> flag = ds4_gpu_get_pipeline("kernel_dsv4_tp_flag_publish");
+    id<MTLComputePipelineState> wait = ds4_gpu_get_pipeline("kernel_dsv4_tp_release_wait");
+    if (!publish || !flag || !wait || !g_tp_release_buffer) return 0;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+    if (g_batch_encoder_concurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [enc setComputePipelineState:publish];
+    [enc setBuffer:g_tp_slab_buffer offset:(NSUInteger)(g_tp_slab_buffer_off + out_off) atIndex:0];
+    [enc setBytes:&n_words length:sizeof(n_words) atIndex:1];
+    [enc dispatchThreadgroups:MTLSizeMake((n_words + 255u) / 256u, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc setComputePipelineState:flag];
+    [enc setBuffer:g_tp_slab_buffer
+            offset:(NSUInteger)(g_tp_slab_buffer_off + g_tp_gpu_flags_off + (uint64_t)slot * 4u)
+           atIndex:0];
+    [enc setBytes:&value length:sizeof(value) atIndex:1];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+    ds4_gpu_close_batch_encoder();
+    if (prefetch_gate < 2u) (void)ds4_gpu_tp_encode_gate_prefetch(prefetch_gate);
+    enc = ds4_gpu_compute_encoder(g_batch_cb);
+    [enc setComputePipelineState:wait];
+    [enc setBuffer:g_tp_release_buffer offset:0 atIndex:0];
+    [enc setBytes:&value length:sizeof(value) atIndex:1];
+    [enc setBytes:&g_tp_spin_max_iters length:sizeof(g_tp_spin_max_iters) atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    /* Hazard tracking cannot see the CPU-side dependency that orders the
+     * combine reads after the spin. */
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+    return 1;
+}
+
 int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     /* The C graph has no outer pool for flag/poll encoder temporaries. */
     @autoreleasepool {
@@ -11051,9 +11142,17 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         }
         g_tp_fold_req_active = 0;
         const uint64_t seq = ++g_tp_seq;
-        const bool event_arrival = g_tp_session_batch_mode || !g_tp_flag_gates;
         const uint32_t slot = layer * DS4_GPU_TP_GATES_PER_LAYER + gate;
-        if (!event_arrival) {
+        const bool spin_gate = ds4_gpu_tp_decode_inline_gates() && !g_ssd_streaming_mode &&
+            g_tp_vec_bytes != 0;
+        const bool event_arrival = !g_tp_flag_gates || (g_tp_session_batch_mode && !spin_gate);
+        if (spin_gate) {
+            if (!ds4_gpu_tp_spin_gate_encode(slot, (uint32_t)seq,
+                                             g_tp_out_off + (uint64_t)slot * g_tp_vec_bytes,
+                                             (uint32_t)(g_tp_vec_bytes / 4u), gate))
+                return 0;
+            g_tp_flag_prepublished_seq = 0;
+        } else if (!event_arrival) {
             /* Publish arrival through the slab word; the buffer hazard against
              * the partial-output kernels orders the store after the payload. */
             const uint32_t value = (uint32_t)seq;
@@ -11101,7 +11200,7 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
             [g_batch_cb encodeSignalEvent:g_tp_gpu_event value:seq];
         }
         const bool poll_gate =
-            !event_arrival && g_tp_poll_gates && !g_ssd_streaming_mode &&
+            !spin_gate && !event_arrival && g_tp_poll_gates && !g_ssd_streaming_mode &&
             slot < DS4_TP_POLL_MAX_SLOTS;
         if (poll_gate) {
             /* Ending the command buffer is what makes the flag and the partial
@@ -11140,7 +11239,7 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             ds4_gpu_end_compute_encoder(g_batch_cb, enc);
-        } else {
+        } else if (!spin_gate) {
             [g_batch_cb encodeWaitForEvent:g_tp_cpu_event value:seq];
         }
         pthread_mutex_lock(&g_tp_mutex);
@@ -11154,6 +11253,7 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         g_tp_queue[tail].gate = gate;
         g_tp_queue[tail].rows = 0;
         g_tp_queue[tail].poll = poll_gate ? 1u : 0u;
+        g_tp_queue[tail].spin = spin_gate ? 1u : 0u;
         g_tp_queue[tail].event_arrival = event_arrival ? 1u : 0u;
         g_tp_queue[tail].seq = seq;
         g_tp_queue[tail].big_out = NULL;
@@ -11215,6 +11315,7 @@ int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
         g_tp_queue[tail].layer = layer;
         g_tp_queue[tail].gate = DS4_GPU_TP_GATE_FFN;
         g_tp_queue[tail].rows = rows;
+        g_tp_queue[tail].spin = 0;
         g_tp_queue[tail].poll = 0;
         g_tp_queue[tail].event_arrival = event_arrival ? 1u : 0u;
         g_tp_queue[tail].seq = seq;
@@ -11261,6 +11362,7 @@ static uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
     g_tp_queue[tail].big_out = out_ptr;
     g_tp_queue[tail].big_in = in_ptr;
     g_tp_queue[tail].big_bytes = bytes;
+    g_tp_queue[tail].spin = 0;
     g_tp_queue[tail].poll = 0;
     g_tp_queue_count++;
     pthread_cond_signal(&g_tp_cond);

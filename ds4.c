@@ -59909,6 +59909,10 @@ static bool mimo_graph_forward_tokens(ds4_mimo_gpu_graph *g, const ds4_model *m,
     bool ok = true;
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
         ok = mimo_graph_layer(g, m, &w->layer[il], il, g->h, pos0, T);
+        /* TP decode gates release inside the command buffer: commit every
+         * two layers so the GPU starts while the rest of the token encodes */
+        if (ok && T == 1u && g->tp_world == 2u && ds4_gpu_tp_decode_inline_gates() && (il == 0 || (il + 1u) % 2u == 0))
+            ok = ds4_gpu_flush_commands() != 0;
         /* DFlash features: the residual outputs of the target layers */
         for (uint32_t t = 0; ok && g->df && t < g->df->n_target; t++) {
             if (g->df->target[t] == il) {
@@ -74881,6 +74885,9 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
             goto fail;
         }
     }
+#ifdef DS4_HAS_MIMO_GPU
+    if (ds4_model_is_mimo()) ds4_gpu_tp_request_decode_inline_gates();
+#endif
     if (!ds4_gpu_tp_init((uint32_t)ds4_tp_rank(tp),
                          e->tp.slab, ds4_tp_slab_gpu_flags_offset(tp),
                          ds4_tp_slab_out_offset(tp, 0, 0), vec_bytes,

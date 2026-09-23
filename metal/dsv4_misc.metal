@@ -6966,6 +6966,63 @@ kernel void kernel_dsv4_add2_f32_tp_flag_checked(
     }
 }
 
+// Inline decode gates (the spin release of the tp-fast-release work): the CPU
+// releases the GPU by a store to a system-coherent word that a one-thread
+// kernel spin-reads inside the open command buffer, so the stream neither
+// parks on a shared event nor ends a command buffer per gate.  Without that
+// buffer boundary the partial and the flag have to be pushed to system
+// visibility explicitly: both are re-stored through coherent(system) views
+// followed by a system-scope fence.
+#pragma METAL internals : enable
+#ifndef __METAL_MEMORY_SCOPE_SYSTEM__
+#define __METAL_MEMORY_SCOPE_SYSTEM__ 3
+#endif
+namespace metal {
+constexpr constant metal::thread_scope thread_scope_system =
+    static_cast<thread_scope>(__METAL_MEMORY_SCOPE_SYSTEM__);
+}
+
+kernel void kernel_dsv4_tp_payload_publish(
+        volatile coherent(system) device uint * payload,
+        constant uint & n_words,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid < n_words) payload[tid] = payload[tid];
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+}
+
+kernel void kernel_dsv4_tp_flag_publish(
+        volatile coherent(system) device uint * flag,
+        constant uint & value) {
+    flag[0] = value;
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+}
+
+// Bounded: a process killed mid-gate never stores the release word, and an
+// unbounded loop strands the kernel in GPU firmware until a reboot (observed).
+// The release seq is compared monotonically so a store is never missed.
+// [1] keeps the spin count of the last wait, [2] counts timeouts.
+kernel void kernel_dsv4_tp_release_wait(
+        volatile coherent(system) device uint * release_word,
+        constant uint & value,
+        constant uint & max_iters) {
+    uint i = 0;
+    for (; i < max_iters; i++) {
+        metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+        if ((int)(release_word[0] - value) >= 0) break;
+    }
+    release_word[1] = i;
+    if (i >= max_iters) release_word[2] = release_word[2] + 1u;
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+}
+
 // Tensor-parallel poll gate: waits for the service thread's release of gate
 // `value` without parking the command buffer on a shared event, which costs
 // tens of microseconds of GPU idle per gate on Apple silicon. A running
