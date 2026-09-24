@@ -90,6 +90,7 @@ help:
 	@echo "  make test-qwen4-kernels  Run the Qwen3.8 Metal kernel tests"
 	@echo "  make test-qwen4-q2       Check exact low-bit decode and prefill tile parity"
 	@echo "  make test-qwen4-vision  Compare the Qwen3.8 vision tower with HF (set DS4_QWEN4_SNAPSHOT, DS4_QWEN4_MMPROJ, DS4_QWEN4_IMAGE)"
+	@echo "  make test-mimo-attn      Check MiMo prefill attention against an fp64 reference"
 	@echo "  make test-mimo-mtp       Check MiMo MTP/DFlash speculative cycles against plain decoding (set DS4_TEST_MODEL, optional DS4_TEST_DFLASH)"
 	@echo "  make test-mimo-vision    Compare the MiMo vision tower with HF (set DS4_MIMO_SNAPSHOT, DS4_MIMO_MMPROJ, DS4_MIMO_IMAGE)"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
@@ -129,6 +130,12 @@ tests/test_mimo_mtp.o: tests/test_mimo_mtp.c ds4.h
 tests/test_mimo_mtp: tests/test_mimo_mtp.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_mimo_attn.o: tests/test_mimo_attn.c ds4_gpu.h
+	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
+
+tests/test_mimo_attn: tests/test_mimo_attn.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
 tests/test_mimo_vision.o: tests/test_mimo_vision.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
@@ -142,6 +149,10 @@ test-mimo-vision: tests/test_mimo_vision
 		{ echo "set DS4_MIMO_SNAPSHOT, DS4_MIMO_MMPROJ and DS4_MIMO_IMAGE"; exit 1; }
 	python3 tests/mimo_vision_ref.py --snapshot "$(DS4_MIMO_SNAPSHOT)" --mmproj "$(DS4_MIMO_MMPROJ)" \
 		--image "$(DS4_MIMO_IMAGE)"
+
+.PHONY: test-mimo-attn
+test-mimo-attn: tests/test_mimo_attn
+	./tests/test_mimo_attn
 
 test-mimo-mtp: tests/test_mimo_mtp
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_mimo_mtp

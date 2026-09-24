@@ -206,7 +206,8 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   `95/100`, and average greedy prefix `17.03`. The platform supplies no
   logprobs; do not report the empty `api_*` columns. Also confirm that
   `--mtp` and `--mtp-model` greedy outputs equal plain decoding on a short
-  and a long prompt.
+  and a long prompt. After MiMo attention kernel changes, `make test-mimo-attn`
+  must pass.
 - Run the 100-case MiMo-V2.6 Pro fixture over two-Mac tensor parallelism
   (`gguf-tools/quality-testing/mimo-v2.6-pro-20260923`, the same command plus
   `--tensor-parallel --role coordinator --listen HOST PORT --transport rdma`
