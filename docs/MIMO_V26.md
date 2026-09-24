@@ -114,6 +114,9 @@ drafters stay off while batching, as for the other families. Each slot's
 logits equal its single-session decode bit for bit, because the batched Q8
 projections keep the single-row kernel; `DS4_MIMO_BATCH_MM=1` uses the
 multi-row kernels instead for more throughput at the cost of that identity.
+Likewise, prefill attention gives the per-row kernel's output bit for bit;
+`DS4_MIMO_ATTN=tiled` selects a tiled kernel that is faster on long prompts
+but not bit-identical to it.
 Prefill is not chunk-invariant at the last bit, so two identical prompts
 whose prefills were split differently (the server interleaves 128-token
 quanta while other slots generate) can part at a near tie;

@@ -155,8 +155,8 @@ static inline void mimo_attn_tile(
 #pragma unroll
         for (uint i = 0; i < NPTV; i++) acc[g][i] = 0.0f;
     }
-    for (uint p = k0; p < k1; p++) {
-        const uint row = p % args.ring;
+    uint row = k0 % args.ring;
+    for (uint p = k0; p < k1; p++, row = row + 1u == args.ring ? 0u : row + 1u) {
         device const half *kr = k_cache + ((uint64_t)row * Hkv + kvh) * Dk + tiisg * NPTK;
         device const half *vr = v_cache + ((uint64_t)row * Hkv + kvh) * Dv + tiisg * NPTV;
         float kv[NPTK], vv[NPTV];
@@ -254,6 +254,107 @@ kernel void kernel_mimo_attn(
     mimo_attn_tile<NPTK, NPTV>(args, split, kvh, tok, q, k_cache, v_cache, sinks, out, part, sgitg, tiisg);
 }
 
+/* Prefill rows (one key split) as mimo_attn_tile computes them, several
+ * tokens of a kv head per threadgroup: each token's four simdgroups own its
+ * heads with the same per-lane arithmetic and key order, so the output is
+ * that kernel's bit for bit, and every block of K/V rows is read from the
+ * cache once, into threadgroup memory, for all the tokens. */
+#define MIMO_ATTN_BK 32
+
+template <uint NPTK, uint NPTV>
+kernel void kernel_mimo_attn_prefill(
+        constant ds4_metal_args_mimo_attn & args,
+        device const float *q, device const half *k_cache, device const half *v_cache,
+        device const float *sinks, device float *out,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        uint3  ntg   [[threads_per_threadgroup]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    constexpr uint Dk = NPTK * 32, Dv = NPTV * 32, BK = MIMO_ATTN_BK;
+    threadgroup half sk[BK * Dk];
+    threadgroup half sv[BK * Dv];
+    const uint H = args.n_head, Hkv = args.n_head_kv, group = H / Hkv;
+    const uint nt = ntg.x, tpt = nt / (32u * MIMO_ATTN_NSG);
+    const uint kvh = tgpig.y, t0 = tgpig.x * tpt, t1 = min(t0 + tpt, args.n_tokens);
+    /* the threadgroup's keys: the first token's window start through the last token */
+    const uint kb0 = mimo_attn_lo(args, args.pos0 + t0), kb1 = args.pos0 + t1;
+
+    const uint tok = t0 + sgitg / MIMO_ATTN_NSG;
+    const uint hps = (group + MIMO_ATTN_NSG - 1) / MIMO_ATTN_NSG;
+    const uint g0 = (sgitg % MIMO_ATTN_NSG) * hps;
+    const uint ng = g0 < group && tok < t1 ? min(hps, group - g0) : 0u;
+    const uint pos = args.pos0 + min(tok, t1 - 1u);
+    const uint k0 = mimo_attn_lo(args, pos), k1 = pos + 1u;
+
+    float qv[MIMO_ATTN_HPS][NPTK];
+    float m[MIMO_ATTN_HPS], l[MIMO_ATTN_HPS], acc[MIMO_ATTN_HPS][NPTV];
+#pragma unroll
+    for (uint g = 0; g < MIMO_ATTN_HPS; g++) {
+        const uint h = kvh * group + min(g0 + g, group - 1u);
+        device const float *qh = q + ((uint64_t)min(tok, t1 - 1u) * H + h) * Dk + tiisg * NPTK;
+#pragma unroll
+        for (uint i = 0; i < NPTK; i++) qv[g][i] = qh[i] * args.scale;
+        m[g] = args.has_sink ? sinks[h] : -3.0e38f;
+        l[g] = args.has_sink ? 1.0f : 0.0f;
+#pragma unroll
+        for (uint i = 0; i < NPTV; i++) acc[g][i] = 0.0f;
+    }
+    uint row = kb0 % args.ring;
+    for (uint kb = kb0; kb < kb1; kb += BK) {
+        const uint nk = min(BK, kb1 - kb);
+        for (uint i = tiitg; i < nk * (Dk / 4); i += nt) {
+            const uint j = i / (Dk / 4), r = row + j < args.ring ? row + j : row + j - args.ring;
+            ((threadgroup half4 *)sk)[i] = ((device const half4 *)(k_cache + ((uint64_t)r * Hkv + kvh) * Dk))[i % (Dk / 4)];
+        }
+        for (uint i = tiitg; i < nk * (Dv / 4); i += nt) {
+            const uint j = i / (Dv / 4), r = row + j < args.ring ? row + j : row + j - args.ring;
+            ((threadgroup half4 *)sv)[i] = ((device const half4 *)(v_cache + ((uint64_t)r * Hkv + kvh) * Dv))[i % (Dv / 4)];
+        }
+        row = row + nk < args.ring ? row + nk : row + nk - args.ring;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint p = max(kb, k0); p < min(kb + nk, k1); p++) {
+            threadgroup const half *kr = sk + (p - kb) * Dk + tiisg * NPTK;
+            threadgroup const half *vr = sv + (p - kb) * Dv + tiisg * NPTV;
+            float kv[NPTK], vv[NPTV];
+#pragma unroll
+            for (uint i = 0; i < NPTK; i++) kv[i] = (float)kr[i];
+#pragma unroll
+            for (uint i = 0; i < NPTV; i++) vv[i] = (float)vr[i];
+#pragma unroll
+            for (uint g = 0; g < MIMO_ATTN_HPS; g++) {
+                if (g < ng) {
+                    float s = 0.0f;
+#pragma unroll
+                    for (uint i = 0; i < NPTK; i++) s += qv[g][i] * kv[i];
+                    s = simd_sum(s);
+                    const float m_new = max(m[g], s);
+                    const float corr = exp(m[g] - m_new);
+                    const float w = exp(s - m_new);
+                    l[g] = l[g] * corr + w;
+#pragma unroll
+                    for (uint i = 0; i < NPTV; i++) acc[g][i] = acc[g][i] * corr + w * vv[i];
+                    m[g] = m_new;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+#pragma unroll
+    for (uint g = 0; g < MIMO_ATTN_HPS; g++) {
+        if (g >= ng) break;
+        device float *dst = out + ((uint64_t)tok * H + kvh * group + g0 + g) * Dv + tiisg * NPTV;
+        const float inv = l[g] > 0.0f ? 1.0f / l[g] : 0.0f;
+#pragma unroll
+        for (uint i = 0; i < NPTV; i++) dst[i] = acc[g][i] * inv;
+    }
+}
+
+template [[host_name("kernel_mimo_attn_prefill_k6v4")]]
+kernel void kernel_mimo_attn_prefill<6, 4>(constant ds4_metal_args_mimo_attn &, device const float *,
+        device const half *, device const half *, device const float *, device float *,
+        uint3, uint3, ushort, ushort, ushort);
+
 /* Merge the split partials of one (token, head). */
 template <uint NPTV>
 kernel void kernel_mimo_attn_merge(
@@ -307,6 +408,188 @@ kernel void kernel_mimo_attn_merge<NPTV_>(constant ds4_metal_args_mimo_attn &, d
 MIMO_MERGE_INSTANCE(4)
 MIMO_MERGE_INSTANCE(2)
 MIMO_MERGE_INSTANCE(1)
+
+/* Prefill attention, qk 192 / value 128: a threadgroup takes 32 query rows of
+ * one kv head (rows are (token, head) pairs, the group's heads innermost) and
+ * walks their key range in blocks of 16, so every K/V block is read once for
+ * all 32 rows.  Q.K^T and P.V run on simdgroup matrices over fp32 q and the
+ * half K/V, accumulating in fp32; the softmax is the same online one, per
+ * block instead of per key.  Two simdgroups share 8 rows: each scores half
+ * of a block's keys and accumulates half of the value columns, which keeps
+ * the fp32 accumulators in registers.  Small tiles (16 KB of threadgroup
+ * memory) run faster here than larger ones that share more. */
+#define MIMO_FA_BK  16
+#define MIMO_FA_M   32
+#define MIMO_FA_NSG 8
+
+kernel void kernel_mimo_attn_fa_k6v4(
+        constant ds4_metal_args_mimo_attn & args,
+        device const float *q,          /* [T][H*192], unscaled */
+        device const half  *k_cache,    /* [ring][Hkv*192] */
+        device const half  *v_cache,    /* [ring][Hkv*128] */
+        device const float *sinks,      /* [H] */
+        device float       *out,        /* [T][H*128] */
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    constexpr uint Dk = 192, Dv = 128, BK = MIMO_FA_BK, M = MIMO_FA_M, NT = MIMO_FA_NSG * 32;
+    threadgroup half  sk[BK * Dk];
+    threadgroup half  sv[BK * Dv];
+    threadgroup float ss[M * BK];                 /* scores, then probabilities */
+    threadgroup float sd[(M / 8) * 64];           /* a diagonal per 8 rows */
+    threadgroup float si[64];                     /* identity, to add score partials */
+
+    const uint H = args.n_head, Hkv = args.n_head_kv, G = H / Hkv;
+    const uint kvh = tgpig.y, tpt = M / G, t0 = tgpig.x * tpt;
+    const uint pos0 = args.pos0;
+    /* this simdgroup: 8 rows (one token, 8 consecutive heads), half the keys and value columns */
+    const uint rb = sgitg % (M / 8u), half_ = sgitg / (M / 8u), r0 = rb * 8u;
+    const uint tok = t0 + r0 / G, g0 = r0 % G;
+    device const float *qrow = q + ((uint64_t)min(tok, args.n_tokens - 1u) * H + kvh * G + g0) * Dk;
+
+    simdgroup_float8x8 om[Dv / 16];
+#pragma unroll
+    for (uint c = 0; c < Dv / 16; c++) om[c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint i = tiitg; i < (M / 8) * 64; i += NT) sd[i] = 0.0f;
+    if (tiitg < 64) si[tiitg] = tiitg % 9u == 0u ? 1.0f : 0.0f;
+
+    /* the tile's keys, from the first row's window start through its last
+     * row, in blocks at fixed positions: a row's blocks do not depend on the
+     * rows that share its tile, so split prefills give the same bits */
+    const uint t1 = min(t0 + tpt, args.n_tokens);
+    uint kstart = args.n_swa && pos0 + t0 + 1u > args.n_swa ? pos0 + t0 + 1u - args.n_swa : 0u;
+    kstart = kstart > args.first ? args.first + (kstart - args.first) / BK * BK : args.first;
+    const uint kend = pos0 + t1;
+
+    /* softmax role: 8 threads per row, BK / 8 keys each */
+    constexpr uint KPT = BK / 8;
+    const uint sr = tiitg / 8u, sq = tiitg % 8u;
+    const uint stok = t0 + sr / G, spos = pos0 + stok;
+    uint slo = args.n_swa && spos + 1u > args.n_swa ? spos + 1u - args.n_swa : 0u;
+    slo = max(slo, args.first);
+    const bool srow = stok < args.n_tokens;
+    /* the row's running max and sum, kept alike by its 8 softmax threads */
+    float rm = args.has_sink ? sinks[kvh * G + sr % G] : -3.0e38f, rl = args.has_sink ? 1.0f : 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kb = kstart; kb < kend; kb += BK) {
+        /* K lands transposed, [dim][key], so the score products read it directly */
+        for (uint i = tiitg; i < BK * Dk / 4; i += NT) {
+            const uint j = i % BK, c = i / BK, p = kb + j;
+            half4 v = half4(0.0h);
+            if (p < kend) v = ((device const half4 *)(k_cache + ((uint64_t)(p < args.ring ? p : p % args.ring) * Hkv + kvh) * Dk))[c];
+            sk[(4u * c + 0u) * BK + j] = v.x;
+            sk[(4u * c + 1u) * BK + j] = v.y;
+            sk[(4u * c + 2u) * BK + j] = v.z;
+            sk[(4u * c + 3u) * BK + j] = v.w;
+        }
+        for (uint i = tiitg; i < BK * Dv / 4; i += NT) {
+            const uint j = i / (Dv / 4), c = i % (Dv / 4), p = kb + j;
+            half4 v = half4(0.0h);
+            if (p < kend) v = ((device const half4 *)(v_cache + ((uint64_t)(p < args.ring ? p : p % args.ring) * Hkv + kvh) * Dv))[c];
+            ((threadgroup half4 *)sv)[i] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        {
+            /* each score sums eight 24-dim partials in a tree, not one 24-step
+             * chain: its rounding stays below the per-row kernel's */
+            simdgroup_float8x8 acc[BK / 16][8];
+#pragma unroll
+            for (uint kk = 0; kk < BK / 16; kk++)
+#pragma unroll
+                for (uint e = 0; e < 8; e++) acc[kk][e] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint d = 0; d < Dk / 64; d++) {
+#pragma unroll
+                for (uint e = 0; e < 8; e++) {
+                    const uint dd = e * (Dk / 64) + d;
+                    simdgroup_float8x8 qd;
+                    simdgroup_load(qd, qrow + dd * 8, Dk);
+#pragma unroll
+                    for (uint kk = 0; kk < BK / 16; kk++) {
+                        simdgroup_half8x8 kt;
+                        simdgroup_load(kt, sk + dd * 8 * BK + (half_ * (BK / 16) + kk) * 8, BK);
+                        simdgroup_multiply_accumulate(acc[kk][e], qd, kt, acc[kk][e]);
+                    }
+                }
+            }
+            simdgroup_float8x8 im;
+            simdgroup_load(im, si, 8);
+#pragma unroll
+            for (uint kk = 0; kk < BK / 16; kk++) {
+                for (uint e = 0; e < 8; e += 2) simdgroup_multiply_accumulate(acc[kk][e], acc[kk][e + 1], im, acc[kk][e]);
+                simdgroup_multiply_accumulate(acc[kk][0], acc[kk][2], im, acc[kk][0]);
+                simdgroup_multiply_accumulate(acc[kk][4], acc[kk][6], im, acc[kk][4]);
+                simdgroup_multiply_accumulate(acc[kk][0], acc[kk][4], im, acc[kk][0]);
+                simdgroup_store(acc[kk][0], ss + r0 * BK + (half_ * (BK / 16) + kk) * 8, BK);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        {
+            threadgroup float *row = ss + sr * BK + sq * KPT;
+            float s[KPT], mx = -3.0e38f;
+            bool ok[KPT];
+            for (uint j = 0; j < KPT; j++) {
+                const uint p = kb + sq * KPT + j;
+                ok[j] = srow && p < kend && p <= spos && p >= slo;
+                s[j] = row[j] * args.scale;
+                if (ok[j]) mx = max(mx, s[j]);
+            }
+            mx = max(mx, simd_shuffle_xor(mx, 1));
+            mx = max(mx, simd_shuffle_xor(mx, 2));
+            mx = max(mx, simd_shuffle_xor(mx, 4));
+            const float m_old = rm, m_new = max(m_old, mx);
+            float sum = 0.0f;
+            for (uint j = 0; j < KPT; j++) {
+                const float pj = ok[j] ? exp(s[j] - m_new) : 0.0f;
+                row[j] = pj;
+                sum += pj;
+            }
+            sum += simd_shuffle_xor(sum, 1);
+            sum += simd_shuffle_xor(sum, 2);
+            sum += simd_shuffle_xor(sum, 4);
+            /* a block with none of the row's keys leaves it exactly as it was */
+            const float corr = mx > -3.0e38f ? exp(m_old - m_new) : 1.0f;
+            rm = m_new;
+            rl = rl * corr + sum;
+            if (sq == 0) sd[(sr / 8u) * 64u + (sr % 8u) * 9u] = corr;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* rescale O only when a row's running max moved in this block */
+        const bool rescale = simd_any(tiisg < 8 && sd[rb * 64u + tiisg * 9u] != 1.0f);
+        simdgroup_float8x8 dm;
+        if (rescale) simdgroup_load(dm, sd + rb * 64u, 8);
+        simdgroup_float8x8 pm[BK / 8];
+#pragma unroll
+        for (uint kk = 0; kk < BK / 8; kk++) simdgroup_load(pm[kk], ss + r0 * BK + kk * 8, BK);
+#pragma unroll
+        for (uint c = 0; c < Dv / 16; c++) {
+            if (rescale) simdgroup_multiply(om[c], dm, om[c]);
+#pragma unroll
+            for (uint kk = 0; kk < BK / 8; kk++) {
+                simdgroup_half8x8 vm;
+                simdgroup_load(vm, sv + kk * 8 * Dv + half_ * (Dv / 2) + c * 8, Dv);
+                simdgroup_multiply_accumulate(om[c], pm[kk], vm, om[c]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (sq == 0) sd[(sr / 8u) * 64u + (sr % 8u) * 9u] = rl > 0.0f ? 1.0f / rl : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tok >= args.n_tokens) return;
+    simdgroup_float8x8 dm;
+    simdgroup_load(dm, sd + rb * 64u, 8);
+    device float *dst = out + ((uint64_t)tok * H + kvh * G + g0) * Dv + half_ * (Dv / 2);
+#pragma unroll
+    for (uint c = 0; c < Dv / 16; c++) {
+        simdgroup_multiply(om[c], dm, om[c]);
+        simdgroup_store(om[c], dst + c * 8, Dv);
+    }
+}
 
 /* --- router ------------------------------------------------------------- */
 

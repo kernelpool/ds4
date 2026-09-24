@@ -50383,6 +50383,8 @@ enum {
     MIMO_K_ATTN_K3V2,
     MIMO_K_ATTN_K4V4,
     MIMO_K_ATTN_K1V1,
+    MIMO_K_ATTN_PREFILL_K6V4,
+    MIMO_K_ATTN_FA_K6V4,
     MIMO_K_MERGE_V4,
     MIMO_K_MERGE_V2,
     MIMO_K_MERGE_V1,
@@ -50403,6 +50405,8 @@ static const char *const mimo_kernel_names[MIMO_K_COUNT] = {
     "kernel_mimo_attn_k3v2",
     "kernel_mimo_attn_k4v4",
     "kernel_mimo_attn_k1v1",
+    "kernel_mimo_attn_prefill_k6v4",
+    "kernel_mimo_attn_fa_k6v4",
     "kernel_mimo_attn_merge_v4",
     "kernel_mimo_attn_merge_v2",
     "kernel_mimo_attn_merge_v1",
@@ -50544,6 +50548,21 @@ int ds4_gpu_mimo_attn_tensor(
         if (!qwen4_bind_tensor(&b[6], qkv, width * sizeof(float), "MiMo qkv projection")) return 0;
     } else {
         b[6] = b[0];
+    }
+    /* prefill rows (no split buffer) share each K/V block across two tokens
+     * with the per-row arithmetic, so the output is that kernel's bit for bit;
+     * DS4_MIMO_ATTN=tiled runs the faster tiled kernel (32 rows share every
+     * block; not bit-identical), DS4_MIMO_ATTN=rowwise the per-row kernel */
+    const char *mode = getenv("DS4_MIMO_ATTN");
+    const uint32_t group = n_head / n_head_kv;
+    if (!part && !hi_end && !fuse && kd == MIMO_K_ATTN_K6V4 && !(mode && !strcmp(mode, "rowwise"))) {
+        if (mode && !strcmp(mode, "tiled") && (group == 8u || group == 16u)) {
+            return mimo_dispatch(MIMO_K_ATTN_FA_K6V4, &args, sizeof(args), b, 5,
+                                 MTLSizeMake((n_tokens + 32u / group - 1u) / (32u / group), n_head_kv, 1),
+                                 MTLSizeMake(256, 1, 1));
+        }
+        return mimo_dispatch(MIMO_K_ATTN_PREFILL_K6V4, &args, sizeof(args), b, 5,
+                             MTLSizeMake((n_tokens + 1u) / 2u, n_head_kv, 1), MTLSizeMake(32 * 4 * 2, 1, 1));
     }
     if (!mimo_dispatch(kd, &args, sizeof(args), b, 7,
                        MTLSizeMake(n_splits, n_head_kv, n_tokens), MTLSizeMake(32 * 4, 1, 1))) {
