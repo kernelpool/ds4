@@ -88143,6 +88143,8 @@ void ds4_session_rewind(ds4_session *s, int pos) {
         if (g->verify_rows && (uint32_t)pos >= g->verify_pos && (uint32_t)pos <= g->verify_pos + g->verify_rows) {
             const uint32_t row = (uint32_t)pos == g->verify_pos ? g->n_verify : (uint32_t)pos - g->verify_pos - 1u;
             memcpy(s->logits, g->host_logits + (size_t)row * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float));
+            /* rows and logits are exactly pos's now, so the session can be saved */
+            g->pos = (uint32_t)pos;
         }
         if (getenv("DS4_MIMO_SPEC_TRACE")) {
             fprintf(stderr, "ds4: spec rewind %d -> %d, block %u+%u\n", s->checkpoint.len, pos, g->verify_pos,

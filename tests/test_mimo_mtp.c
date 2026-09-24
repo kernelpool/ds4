@@ -9,8 +9,8 @@
  * with DS4_MIMO_SPEC_DRAFTS pointing at the plain continuation (every
  * draft accepted) and at a corrupted copy (mixed accept/reject).  Each run
  * must reproduce the plain tokens exactly, as must a continuation after a
- * rewind into the last verify block; sampled and exact-sampling cycles
- * must run without error. */
+ * rewind into the last verify block, live and from a checkpoint saved there;
+ * sampled and exact-sampling cycles must run without error. */
 #include "ds4.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -176,13 +176,24 @@ int main(void) {
         if (c == 0 && drafts < N_GEN / 2) fail("oracle drafts were not accepted");
         if (c == 1 && (drafts == 0 || drafts >= N_GEN - N_GEN / 3)) fail("corrupted drafts were not rejected");
 
-        /* rewind into the last block (its last row is always inside) and continue */
+        /* rewind into the last block (its last row is always inside), save
+         * there as a server eviction does, and continue live and restored */
         const int pos = ds4_session_pos(s);
         ds4_session_rewind(s, pos - 1);
         if (ds4_session_pos(s) != pos - 1) fail("rewind position");
+        FILE *fp = tmpfile();
+        if (!fp || ds4_session_save_payload(s, fp, err, sizeof(err)) != 0) fail(err[0] ? err : "save after rewind");
+        const long bytes = ftell(fp);
         drafts = decode_spec(s, N_REWIND + 1, got);
         expect_tokens(got, ref + N_GEN - 1, N_REWIND + 1, "rewound continuation");
         printf("rewound continuation: %d accepted\n", drafts);
+        ds4_session_free(s);
+        rewind(fp);
+        if (ds4_session_create(&s, e, TEST_CTX) != 0) fail("session create");
+        if (ds4_session_load_payload(s, fp, (uint64_t)bytes, err, sizeof(err)) != 0) fail(err);
+        fclose(fp);
+        decode_spec(s, N_REWIND + 1, got);
+        expect_tokens(got, ref + N_GEN - 1, N_REWIND + 1, "restored rewound continuation");
         ds4_session_free(s);
         unlink(oracle[c]);
     }
