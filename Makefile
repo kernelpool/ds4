@@ -92,6 +92,7 @@ help:
 	@echo "  make test-qwen4-vision  Compare the Qwen3.8 vision tower with HF (set DS4_QWEN4_SNAPSHOT, DS4_QWEN4_MMPROJ, DS4_QWEN4_IMAGE)"
 	@echo "  make test-mimo-attn      Check MiMo prefill attention against an fp64 reference"
 	@echo "  make test-mimo-mtp       Check MiMo MTP/DFlash speculative cycles against plain decoding (set DS4_TEST_MODEL, optional DS4_TEST_DFLASH)"
+	@echo "  make test-mimo-verify-exact  Check MiMo verify logits equal plain decoding bit for bit (set DS4_TEST_MODEL)"
 	@echo "  make test-mimo-vision    Compare the MiMo vision tower with HF (set DS4_MIMO_SNAPSHOT, DS4_MIMO_MMPROJ, DS4_MIMO_IMAGE)"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth  Run legacy MTP speculative verification smoke if MTP GGUF is present"
@@ -130,6 +131,12 @@ tests/test_mimo_mtp.o: tests/test_mimo_mtp.c ds4.h
 tests/test_mimo_mtp: tests/test_mimo_mtp.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_mimo_verify_exact.o: tests/test_mimo_verify_exact.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_mimo_verify_exact: tests/test_mimo_verify_exact.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
 tests/test_mimo_attn.o: tests/test_mimo_attn.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
@@ -156,6 +163,9 @@ test-mimo-attn: tests/test_mimo_attn
 
 test-mimo-mtp: tests/test_mimo_mtp
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_mimo_mtp
+
+test-mimo-verify-exact: tests/test_mimo_verify_exact
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_mimo_verify_exact
 
 tests/test_metal_tp_spec: tests/test_metal_tp_spec.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)

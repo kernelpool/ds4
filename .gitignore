@@ -89,4 +89,5 @@ __pycache__/
 /tests/test_q8_prefill_variants
 /tests/test_mimo_attn
 /tests/test_mimo_mtp
+/tests/test_mimo_verify_exact
 /tests/test_mimo_vision

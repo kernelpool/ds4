@@ -141,7 +141,9 @@ requantizing them.
 `DS4_TEST_DFLASH=<sidecar>`) checks that speculative cycles, including
 rewinds and both sampling modes, reproduce plain greedy decoding;
 `DS4_MIMO_SPEC_DRAFTS=FILE` feeds drafts by position so the accept paths
-run on any model. `make test-mimo-vision` (`DS4_MIMO_SNAPSHOT`,
+run on any model. `make test-mimo-verify-exact` (`DS4_TEST_MODEL=<gguf>`)
+checks that every verify block's logits equal plain decoding bit for bit at
+each draft depth, with and without rejected drafts. `make test-mimo-vision` (`DS4_MIMO_SNAPSHOT`,
 `DS4_MIMO_MMPROJ`, `DS4_MIMO_IMAGE`) compares the vision tower with the
 Hugging Face tower on the same GGUF weights, feeding DS4's own patches to
 both so resizing differences do not hide tower differences, and reports
