@@ -6,7 +6,7 @@ MiMo-V2.6 Flash uses the llama.cpp `mimo2` GGUF architecture and a
 dedicated Metal graph: 48 layers alternating global attention with
 128-token sliding-window attention (per-head sinks on the windowed layers),
 one dense layer followed by 256-expert MoE layers with a sigmoid router,
-three chained MTP blocks, and the shared Qwen2 tokenizer with ChatML turns.
+three MTP blocks, and the shared Qwen2 tokenizer with ChatML turns.
 The port is Metal only.
 
 ## Run
@@ -46,10 +46,12 @@ session batching stay off.
 Two drafters are available; use one of them.
 
 `--mtp` runs the MTP blocks embedded in the main GGUF. Each block is a
-sliding-window attention layer with a dense FFN chained on the previous
-block's residual. A cycle drafts one token and verifies it in one target
-pass, which decodes fastest on Apple Silicon; `DS4_MIMO_MTP_DEPTH=2` or `3`
-chains the deeper blocks for more drafts per cycle.
+sliding-window attention layer with a dense FFN over the target's last
+hidden state before its final norm and the embedding of the token it
+follows; block k drafts k + 1 tokens past the same target row (the blocks
+are not chained, as trained). A cycle drafts one token and verifies it in
+one target pass, which decodes fastest on Apple Silicon;
+`DS4_MIMO_MTP_DEPTH=2` or `3` drafts more tokens per cycle.
 
 `--mtp-model MiMo-V2.6-Flash-DFlash-Q8_0.gguf` runs the DFlash drafter
 instead: five Qwen3-style layers over features taken from five target
@@ -106,8 +108,8 @@ the reference prompts must stay identical to plain decoding.
 
 SSD streaming, DSpark and CUDA are not supported yet; see [Pro](#pro) for
 what tensor parallelism leaves out.
-The server's disk KV cache saves and restores MiMo sessions (the MTP chain
-replays its rows after a restore; the DFlash context of the last window
+The server's disk KV cache saves and restores MiMo sessions (the MTP blocks
+replay their rows after a restore; the DFlash context of the last window
 positions is saved with the session). `ds4-server --batched-session N` decodes the slots
 together on shared transients, reading the experts once per batch; the
 drafters stay off while batching, as for the other families. Each slot's

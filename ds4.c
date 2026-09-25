@@ -60012,16 +60012,18 @@ static bool mimo_graph_mtp_row_write(ds4_mimo_gpu_graph *g, const ds4_model *m, 
 }
 
 /* Run the MTP blocks after a forward whose first T rows (tokens[], at
- * positions p0..) are committed and still in h: depth k re-runs its rows
- * from p0 through the parent and the shallower drafts, and its last row
- * drafts token k + 1 while k < n_draft.  Row i of the buffers is position
- * p0 - 1 + i; row 0 is the hidden row carried from the previous call,
- * without which (a fresh chain, or after a rewind) a depth starts one row
- * after the depth above it.  T may be 0 to draft from the carried rows
- * alone.  Rows of depth k feed depth k + 1, whose output reuses the buffer
- * of depth k - 1.
- * rows_logits, if set, receives every committed row's logits per depth
- * ([depth][T][vocab], positions before the depth's first row untouched). */
+ * positions p0..) are committed and still in h.  The blocks are not chained:
+ * block k at position P reads the trunk's pre-norm hidden at P - k - 1 and
+ * the embedding of token P, so its last row drafts token k + 1 from the same
+ * trunk row as block 0.  Block k re-runs its rows from p0 through the parent
+ * and the drafts before it (only committed rows while k >= n_draft).  Row i
+ * of mtp_e is position p0 - 1 + i; row j of mtp_a is the trunk hidden at
+ * p0 - K + j, the first K rows carried from the previous call
+ * (mtp_carry_ok[k]: the row at p0 - 1 - k is there); without them (a fresh
+ * chain, or after a rewind) block k starts at the first position whose
+ * trunk row this call has.  T may be 0 to draft from the carried rows alone.
+ * rows_logits, if set, receives every committed row's logits per block
+ * ([block][T][vocab], positions before the block's first row untouched). */
 static bool mimo_graph_mtp_rows(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                 const int *tokens, uint32_t T, uint32_t p0, int parent,
                                 int *drafts, uint32_t n_draft, float *rows_logits) {
@@ -60035,37 +60037,21 @@ static bool mimo_graph_mtp_rows(ds4_mimo_gpu_graph *g, const ds4_model *m, const
     }
     if (n_draft && !mimo_graph_mtp_row_write(g, m, w, T + 1u, parent)) return false;
     if (!glm_graph_begin_commands_if_needed()) return false;
-    bool ok = true;
-    if (T) {
-        ds4_gpu_tensor *norm_rows = ds4_gpu_tensor_view(g->mtp_a, row, (uint64_t)T * row);
-        ok = norm_rows &&
-             ds4_gpu_rms_norm_weight_rows_tensor(norm_rows, g->h, m->map, m->size, w->output_norm->abs_offset,
-                                                 E, T, DS4_RMS_EPS);
-        ds4_gpu_tensor_free(norm_rows);
-    }
-    uint32_t q_prev = p0;   /* first row of the depth above, whose rows feed this one */
+    uint32_t c = 0;
+    while (c < K && g->mtp_carry_ok[c]) c++;
+    bool ok = ds4_gpu_tensor_copy(g->mtp_a, 0, g->mtp_carry, 0, (uint64_t)K * row) != 0 &&
+              (T == 0 || ds4_gpu_tensor_copy(g->mtp_a, (uint64_t)K * row, g->h, 0, (uint64_t)T * row) != 0);
     for (uint32_t k = 0; k < K && ok; k++) {
         const uint32_t il = n_trunk + k;
         const ds4_layer_weights *l = &w->layer[il];
-        ds4_gpu_tensor *src = (k & 1u) ? g->mtp_b : g->mtp_a;
-        ds4_gpu_tensor *out = (k & 1u) ? g->mtp_a : g->mtp_b;
-        const uint32_t q = g->mtp_carry_ok[k] ? (p0 > k + 1u ? p0 : k + 1u) : q_prev + 1u;
-        const uint32_t end = p0 + T + (k + 1u < n_draft ? k + 1u : n_draft);
-        /* the carried row feeds position p0; the source row at p0 + T - 1
-         * (written by the depth above, or the trunk) carries the next call */
-        if (q == p0) ok = ds4_gpu_tensor_copy(src, 0, g->mtp_carry, (uint64_t)k * row, row) != 0;
-        if (T) {
-            g->mtp_carry_ok[k] = q_prev + 1u <= p0 + T;
-            if (g->mtp_carry_ok[k]) {
-                ok = ok && ds4_gpu_tensor_copy(g->mtp_carry, (uint64_t)k * row, src, (uint64_t)T * row, row) != 0;
-            }
-        }
-        q_prev = q;
-        if (!ok || end <= q) continue;
+        const uint32_t q = p0 + (c > k ? 0u : k + 1u - c);
+        const uint32_t end = p0 + T + (k < n_draft ? k + 1u : 0u);
+        if (end <= q) continue;
         const uint32_t n = end - q, i0 = q - p0 + 1u;
         ds4_gpu_tensor *e_rows = ds4_gpu_tensor_view(g->mtp_e, (uint64_t)i0 * row, (uint64_t)n * row);
-        ds4_gpu_tensor *h_rows = ds4_gpu_tensor_view(src, (uint64_t)(i0 - 1u) * row, (uint64_t)n * row);
-        ds4_gpu_tensor *r = ds4_gpu_tensor_view(out, (uint64_t)i0 * row, (uint64_t)n * row);
+        ds4_gpu_tensor *h_rows = ds4_gpu_tensor_view(g->mtp_a, (uint64_t)(q - p0 + K - k - 1u) * row,
+                                                     (uint64_t)n * row);
+        ds4_gpu_tensor *r = ds4_gpu_tensor_view(g->mtp_b, 0, (uint64_t)n * row);
         ok = e_rows && h_rows && r &&
              ds4_gpu_mimo_mtp_cat_tensor(g->mtp_cat, e_rows, h_rows, m->map, m->size, l->nextn_enorm->abs_offset,
                                          l->nextn_hnorm->abs_offset, n, E, DS4_RMS_EPS) &&
@@ -60103,6 +60089,11 @@ static bool mimo_graph_mtp_rows(ds4_mimo_gpu_graph *g, const ds4_model *m, const
         ds4_gpu_tensor_free(e_rows);
         ds4_gpu_tensor_free(h_rows);
         ds4_gpu_tensor_free(r);
+    }
+    if (ok && T) {
+        ok = ds4_gpu_tensor_copy(g->mtp_carry, 0, g->mtp_a, (uint64_t)T * row, (uint64_t)K * row) != 0;
+        c = c + T < K ? c + T : K;
+        for (uint32_t k = 0; k < K; k++) g->mtp_carry_ok[k] = k < c;
     }
     if (ok && !g->mtp_draft_gpu) ok = ds4_gpu_end_commands() != 0;
     if (ok && n_draft) {
@@ -69663,10 +69654,11 @@ static void mimo_ref_layer(const ds4_model *m, const ds4_layer_weights *l, uint3
     free(blk); free(xn);
 }
 
-/* Forward `token` at `pos`; h_post (optional) receives the post-norm hidden
- * state, streams (optional) the residual after every trunk layer. */
+/* Forward `token` at `pos`; h_last (optional) receives the pre-norm hidden
+ * state the MTP blocks read, streams (optional) the residual after every
+ * trunk layer. */
 static void mimo_ref_forward_token(const ds4_model *m, const ds4_weights *w, mimo_ref_state *st,
-                                   int token, uint32_t pos, float *logits, float *h_post, float *streams) {
+                                   int token, uint32_t pos, float *logits, float *h_last, float *streams) {
     const uint32_t E = DS4_N_EMBD, n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     float *h = xmalloc(E * sizeof(float));
     float *hn = xmalloc(E * sizeof(float));
@@ -69675,17 +69667,17 @@ static void mimo_ref_forward_token(const ds4_model *m, const ds4_weights *w, mim
         mimo_ref_layer(m, &w->layer[il], il, st, pos, h);
         if (streams) memcpy(streams + (uint64_t)il * E, h, E * sizeof(float));
     }
+    if (h_last) memcpy(h_last, h, E * sizeof(float));
     qwen4_ref_rms(hn, h, qwen4_ref_f32(m, w->output_norm), E, DS4_RMS_EPS);
-    if (h_post) memcpy(h_post, hn, E * sizeof(float));
     if (logits) qwen4_ref_matvec(m, w->output, hn, logits);
     free(hn); free(h);
 }
 
-/* MTP depth k at `pos`: eh_proj over [enorm(E[token]) ; hnorm(h_prev)], one
- * SWA block on its own cache, then the shared head; r2 (optional) is the
- * pre-head residual the next depth consumes. */
+/* MTP block k at `pos`: eh_proj over [enorm(E[token]) ; hnorm(h_trunk)],
+ * h_trunk the trunk's pre-norm hidden at pos - k - 1, one SWA block on its
+ * own cache, then the shared head. */
 static void mimo_ref_mtp(const ds4_model *m, const ds4_weights *w, mimo_ref_state *st, uint32_t k,
-                         const float *h_prev, int token, uint32_t pos, float *logits, float *r2) {
+                         const float *h_trunk, int token, uint32_t pos, float *logits) {
     const uint32_t E = DS4_N_EMBD, il = DS4_N_LAYER - DS4_N_NEXTN_PREDICT + k;
     const ds4_layer_weights *l = &w->layer[il];
     float *e = xmalloc(E * sizeof(float));
@@ -69694,10 +69686,9 @@ static void mimo_ref_mtp(const ds4_model *m, const ds4_weights *w, mimo_ref_stat
     float *hn = xmalloc(E * sizeof(float));
     qwen4_ref_row(m, w->token_embd, (uint64_t)token, e);
     qwen4_ref_rms(cat, e, qwen4_ref_f32(m, l->nextn_enorm), E, DS4_RMS_EPS);
-    qwen4_ref_rms(cat + E, h_prev, qwen4_ref_f32(m, l->nextn_hnorm), E, DS4_RMS_EPS);
+    qwen4_ref_rms(cat + E, h_trunk, qwen4_ref_f32(m, l->nextn_hnorm), E, DS4_RMS_EPS);
     qwen4_ref_matvec(m, l->nextn_eh_proj, cat, h);
     mimo_ref_layer(m, l, il, st, pos, h);
-    if (r2) memcpy(r2, h, E * sizeof(float));
     if (logits) {
         qwen4_ref_rms(hn, h, qwen4_ref_f32(m, l->nextn_shared_head_norm), E, DS4_RMS_EPS);
         qwen4_ref_matvec(m, w->output, hn, logits);
@@ -69919,14 +69910,14 @@ static int mimo_first_token_test(const ds4_engine *e, const ds4_tokens *prompt, 
         }
     }
     float *logits = xmalloc((uint64_t)n_seq * V * sizeof(float));
-    float *post = xmalloc((uint64_t)n_seq * E * sizeof(float));
+    float *trunk = xmalloc((uint64_t)n_seq * E * sizeof(float));
     float *layer_streams = (hidden_out && hidden_out[0]) || n_anchor ?
         xmalloc((uint64_t)n_seq * n_trunk * E * sizeof(float)) : NULL;
     mimo_ref_state st;
     mimo_ref_state_init(&st, n_seq);
     for (uint32_t t = 0; t < n_seq; t++) {
         mimo_ref_forward_token(model, weights, &st, seq[t], t, logits + (uint64_t)t * V,
-                               post + (uint64_t)t * E,
+                               trunk + (uint64_t)t * E,
                                layer_streams ? layer_streams + (uint64_t)t * n_trunk * E : NULL);
     }
     /* mtp_ref[k][p] holds depth k's logits at position p (rows below k + 1 unused) */
@@ -69935,19 +69926,12 @@ static int mimo_first_token_test(const ds4_engine *e, const ds4_tokens *prompt, 
     float *mtp_ref = NULL;
     if (mtp_out && mtp_out[0] && n_seq > 1 && K) {
         mtp_ref = xmalloc((uint64_t)K * n_seq * V * sizeof(float));
-        float *prev = xmalloc((uint64_t)n_seq * E * sizeof(float));
-        float *next = xmalloc((uint64_t)n_seq * E * sizeof(float));
-        memcpy(prev, post, (uint64_t)n_seq * E * sizeof(float));
         for (uint32_t k = 0; k < K && k + 1u < n_seq; k++) {
             for (uint32_t i = 0; i + k + 1u < n_seq; i++) {
-                mimo_ref_mtp(model, weights, &st, k, prev + (uint64_t)i * E, seq[i + k + 1u], i + k + 1u,
-                             mtp_ref + ((uint64_t)k * n_seq + i + k + 1u) * V, next + (uint64_t)i * E);
+                mimo_ref_mtp(model, weights, &st, k, trunk + (uint64_t)i * E, seq[i + k + 1u], i + k + 1u,
+                             mtp_ref + ((uint64_t)k * n_seq + i + k + 1u) * V);
             }
-            float *tmp = prev;
-            prev = next;
-            next = tmp;
         }
-        free(next); free(prev);
     }
     mimo_ref_state_free(&st);
     const uint32_t df_rows = n_anchor ? e->dflash.block - 1u : 0u;
@@ -69970,7 +69954,7 @@ static int mimo_first_token_test(const ds4_engine *e, const ds4_tokens *prompt, 
         if (!mimo_graph_alloc(g, weights, n_seq + 8u, chunk, mtp_ref != NULL, n_anchor ? &e->dflash : NULL,
                               &e->mtp_model, NULL, 0u)) {
             free(g);
-            free(df_ref); free(mtp_ref); free(layer_streams); free(post); free(logits); free(seq);
+            free(df_ref); free(mtp_ref); free(layer_streams); free(trunk); free(logits); free(seq);
             return 1;
         }
         ds4_gpu_tensor_free(g->logits);
@@ -69990,7 +69974,7 @@ static int mimo_first_token_test(const ds4_engine *e, const ds4_tokens *prompt, 
                 (n_anchor && !mimo_graph_dflash_inject(g, n, t0))) {
                 fprintf(stderr, "ds4: MiMo GPU forward failed at token %u\n", t0);
                 free(gpu_mtp); free(gpu); mimo_graph_free(g); free(g);
-                free(df_ref); free(mtp_ref); free(layer_streams); free(post); free(logits); free(seq);
+                free(df_ref); free(mtp_ref); free(layer_streams); free(trunk); free(logits); free(seq);
                 return 1;
             }
             /* teacher-forced MTP rows of the chunk against the reference */
@@ -70059,7 +70043,7 @@ static int mimo_first_token_test(const ds4_engine *e, const ds4_tokens *prompt, 
             if (!ok || !mimo_graph_dflash_draft(g, model, weights, seq[s_pos], s_pos, drafts, gpu_rows)) {
                 fprintf(stderr, "ds4: MiMo DFlash draft failed at anchor %d\n", anchors[a]);
                 free(gpu_mtp); free(gpu); mimo_graph_free(g); free(g);
-                free(df_ref); free(mtp_ref); free(layer_streams); free(post); free(logits); free(seq);
+                free(df_ref); free(mtp_ref); free(layer_streams); free(trunk); free(logits); free(seq);
                 return 1;
             }
             for (uint32_t r = 0; r < df_rows; r++) {
@@ -70124,7 +70108,7 @@ static int mimo_first_token_test(const ds4_engine *e, const ds4_tokens *prompt, 
     }
     printf("top logits after MiMo CPU pass over %u tokens:\n", n_seq);
     for (int j = 0; j < 8; j++) printf("  %d: %g\n", best[j], (double)last[best[j]]);
-    free(layer_streams); free(post); free(logits); free(seq);
+    free(layer_streams); free(trunk); free(logits); free(seq);
     return 0;
 }
 

@@ -79,7 +79,7 @@ perfect, disengaging after repeated second-draft rejections.
 
 ## MiMo-V2.6: built-in MTP or the DFlash sidecar
 
-`./ds4 --mtp` drafts with the chained MTP blocks in the main GGUF, one
+`./ds4 --mtp` drafts with the MTP blocks in the main GGUF, one
 draft per cycle by default (`DS4_MIMO_MTP_DEPTH=1..3`);
 `./ds4 --mtp-model MiMo-V2.6-Flash-DFlash-Q8_0.gguf` drafts seven-token
 blocks with the DFlash sidecar instead and verifies two of them by default
