@@ -76856,9 +76856,9 @@ static bool mimo_graph_native_session_batch_check(ds4_decode_item *items, int co
     return true;
 }
 
-/* DS4_MIMO_MTP_DEPTH=1..max sets the drafts verified per cycle.  One MTP
- * draft and two DFlash drafts decode fastest: every further verify row costs
- * more expert traffic than its rarer acceptance returns. */
+/* DS4_MIMO_MTP_DEPTH=1..max sets the drafts verified per cycle.  Two drafts
+ * decode fastest with either drafter: every further verify row costs more
+ * expert traffic than its rarer acceptance returns. */
 static uint32_t mimo_spec_depth(uint32_t max, uint32_t dflt) {
     const char *env = getenv("DS4_MIMO_MTP_DEPTH");
     const int v = env && env[0] ? atoi(env) : 0;
@@ -76896,7 +76896,7 @@ static int ds4_session_mimo_spec_cycle(ds4_session *s, int first_token, float te
     const ds4_model *m = &e->model;
     const ds4_weights *w = &e->weights;
     const uint32_t V = DS4_N_VOCAB, depth = e->dflash_ready ?
-        mimo_spec_depth(e->dflash.block - 1u, 2u) : mimo_spec_depth(DS4_N_NEXTN_PREDICT, 1u);
+        mimo_spec_depth(e->dflash.block - 1u, 2u) : mimo_spec_depth(DS4_N_NEXTN_PREDICT, 2u);
     const bool trace = getenv("DS4_MIMO_SPEC_TRACE") != NULL;
     const uint32_t n = (uint32_t)s->checkpoint.len;
     if (g->mtp_draft_valid && first_token != g->mtp_parent) g->mtp_draft_valid = false;

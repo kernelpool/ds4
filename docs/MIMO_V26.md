@@ -49,9 +49,9 @@ Two drafters are available; use one of them.
 sliding-window attention layer with a dense FFN over the target's last
 hidden state before its final norm and the embedding of the token it
 follows; block k drafts k + 1 tokens past the same target row (the blocks
-are not chained, as trained). A cycle drafts one token and verifies it in
-one target pass, which decodes fastest on Apple Silicon;
-`DS4_MIMO_MTP_DEPTH=2` or `3` drafts more tokens per cycle.
+are not chained, as trained). A cycle drafts two tokens and verifies them
+in one target pass, which decodes fastest on Apple Silicon;
+`DS4_MIMO_MTP_DEPTH=1..3` sets the drafts per cycle.
 
 `--mtp-model MiMo-V2.6-Flash-DFlash-Q8_0.gguf` runs the DFlash drafter
 instead: five Qwen3-style layers over features taken from five target
