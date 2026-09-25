@@ -60,10 +60,11 @@ by default (`DS4_MIMO_MTP_DEPTH=1..7`). The sidecar uses the llama.cpp
 `dflash` layout plus the mask embedding DS4 needs. The built-in MTP
 drafter is the faster of the two here.
 
-Both drafters verify against the target's logits, so temperature-zero
-output follows plain decoding; the batched verifier's reduction order can
-differ from one-token decode, so a near tie in a long greedy continuation
-may resolve differently (see [speculative decoding](SPECULATIVE_DECODING.md)).
+Both drafters verify against the target's logits, and the verify rows keep
+the one-token arithmetic: the Q8 projections run up to four rows through the
+single-row kernel's reduction, reading the weights once, and attention
+splits each row's keys as that row's own decode would. Temperature-zero
+output therefore equals plain decoding bit for bit.
 For non-zero temperature, `--mtp-exact-sampling` preserves the target
 distribution. `--mtp-timing` prints the verify cycles and accepted drafts
 at exit.

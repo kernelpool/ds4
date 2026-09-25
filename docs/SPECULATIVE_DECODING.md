@@ -86,7 +86,8 @@ blocks with the DFlash sidecar instead and verifies two of them by default
 (`DS4_MIMO_MTP_DEPTH=1..7`). Both verify the drafts in one target pass and
 keep the longest accepted prefix; the position-indexed caches simply
 rewrite rejected rows, so no state snapshot is needed on rejection or
-rewind. See [MiMo setup](MIMO_V26.md).
+rewind. The verify rows keep the one-token arithmetic, so greedy output
+equals plain decoding bit for bit. See [MiMo setup](MIMO_V26.md).
 
 ## Sampling and reproducibility
 

@@ -59473,6 +59473,7 @@ typedef struct ds4_mimo_gpu_graph {
     ds4_gpu_tensor *ffn_g, *ffn_u, *ffn_m, *logits;
     bool owns_scratch;
     bool batch_exact;                      /* the arena: batched rows keep the single-row Q8 kernel */
+    bool rows_exact;                       /* this forward's rows are all read (a verify block): likewise */
     ds4_gpu_tensor *k_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *v_cache[DS4_MAX_LAYER];
     uint32_t ring[DS4_MAX_LAYER];
@@ -59539,27 +59540,31 @@ static uint32_t mimo_graph_kv(const ds4_mimo_gpu_graph *g, uint32_t il) {
     return mimo_layer_kv(il) / (mimo_tp_layer(g, il) ? 2u : 1u);
 }
 
-/* A batched decode reads each Q8 matrix once per four rows with the
- * single-row kernel instead of once per batch with the tile, so every
- * session's logits equal its single-session decode bit for bit
- * (DS4_MIMO_BATCH_MM=1 takes the tile and its throughput instead). */
+/* A batched decode and a verify block keep the single-row arithmetic, so
+ * every session's logits, and every verified row's, equal the decode of its
+ * token bit for bit: Q8 rows go up to four at a time through the single-row
+ * kernel's reduction, reading the matrix once per group, other types row by
+ * row (the multi-row kernels order their sums differently).
+ * DS4_MIMO_BATCH_MM=1 gives batched sessions the tile and its throughput. */
 static bool mimo_gemv(const ds4_mimo_gpu_graph *g, ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
                       const ds4_gpu_tensor *x, uint32_t T) {
-    if (g->batch_exact && T > 1u && T <= 32u) {
-        /* row by row: the multi-row Q8 kernels order their sums differently */
-        const uint64_t in_bytes = (uint64_t)w->dim[0] * sizeof(float);
-        const uint64_t out_bytes = (uint64_t)(w->ndim >= 2 ? w->dim[1] : 1u) * sizeof(float);
-        for (uint32_t t = 0; t < T; t++) {
-            ds4_gpu_tensor *xr = ds4_gpu_tensor_view(x, t * in_bytes, in_bytes);
-            ds4_gpu_tensor *outr = ds4_gpu_tensor_view(out, t * out_bytes, out_bytes);
-            const bool ok = xr && outr && qwen4_gemv(outr, m, w, xr, 1u);
-            ds4_gpu_tensor_free(outr);
-            ds4_gpu_tensor_free(xr);
-            if (!ok) return false;
-        }
-        return true;
+    if (!(g->batch_exact || g->rows_exact) || T < 2u || T > 32u) return qwen4_gemv(out, m, w, x, T);
+    const uint64_t in_bytes = (uint64_t)w->dim[0] * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)(w->ndim >= 2 ? w->dim[1] : 1u) * sizeof(float);
+    for (uint32_t t = 0; t < T;) {
+        const uint32_t n = w->type == DS4_TENSOR_Q8_0 && w->ndim >= 2 ? (T - t < 4u ? T - t : 4u) : 1u;
+        ds4_gpu_tensor *xr = ds4_gpu_tensor_view(x, t * in_bytes, n * in_bytes);
+        ds4_gpu_tensor *outr = ds4_gpu_tensor_view(out, t * out_bytes, n * out_bytes);
+        const bool ok = xr && outr &&
+            (n == 1u ? qwen4_gemv(outr, m, w, xr, 1u)
+                     : ds4_gpu_matmul_q8_0_rows_tensor(outr, m->map, m->size, w->abs_offset, w->dim[0], w->dim[1],
+                                                       xr, n) != 0);
+        ds4_gpu_tensor_free(outr);
+        ds4_gpu_tensor_free(xr);
+        if (!ok) return false;
+        t += n;
     }
-    return qwen4_gemv(out, m, w, x, T);
+    return true;
 }
 
 static uint32_t mimo_prefill_chunk_tokens(uint32_t ctx) {
@@ -59944,6 +59949,7 @@ static bool mimo_graph_forward_tokens(ds4_mimo_gpu_graph *g, const ds4_model *m,
     if (!glm_graph_begin_commands_if_needed()) return false;
     const uint32_t pos0 = g->pos;
     g->verify_rows = 0;
+    g->rows_exact = all_rows;
     bool ok = true;
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
         ok = mimo_graph_layer(g, m, &w->layer[il], il, g->h, pos0, T);
@@ -59963,6 +59969,7 @@ static bool mimo_graph_forward_tokens(ds4_mimo_gpu_graph *g, const ds4_model *m,
         ok = all_rows ? mimo_graph_head(g, m, w, g->h, w->output_norm, 0u, T)
                       : mimo_graph_head(g, m, w, g->h, w->output_norm, T - 1u, 1u);
     }
+    g->rows_exact = false;
     if (!ds4_gpu_end_commands()) ok = false;
     if (tp_block) {
         g->tp_block_gate = UINT32_MAX;

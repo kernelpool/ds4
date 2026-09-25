@@ -107,11 +107,12 @@ struct ds4_metal_args_mimo_attn {
     uint32_t fuse_prep;      /* one token: the kernel ropes q and writes the K/V row itself */
     uint32_t n_rot;
     float    v_scale;
-    uint32_t pad3;
+    uint32_t split_keys;     /* keys per split a one-row batch aims for */
     float    rope_freq[32];
 };
 
 #define MIMO_ATTN_NSG 4          /* simdgroups per threadgroup */
+#define MIMO_ATTN_MAX_SPLITS 64  /* as in ds4_metal.m */
 #define MIMO_ATTN_HPS 4          /* q heads per simdgroup: group <= NSG * HPS */
 
 static inline uint mimo_attn_lo(constant ds4_metal_args_mimo_attn &args, uint pos) {
@@ -138,8 +139,16 @@ static inline void mimo_attn_tile(
     const uint ng = min(hps, group - g0);
     const uint pos = args.pos0 + tok;
     const uint lo = mimo_attn_lo(args, pos);
-    const uint k0 = lo + split * args.keys_per_split;
-    const uint k1 = min(args.hi_end ? args.hi_end : pos + 1u, k0 + args.keys_per_split);
+    const uint end = args.hi_end ? args.hi_end : pos + 1u;
+    /* every row splits its own keys as a one-row batch would, so a verify
+     * row equals the decode of its token; its splits past that are empty */
+    uint ns = args.n_splits, kps = args.keys_per_split;
+    if (ns > 1u) {
+        ns = clamp((end - lo + args.split_keys - 1u) / args.split_keys, 1u, (uint)MIMO_ATTN_MAX_SPLITS);
+        kps = (end - lo + ns - 1u) / ns;
+    }
+    const uint k0 = split < ns ? lo + split * kps : end;
+    const uint k1 = min(end, k0 + kps);
 
     float qv[MIMO_ATTN_HPS][NPTK];
     float m[MIMO_ATTN_HPS], l[MIMO_ATTN_HPS], acc[MIMO_ATTN_HPS][NPTV];

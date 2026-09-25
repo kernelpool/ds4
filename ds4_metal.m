@@ -19843,6 +19843,64 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     }
 }
 
+/* Two to four rows (the verify block of a speculative cycle) in one pass over
+ * the weights, each row bit-identical to the single-row decode matvec. */
+int ds4_gpu_matmul_q8_0_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    static const char *names[5] = { NULL, NULL, "kernel_mul_mv_q8_0_f32_rows2",
+                                    "kernel_mul_mv_q8_0_f32_rows3", "kernel_mul_mv_q8_0_f32_rows4" };
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !x || !model_map || n_rows < 2u || n_rows > 4u ||
+        (in_dim & 31u) != 0 || in_dim > UINT32_MAX || out_dim == 0 || out_dim > UINT32_MAX ||
+        ds4_gpu_tensor_bytes(x) < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < (uint64_t)n_rows * out_dim * sizeof(float)) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t row_bytes = (in_dim / 32u) * 34u;
+        const uint64_t weight_bytes = out_dim * row_bytes;
+        if (!xbuf || !outbuf || weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight_offset, weight_bytes,
+                                                      &inner_offset);
+        if (!wbuf) return 0;
+
+        /* the single-row dispatch: same simdgroups, so the same K walk */
+        ds4_gpu_mv_dispatch dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        if (out_dim > 65536u) dispatch.nsg = 8;
+        ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+        args.nr0 = dispatch.nr0;
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(names[n_rows], dispatch.nsg);
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:dispatch.smem * n_rows atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)dispatch.nr0 - 1u) /
+                                              (NSUInteger)dispatch.nr0, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 exact rows matvec");
+    }
+}
+
 int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -50515,10 +50573,11 @@ int ds4_gpu_mimo_attn_tensor(
     }
     const uint32_t keys_per_split = (n_keys + n_splits - 1) / n_splits;
     struct { uint32_t n_tokens, n_head, n_head_kv, head_dim, value_dim, pos0, ring, n_swa, first, has_sink,
-             n_splits, keys_per_split; float scale; uint32_t hi_end, fuse_prep, n_rot; float v_scale; uint32_t pad3;
-             float rope_freq[32]; } args =
+             n_splits, keys_per_split; float scale; uint32_t hi_end, fuse_prep, n_rot; float v_scale;
+             uint32_t split_keys; float rope_freq[32]; } args =
         { n_tokens, n_head, n_head_kv, head_dim, value_dim, pos0, ring, n_swa, first, has_sink ? 1u : 0u,
-          n_splits, keys_per_split, scale, hi_end, fuse ? 1u : 0u, fuse ? n_rot : 0u, v_scale, 0, { 0 } };
+          n_splits, keys_per_split, scale, hi_end, fuse ? 1u : 0u, fuse ? n_rot : 0u, v_scale,
+          qwen4_attn_split_keys(), { 0 } };
     for (uint32_t i = 0; fuse && i < n_rot / 2u && i < 32u; i++) {
         args.rope_freq[i] = 1.0f / powf(rope_base, (float)(2u * i) / (float)n_rot);
     }
