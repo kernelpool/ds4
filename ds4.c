@@ -59489,6 +59489,7 @@ typedef struct ds4_mimo_gpu_graph {
     int mtp_parent;
     uint32_t mtp_n_draft;
     int mtp_draft[DS4_DFLASH_BLOCK];
+    float mtp_hit[2];                        /* MTP draft 1 / 2 landed, smoothed */
     uint32_t n_verify;
     float *host_logits;
     uint32_t verify_pos, verify_rows;
@@ -59756,6 +59757,8 @@ static void mimo_graph_reset(ds4_mimo_gpu_graph *g) {
     memset(g->mtp_carry_ok, 0, sizeof(g->mtp_carry_ok));
     g->mtp_draft_valid = false;
     g->verify_rows = 0;
+    g->mtp_hit[0] = 0.6f;
+    g->mtp_hit[1] = 0.4f;
 }
 
 /* TP: this rank's partial of T rows plus the peer's, added in rank order so
@@ -76872,6 +76875,21 @@ static uint32_t mimo_spec_depth(uint32_t max, uint32_t dflt) {
     return v >= 1 && v <= (int)max ? (uint32_t)v : dflt;
 }
 
+/* MTP drafts per cycle unless DS4_MIMO_MTP_DEPTH sets them: three when that
+ * promises more tokens per verify cost than two.  The first two drafts are
+ * the same at either depth, so their landing rates are known; the third is
+ * taken to land after them as often as the second does after the first.
+ * Costs in one-row decodes: each verify row past the first adds about a third
+ * on an M3 Ultra, each MTP head's draft 0.07. */
+static uint32_t mimo_mtp_depth(const ds4_mimo_gpu_graph *g) {
+    const uint32_t fixed = mimo_spec_depth(DS4_N_NEXTN_PREDICT, 0u);
+    if (fixed) return fixed;
+    if (DS4_N_NEXTN_PREDICT < 3u) return DS4_N_NEXTN_PREDICT;
+    const float h1 = g->mtp_hit[0], h2 = g->mtp_hit[1];
+    const float t2 = 1.0f + h1 + h2, t3 = t2 + (h1 > 0.0f ? h2 * h2 / h1 : 0.0f);
+    return t3 / (1.0f + 0.33f * 3.0f + 0.21f) > t2 / (1.0f + 0.33f * 2.0f + 0.14f) ? 3u : 2u;
+}
+
 /* The drafter's bookkeeping after a forward whose first T rows (tokens at
  * p0..) are committed: the MTP chain catches up, or the DFlash context takes
  * the rows' features; with a parent the new drafts follow. */
@@ -76902,8 +76920,8 @@ static int ds4_session_mimo_spec_cycle(ds4_session *s, int first_token, float te
     ds4_mimo_gpu_graph *g = &s->mimo_graph;
     const ds4_model *m = &e->model;
     const ds4_weights *w = &e->weights;
-    const uint32_t V = DS4_N_VOCAB, depth = e->dflash_ready ?
-        mimo_spec_depth(e->dflash.block - 1u, 2u) : mimo_spec_depth(DS4_N_NEXTN_PREDICT, 2u);
+    const uint32_t V = DS4_N_VOCAB;
+    uint32_t depth = e->dflash_ready ? mimo_spec_depth(e->dflash.block - 1u, 2u) : mimo_mtp_depth(g);
     const bool trace = getenv("DS4_MIMO_SPEC_TRACE") != NULL;
     const uint32_t n = (uint32_t)s->checkpoint.len;
     if (g->mtp_draft_valid && first_token != g->mtp_parent) g->mtp_draft_valid = false;
@@ -76992,6 +77010,11 @@ static int ds4_session_mimo_spec_cycle(ds4_session *s, int first_token, float te
     s->mtp_draft_valid = false;
     s->mimo_spec_cycles++;
     s->mimo_spec_accepted += a;
+    if (!e->dflash_ready) {
+        g->mtp_hit[0] = 0.95f * g->mtp_hit[0] + 0.05f * (float)(a >= 1u);
+        if (D >= 2u) g->mtp_hit[1] = 0.95f * g->mtp_hit[1] + 0.05f * (float)(a >= 2u);
+        depth = mimo_mtp_depth(g);
+    }
     if (trace) {
         fprintf(stderr, "ds4: spec pos %u token %d drafts", n, first_token);
         for (uint32_t j = 0; j < D; j++) fprintf(stderr, " %d", toks[1u + j]);
