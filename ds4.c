@@ -74949,10 +74949,11 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         !(e->mimo_tp_slices = mimo_tp_slices_build(e, (uint32_t)ds4_tp_rank(tp), err, errlen))) {
         goto fail;
     }
-    /* both ranks run MiMo's MTP cycle, so both need --mtp */
+    /* both ranks run MiMo's MTP cycle, so both need the same MTP flags */
     if (ds4_model_is_mimo()) {
-        const int same = ds4_tp_hash_check(tp, 0, e->glm_mtp ? 1u : 0u, err, errlen);
-        if (same < 0) snprintf(err, errlen, "tp: MiMo needs --mtp on both ranks or on neither");
+        const int same = ds4_tp_hash_check(tp, 0, (e->glm_mtp ? 1u : 0u) | (e->dspark_exact_sampling ? 2u : 0u),
+                                           err, errlen);
+        if (same < 0) snprintf(err, errlen, "tp: MiMo needs the same --mtp and --mtp-exact-sampling on both ranks");
         if (same != 1) goto fail;
     }
 #endif
@@ -76986,22 +76987,41 @@ static int ds4_session_mimo_spec_cycle(ds4_session *s, int first_token, float te
     g->verify_rows = D + 1u;
     uint32_t a = 0;
     int replacement = -1;
-    for (; a < D; a++) {
+    /* exact sampling under TP: the leader's draws decide and the worker follows */
+    const bool tp_exact = e->tp.active && e->dspark_exact_sampling;
+    const bool follow = tp_exact && !ds4_session_tp_leader(s);
+    if (follow) {
+        int32_t r = -1, c = 0;
+        if (!ds4_tp_recv_verify_commit(e->tp.ctx, &r, &c) || c < 0 || (uint32_t)c > D ||
+            r < -1 || r >= (int32_t)V || (r >= 0 && (uint32_t)c == D)) {
+            if (errlen) snprintf(err, errlen, "tp: MiMo acceptance frame missing");
+            return -1;
+        }
+        a = (uint32_t)c;
+        replacement = r;
+    }
+    for (; !follow && a < D; a++) {
         const float *row = rows + (size_t)a * V;
         if (exact_sampling && temperature > 0.0f) {
             if (!rng || !sample_build_probabilities(row, V, temperature, top_k, top_p, min_p, s->sample_probs)) {
+                if (tp_exact) (void)ds4_tp_send_verify_commit(e->tp.ctx, -1, -1);   /* releases the worker */
                 if (errlen) snprintf(err, errlen, "MiMo mtp: target distribution failed");
                 return -1;
             }
             if (speculative_point_accept(s->sample_probs[toks[a + 1u]], 1.0f, rng)) continue;
             replacement = speculative_point_replacement(s, toks[a + 1u], rng);
             if (replacement < 0) {
+                if (tp_exact) (void)ds4_tp_send_verify_commit(e->tp.ctx, -1, -1);
                 if (errlen) snprintf(err, errlen, "MiMo mtp: replacement sampling failed");
                 return -1;
             }
             break;
         }
         if (sample_argmax(row, V) != toks[a + 1u]) break;
+    }
+    if (tp_exact && !follow && !ds4_tp_send_verify_commit(e->tp.ctx, replacement, (int32_t)a)) {
+        if (errlen) snprintf(err, errlen, "tp: MiMo acceptance send failed");
+        return -1;
     }
     for (uint32_t j = 0; j <= a; j++) token_vec_push(&s->checkpoint, toks[j]);
     g->pos = n + 1u + a;
@@ -77046,7 +77066,7 @@ static int ds4_session_mimo_spec_cycle(ds4_session *s, int first_token, float te
 
 /* Under TP both ranks run the cycle: the leader announces its token and
  * cap, and argmax acceptance over the same logits keeps the worker in step.
- * Exact sampling draws from the leader's RNG, so it decodes plainly there. */
+ * Exact sampling draws from the leader's RNG, which sends its decision. */
 static int ds4_session_mimo_spec(ds4_session *s, int first_token, float temperature, int top_k, float top_p,
                                  float min_p, uint64_t *rng, bool exact_sampling, int *accepted, int accepted_cap,
                                  char *err, size_t errlen) {
@@ -77055,7 +77075,7 @@ static int ds4_session_mimo_spec(ds4_session *s, int first_token, float temperat
         return ds4_session_mimo_spec_cycle(s, first_token, temperature, top_k, top_p, min_p, rng, exact_sampling,
                                            accepted, accepted_cap, err, errlen);
     }
-    if (exact_sampling || e->dflash_ready) {
+    if (e->dflash_ready) {
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
@@ -77065,7 +77085,7 @@ static int ds4_session_mimo_spec(ds4_session *s, int first_token, float temperat
         snprintf(err, errlen, "tp: worker eval send failed");
         return -1;
     }
-    const int rc = ds4_session_mimo_spec_cycle(s, first_token, temperature, top_k, top_p, min_p, rng, false,
+    const int rc = ds4_session_mimo_spec_cycle(s, first_token, temperature, top_k, top_p, min_p, rng, exact_sampling,
                                                accepted, cap, err, errlen);
     const bool worker_ok = ds4_tp_wait_command_ack(e->tp.ctx, s->tp_session_id, "MiMo MTP", err, errlen);
     if (rc < 0 || !worker_ok || ds4_gpu_tp_failed()) {
