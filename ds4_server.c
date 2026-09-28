@@ -7742,7 +7742,7 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
         }
 
         if (dt->mode == DSML_TRACK_BETWEEN) {
-            /* Qwen and GLM wrap every call: another one may follow before EOS */
+            /* Qwen, MiMo and GLM wrap every call: another one may follow before EOS */
             while (dt->pos < raw_len && isspace((unsigned char)raw[dt->pos])) dt->pos++;
             dt->decode = DSML_DECODE_OUTSIDE;
             if (dt->pos >= raw_len || raw_partial_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_start)) return;
@@ -7822,7 +7822,7 @@ structural:
                 dt->mode = DSML_TRACK_DONE;
                 dt->pos += strlen(dt->syn->tool_calls_end);
                 dt->decode = DSML_DECODE_OUTSIDE;
-                if (dt->model_syntax != SERVER_MODEL_SYNTAX_QWEN && dt->model_syntax != SERVER_MODEL_SYNTAX_GLM) return;
+                if (!syntax_is_chatml(dt->model_syntax) && dt->model_syntax != SERVER_MODEL_SYNTAX_GLM) return;
                 dt->calls_end = dt->pos;
                 dt->mode = DSML_TRACK_BETWEEN;
                 continue;
