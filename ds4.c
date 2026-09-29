@@ -80220,7 +80220,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         for (uint32_t i = 0; i < back; i++) toks[i] = s->checkpoint.v[g->pos - back + i];
         toks[back] = token;
         g->pos -= back;
-        if (!mimo_graph_forward_tokens(g, &e->model, &e->weights, toks, back + 1u, s->logits, false) ||
+        /* the replayed rows rewrite their K/V: row-exact, as their decodes wrote them */
+        const bool replay = back > 0;
+        if (!mimo_graph_forward_tokens(g, &e->model, &e->weights, toks, back + 1u, replay ? g->host_logits : s->logits,
+                                       replay) ||
             (e->glm_mtp && !mimo_graph_mtp_rows(g, &e->model, &e->weights, toks, back + 1u, g->pos - back - 1u,
                                                 -1, NULL, 0u, NULL)) ||
             (e->dflash_ready && !mimo_graph_dflash_inject(g, 1u, g->pos - 1u))) {
@@ -80228,6 +80231,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             if (errlen) snprintf(err, errlen, "MiMo decode failed at position %d", s->checkpoint.len);
             return 1;
         }
+        if (replay) memcpy(s->logits, g->host_logits + (size_t)back * DS4_N_VOCAB, DS4_N_VOCAB * sizeof(float));
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
