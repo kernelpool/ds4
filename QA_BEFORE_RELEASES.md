@@ -1983,7 +1983,8 @@ paired comparisons, also with decode graphs disabled. Separately run the
   greedy mismatches with their logit margins, not by loosening kernel tests.
   Run `tests/test_qwen4_kernels` under Metal validation and the real-model
   `tests/test_qwen4_ngram_state` for mixed ordinary/MTP cycles, failed batch
-  reads, exact recovery and the final context slot.
+  reads, exact recovery and the final context slot. `make
+  test-qwen4-verify-exact` must pass on each real model.
 - Start a four-slot Qwen Metal server with and without `--mtp`. Check concurrent
   tool calls, prefix reuse, cancellation, stop strings and one/two-token output
   limits. Repeat with `--mtp-exact-sampling`, mixing temperature-zero and
