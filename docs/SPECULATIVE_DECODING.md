@@ -75,7 +75,9 @@ draft** (one extra nextn-layer step conditioned on the predictor's own
 stream, verified in a 3-row pass) while recent first-draft acceptance is
 perfect, disengaging after repeated second-draft rejections.
 `DS4_QWEN4_MTP_DEPTH=2` or `=3` fixes the depth;
-`0` (default) is the adaptive policy.
+`0` (default) is the adaptive policy. The verify rows keep the one-token
+arithmetic, so greedy output of a single session equals plain decoding bit
+for bit.
 
 ## Sampling and reproducibility
 

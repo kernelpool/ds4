@@ -42,6 +42,8 @@ default. The 1024-token example above saves memory on smaller Macs.
 
 Use the same model options with `ds4-agent` or `ds4-server`.
 Add `--mtp` for speculative decoding using the built-in MTP weights.
+Its verify rows keep the one-token arithmetic, so temperature-zero output
+equals plain decoding bit for bit.
 `ds4-bench` benchmarks ordinary decoding; it does not accept `--mtp`.
 `--nothink` disables thinking. The server exposes
 `qwen3.8-flash-next`, `qwen3.8-flash-next-chat`, and
