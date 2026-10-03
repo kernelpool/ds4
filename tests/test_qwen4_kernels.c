@@ -2072,9 +2072,9 @@ static void test_moe_grouped(arena_t *a) {
                                              0, UINT32_MAX), "grouped: per-token down");
     require_ok(ds4_gpu_qwen4_moe_build_lists_tensor(glists, gcounts, gsel, T, slots, NE, cap), "grouped: lists");
     require_ok(ds4_gpu_qwen4_moe_mid_grouped_tensor(gmid[1], gx, gsel, glists, gcounts, cap, a->base, a->size, gate_off,
-                                                    up_off, 12u, NE, T, slots, E, F), "grouped: mid");
+                                                    up_off, 12u, NE, T, slots, E, F, 0, 0, UINT32_MAX), "grouped: mid");
     require_ok(ds4_gpu_qwen4_moe_down_grouped_tensor(gpart[1], gmid[0], gsel, glists, gcounts, cap, a->base, a->size,
-                                                     down_off, 39u, NE, T, slots, F, E), "grouped: down");
+                                                     down_off, 39u, NE, T, slots, F, E, 0, UINT32_MAX), "grouped: down");
     const uint64_t nm = (uint64_t)T * slots * F, np = (uint64_t)T * slots * E;
     float *am = download(gmid[0], nm), *bm = download(gmid[1], nm);
     float *ap = download(gpart[0], np), *bp = download(gpart[1], np);

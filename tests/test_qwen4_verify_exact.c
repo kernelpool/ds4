@@ -7,7 +7,9 @@
  * every position.  An engine with MTP then decodes the same tokens one at a
  * time, and through speculative cycles at draft depth 2 and 3; after every
  * step its logits must equal the plain logits at that position exactly.  The
- * last prompt is long enough for the sparse attention path. */
+ * copy prompt makes the continuation repeat earlier text, so prompt-lookup
+ * blocks of up to sixteen rows are verified too; the last prompt is long
+ * enough for the sparse attention path. */
 #include "ds4.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +21,9 @@
 static const char *prompts[] = {
     "The history of the printing press begins in the fifteenth century, when",
     "def merge_intervals(intervals):\n    \"\"\"Merge overlapping [start, end] pairs.\"\"\"\n",
+    "Original:\nThe lighthouse keeper rose before dawn, climbed the ninety-one steps, trimmed the wick, polished "
+    "the great lens until it shone, and wrote the weather, the wind and every passing ship into the log.\n"
+    "Copy:\nThe lighthouse keeper rose before dawn, climbed",
     NULL,   /* long: built in main */
 };
 #define N_PROMPTS (int)(sizeof(prompts) / sizeof(prompts[0]))
@@ -72,9 +77,9 @@ int main(void) {
         return 0;
     }
     char err[256] = {0};
-    const int n_ref = N_GEN + 3;   /* a last cycle may run two tokens past N_GEN */
+    const int n_ref = N_GEN + 16;   /* a last cycle may run past N_GEN */
     ds4_tokens prompt[N_PROMPTS] = {{0}};
-    int (*ref)[N_GEN + 3] = calloc(N_PROMPTS, sizeof(*ref));
+    int (*ref)[N_GEN + 16] = calloc(N_PROMPTS, sizeof(*ref));
     float *ref_logits = NULL;
     int V = 0;
 
@@ -125,8 +130,8 @@ int main(void) {
             worst = 0.0f;
             int token = ds4_session_argmax(s);
             while (produced < N_GEN) {
-                int accepted[4];
-                const int n = ds4_session_eval_speculative_argmax(s, token, N_GEN - produced, -1, accepted, 4,
+                int accepted[17];
+                const int n = ds4_session_eval_speculative_argmax(s, token, N_GEN - produced, -1, accepted, 17,
                                                                   err, sizeof(err));
                 if (n <= 0) fail(err[0] ? err : "speculative cycle");
                 int diverged = 0;

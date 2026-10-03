@@ -3394,8 +3394,12 @@ int ds4_gpu_qwen4_gdn_prep_tensor(
         const void *model_map, uint64_t model_size, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
         uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim);
 /* snap_state/snap2_state (optional) receive the state right after tokens
- * snap_tok/snap2_tok; two points serve the 3-row MTP verifier */
+ * snap_tok/snap2_tok; two points serve the 3-row MTP verifier.  With
+ * snapshot rows n, snap_state (and the conv and PLE histories' snapshots)
+ * holds n consecutive slots for the tokens snap_tok.. */
 void ds4_gpu_qwen4_set_verify_rows_exact(bool on);
+bool ds4_gpu_qwen4_verify_rows_exact(void);
+void ds4_gpu_qwen4_set_snapshot_rows(uint32_t rows);
 int ds4_gpu_qwen4_gdn_scan_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv,
         const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
@@ -3488,13 +3492,15 @@ int ds4_gpu_qwen4_moe_mid_grouped_tensor(
         const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t list_cap,
         const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
-        uint32_t in_dim, uint32_t ff_dim);
+        uint32_t in_dim, uint32_t ff_dim,
+        uint64_t shared_gate_offset, uint64_t shared_up_offset, uint32_t shared_type);
 int ds4_gpu_qwen4_moe_down_grouped_tensor(
         ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t list_cap,
         const void *model_map, uint64_t model_size, uint64_t down_offset,
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
-        uint32_t ff_dim, uint32_t out_dim);
+        uint32_t ff_dim, uint32_t out_dim,
+        uint64_t shared_down_offset, uint32_t shared_type);
 /* shared_gate NULL: no shared expert; shared NULL: the shared output is part
  * slot n_slots, otherwise `shared` [T][dim] holds it.  part_stride = slots per
  * token in part. */

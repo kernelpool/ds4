@@ -697,7 +697,7 @@ struct ds4_metal_args_qwen4_gdn_scan {
     uint32_t head_dim;
     uint32_t snap_tok;     /* copy the state after this token into snap_state (UINT32_MAX: never) */
     uint32_t snap2_tok;    /* second snapshot point for 3-row MTP verifies (UINT32_MAX: never) */
-    uint32_t pad1;
+    uint32_t snap_rows;    /* r4: tokens snap_tok.. go to consecutive snap_state slots */
     uint32_t pad2;
 };
 
@@ -915,8 +915,9 @@ kernel void kernel_qwen4_gdn_scan_r4(
         if (tiisg == 0) {
             *(device float4 *)(out + ((uint64_t)tok * args.n_v_head + h) * D + dv0) = float4(o[0], o[1], o[2], o[3]);
         }
-        if (tok == args.snap_tok) {
-            for (uint r = 0; r < 4; r++) *(device float4 *)(snaprow + r * D) = s[r];
+        if (tok - args.snap_tok < args.snap_rows) {
+            device float *slot = snaprow + (uint64_t)(tok - args.snap_tok) * args.n_v_head * D * D;
+            for (uint r = 0; r < 4; r++) *(device float4 *)(slot + r * D) = s[r];
         }
         if (tok == args.snap2_tok) {
             for (uint r = 0; r < 4; r++) *(device float4 *)(snap2row + r * D) = s[r];
@@ -1050,7 +1051,7 @@ struct ds4_metal_args_qwen4_ple_conv {
     uint32_t weight_f16;   /* taps stored as half */
     uint32_t snap_tok;     /* copy the history after this token into snap_history */
     uint32_t snap2_tok;    /* second snapshot point for 3-row MTP verifies */
-    uint32_t pad2;
+    uint32_t snap_rows;    /* tokens snap_tok.. go to consecutive snap_history slots */
 };
 
 /* R += gated + silu(dilated depthwise conv of normed).  history holds the
@@ -1087,8 +1088,8 @@ kernel void kernel_qwen4_ple_conv(
         for (uint t = 0; t + 1 < H; t++) hist[t] = hist[t + 1];
         hist[H - 1] = cur;
         R[tok * C + c] += gated[tok * C + c] + qwen4_silu(acc);
-        if (tok == args.snap_tok) {
-            for (uint t = 0; t < H; t++) snap_history[t * C + c] = hist[t];
+        if (tok - args.snap_tok < args.snap_rows) {
+            for (uint t = 0; t < H; t++) snap_history[((tok - args.snap_tok) * H + t) * C + c] = hist[t];
         }
         if (tok == args.snap2_tok) {
             for (uint t = 0; t < H; t++) snap2_history[t * C + c] = hist[t];
@@ -3303,6 +3304,176 @@ kernel void kernel_qwen4_moe_down_mxfp4_grouped(
     }
 }
 
+/* Q8_0 expert rows for up to four (token, slot) pairs per pass: each pair's
+ * dot keeps qwen4_row_dot's lane mapping and accumulation, so it equals the
+ * per-row kernels bit for bit, while the expert's rows are read once per pass
+ * instead of once per pair.  The shared expert (slot n_slots) takes the
+ * tokens in fours.  xoff/doff: each pair's input row and output row offsets. */
+template <uint NJ>
+static inline void qwen4_q8_pairs_dot(device const char *row, device const float *x, thread const uint *xoff,
+                                      uint in_dim, ushort tiisg, thread float *out) {
+    float acc[NJ];
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) acc[j] = 0.0f;
+    const short ix = tiisg / 8, it = tiisg % 8;
+    const uint nb = in_dim / 32;
+    for (uint ib = (uint)ix; ib < nb; ib += 4) {
+        device const char *b = row + (uint64_t)ib * 34;
+        const float d = (float)(*(device const half *)b);
+        device const char *q = b + 2 + it * 2;
+#pragma unroll
+        for (uint j = 0; j < NJ; j++) {
+            device const float *y = x + xoff[j] + ib * 32 + (uint)it * 2;
+            acc[j] += d * (y[0] * (float)q[0] + y[1] * (float)q[1] +
+                           y[16] * (float)q[16] + y[17] * (float)q[17]);
+        }
+    }
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) out[j] = simd_sum(acc[j]);
+}
+
+/* the pairs of one expert (or the shared expert's tokens) this simdgroup owns;
+ * 0 when another threadgroup owns them */
+static inline uint qwen4_q8_group(constant ds4_metal_args_qwen4_moe &args, device const int32_t *selected,
+                                  device const int32_t *lists, device const int32_t *counts, uint slot, uint tok,
+                                  thread device const int32_t *&list, thread uint64_t &ebase) {
+    if (slot == args.n_slots) {
+        list = nullptr;
+        ebase = 0;
+        return tok % 4u ? 0u : min(4u, args.n_tokens - tok);
+    }
+    const uint pair = tok * args.n_slots + slot;
+    const int32_t expert = selected[pair];
+    if (expert < 0 || (uint)expert >= args.n_total_expert) return 0;
+    list = lists + (uint64_t)(uint)expert * args.list_cap;
+    const uint count = min((uint)counts[expert], args.list_cap);
+    if (count == 0 || (uint)list[0] != pair) return 0;
+    ebase = (uint64_t)(uint)expert * args.expert_bytes;
+    return count;
+}
+
+/* pair j0 + j of the group: its token and slot */
+static inline uint2 qwen4_q8_pair(constant ds4_metal_args_qwen4_moe &args, device const int32_t *list,
+                                  uint slot, uint tok, uint j) {
+    if (!list) return uint2(tok + j, slot);
+    const uint p = (uint)list[j];
+    return uint2(p / args.n_slots, p % args.n_slots);
+}
+
+template <uint NJ>
+static inline void qwen4_moe_mid_q8_pass(constant ds4_metal_args_qwen4_moe &args, device const char *gb,
+                                         device const char *ub, device const float *x, device float *mid,
+                                         device const int32_t *list, uint slot, uint tok, uint j0, uint64_t ebase,
+                                         uint row_bytes, uint row0, ushort tiisg) {
+    const uint n_out = args.n_slots + args.has_shared;
+    uint xoff[NJ], moff[NJ];
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) {
+        const uint2 ts = qwen4_q8_pair(args, list, slot, tok, j0 + j);
+        xoff[j] = ts.x * args.in_dim;
+        moff[j] = (ts.x * n_out + ts.y) * args.out_rows;
+    }
+    for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
+        const uint64_t off = ebase + (uint64_t)r * row_bytes;
+        float g[NJ], u[NJ];
+        qwen4_q8_pairs_dot<NJ>(gb + off, x, xoff, args.in_dim, tiisg, g);
+        qwen4_q8_pairs_dot<NJ>(ub + off, x, xoff, args.in_dim, tiisg, u);
+        if (tiisg == 0) {
+#pragma unroll
+            for (uint j = 0; j < NJ; j++) mid[moff[j] + r] = qwen4_silu(g[j]) * u[j];
+        }
+    }
+}
+
+kernel void kernel_qwen4_moe_mid_q8_grouped(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *gate_base,
+        device const char    *up_base,
+        device const int32_t *selected,
+        device const float   *x,
+        device float         *mid,       /* [T][n_slots+has_shared][out_rows] */
+        device const char    *sh_gate,
+        device const char    *sh_up,
+        device const int32_t *lists,
+        device const int32_t *counts,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * 2u;
+    if (row0 >= args.out_rows || slot >= args.n_slots + args.has_shared || tok >= args.n_tokens) return;
+    device const int32_t *list;
+    uint64_t ebase;
+    const uint count = qwen4_q8_group(args, selected, lists, counts, slot, tok, list, ebase);
+    const bool shared = slot == args.n_slots;
+    device const char *gb = shared ? sh_gate : gate_base, *ub = shared ? sh_up : up_base;
+    const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
+    for (uint j0 = 0; j0 < count; j0 += 4u) {
+        switch (min(4u, count - j0)) {
+        case 1u: qwen4_moe_mid_q8_pass<1>(args, gb, ub, x, mid, list, slot, tok, j0, ebase, row_bytes, row0, tiisg); break;
+        case 2u: qwen4_moe_mid_q8_pass<2>(args, gb, ub, x, mid, list, slot, tok, j0, ebase, row_bytes, row0, tiisg); break;
+        case 3u: qwen4_moe_mid_q8_pass<3>(args, gb, ub, x, mid, list, slot, tok, j0, ebase, row_bytes, row0, tiisg); break;
+        default: qwen4_moe_mid_q8_pass<4>(args, gb, ub, x, mid, list, slot, tok, j0, ebase, row_bytes, row0, tiisg); break;
+        }
+    }
+}
+
+template <uint NJ>
+static inline void qwen4_moe_down_q8_pass(constant ds4_metal_args_qwen4_moe &args, device const char *db,
+                                          device const float *mid, device float *part,
+                                          device const int32_t *list, uint slot, uint tok, uint j0, uint64_t ebase,
+                                          uint row_bytes, uint row0, ushort tiisg) {
+    const uint n_out = args.n_slots + args.has_shared;
+    uint xoff[NJ], poff[NJ];
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) {
+        const uint2 ts = qwen4_q8_pair(args, list, slot, tok, j0 + j);
+        xoff[j] = (ts.x * n_out + ts.y) * args.in_dim;
+        poff[j] = (ts.x * n_out + ts.y) * args.out_rows;
+    }
+    for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
+        float v[NJ];
+        qwen4_q8_pairs_dot<NJ>(db + ebase + (uint64_t)r * row_bytes, mid, xoff, args.in_dim, tiisg, v);
+        if (tiisg == 0) {
+#pragma unroll
+            for (uint j = 0; j < NJ; j++) part[poff[j] + r] = v[j];
+        }
+    }
+}
+
+kernel void kernel_qwen4_moe_down_q8_grouped(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *down_base,
+        device const int32_t *selected,
+        device const float   *mid,       /* [T][n_slots+has_shared][in_dim] */
+        device float         *part,      /* [T][n_slots+has_shared][out_rows] */
+        device const char    *sh_down,
+        device const int32_t *lists,
+        device const int32_t *counts,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * 2u;
+    if (row0 >= args.out_rows || slot >= args.n_slots + args.has_shared || tok >= args.n_tokens) return;
+    device const int32_t *list;
+    uint64_t ebase;
+    const uint count = qwen4_q8_group(args, selected, lists, counts, slot, tok, list, ebase);
+    const bool shared = slot == args.n_slots;
+    device const char *db = shared ? sh_down : down_base;
+    const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
+    for (uint j0 = 0; j0 < count; j0 += 4u) {
+        switch (min(4u, count - j0)) {
+        case 1u: qwen4_moe_down_q8_pass<1>(args, db, mid, part, list, slot, tok, j0, ebase, row_bytes, row0, tiisg); break;
+        case 2u: qwen4_moe_down_q8_pass<2>(args, db, mid, part, list, slot, tok, j0, ebase, row_bytes, row0, tiisg); break;
+        case 3u: qwen4_moe_down_q8_pass<3>(args, db, mid, part, list, slot, tok, j0, ebase, row_bytes, row0, tiisg); break;
+        default: qwen4_moe_down_q8_pass<4>(args, db, mid, part, list, slot, tok, j0, ebase, row_bytes, row0, tiisg); break;
+        }
+    }
+}
+
 struct ds4_metal_args_qwen4_moe_reduce {
     uint32_t n_tokens;
     uint32_t n_slots;
@@ -4533,7 +4704,7 @@ struct ds4_metal_args_qwen4_gdn_front {
     uint32_t row_bytes;
     uint32_t snap_tok;     /* copy the conv history after this token into snap_state */
     uint32_t snap2_tok;    /* second snapshot point for 3-row MTP verifies */
-    uint32_t pad1;
+    uint32_t snap_rows;    /* tokens snap_tok.. go to consecutive snap_state slots */
     uint32_t pad2;
 };
 
@@ -4581,8 +4752,9 @@ kernel void kernel_qwen4_gdn_front(
             for (uint t = 0; t + 2 < K; t++) state[t * C + c] = state[(t + 1) * C + c];
             state[(K - 2) * C + c] = raw;
             row[c] = qwen4_silu(acc);
-            if (tok == args.snap_tok) {
-                for (uint t = 0; t + 1 < K; t++) snap_state[t * C + c] = state[t * C + c];
+            if (tok - args.snap_tok < args.snap_rows) {
+                device float *slot = snap_state + (uint64_t)(tok - args.snap_tok) * (K - 1) * C;
+                for (uint t = 0; t + 1 < K; t++) slot[t * C + c] = state[t * C + c];
             }
             if (tok == args.snap2_tok) {
                 for (uint t = 0; t + 1 < K; t++) snap2_state[t * C + c] = state[t * C + c];

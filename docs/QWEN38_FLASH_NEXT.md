@@ -225,7 +225,8 @@ the next checkpoint uses the visible history key for restart reuse.
 The MTP tests cover small prefill buffers, rewinds, reused sessions, and
 truncated checkpoints. `make test-qwen4-verify-exact` (`DS4_TEST_MODEL=<gguf>`)
 checks that MTP logits equal plain decoding bit for bit at draft depth 2 and
-3, including past the sparse-attention boundary. The logit-dump test requires NumPy and compares all-row
+3, including past the sparse-attention boundary and prompt-lookup blocks of
+up to sixteen rows. The logit-dump test requires NumPy and compares all-row
 prefill with teacher-forced decode across a chunk boundary. For official
 continuation scoring, use `--rendered-prompt`
 when a fixture already contains the complete model chat template.
