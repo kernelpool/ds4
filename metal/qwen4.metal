@@ -1227,6 +1227,7 @@ kernel void kernel_qwen4_gdn_fused(
         device float       *out,      /* [T][Hv*D] */
         device float       *snap_state,
         device float       *snap2_state,
+        device float       *state_out,  /* state, or a second buffer that keeps state unchanged */
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]]) {
@@ -1280,7 +1281,8 @@ kernel void kernel_qwen4_gdn_fused(
             for (uint r = 0; r < 4; r++) *(device float4 *)(snap2row + r * D) = s[r];
         }
     }
-    for (uint r = 0; r < 4; r++) *(device float4 *)(srow + r * D) = s[r];
+    device float *orow = state_out + ((uint64_t)h * D + dv0) * D + dk0;
+    for (uint r = 0; r < 4; r++) *(device float4 *)(orow + r * D) = s[r];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint t = sgitg; t < T; t += 32) {
 #pragma clang fp reassociate(off)
@@ -5823,7 +5825,8 @@ struct ds4_metal_args_qwen4_rows_conv {
 /* kernel_mul_mv_q8_0_f32_rows with kernel_qwen4_gdn_front's conv on its rows (the
  * qkv channels): the thread that writes channel c convolves its NR1 tokens in
  * order, advancing the history and taking gdn_front's history snapshots.  The
- * leading threadgroups take the rows' alpha/beta row dots. */
+ * leading threadgroups take the rows' alpha/beta row dots, the trailing ones
+ * (zargs.ne01 rows) the z projection as kernel_mul_mv_q8_0_f32_rows. */
 template<short NR1>
 kernel void kernel_qwen4_q8_rows_conv(
         constant ds4_metal_args_mul_mv & args,
@@ -5841,6 +5844,9 @@ kernel void kernel_qwen4_q8_rows_conv(
         device const char *w_beta,
         device float *ga,
         device float *gb,
+        constant ds4_metal_args_mul_mv & zargs,
+        device const char * zsrc0,
+        device       char * zdst,
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
@@ -5853,6 +5859,12 @@ kernel void kernel_qwen4_q8_rows_conv(
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NQ = 8;
     constexpr short NR0 = N_R0_Q8_0;
+    const uint qkv_groups = (args.ne01 + NR0 - 1) / NR0;
+    if (tgpig.x >= qkv_groups) {
+        tgpig.x -= qkv_groups;
+        kernel_mul_mv_q8_0_f32_rows_impl<NR1>(zargs, zsrc0, src1, zdst, shmem, tgpig, tiisg, sgitg);
+        return;
+    }
     const int nb = args.ne00/QK8_0;
     const int r0 = tgpig.x*NR0;
     device const block_q8_0 * ax[NR0];

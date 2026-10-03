@@ -203,15 +203,15 @@ kernel void kernel_mul_mv_q8_0_f32(
 // equals the decode of its tokens.  Threadgroup memory: NR1 times the
 // single-row kernel's.
 template<short NR1>
-kernel void kernel_mul_mv_q8_0_f32_rows(
+static inline void kernel_mul_mv_q8_0_f32_rows_impl(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
     const short NSG = FC_mul_mv_nsg;
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NQ = 8;
@@ -266,6 +266,19 @@ kernel void kernel_mul_mv_q8_0_f32_rows(
         helper_mv_reduce_and_write<NR0>((device float *) dst + (uint64_t)j*args.ne0, sumf[j], r0, args.ne01,
                                         tiisg, sgitg, shmem + j*NR0*NW*sizeof(float));
     }
+}
+
+template<short NR1>
+kernel void kernel_mul_mv_q8_0_f32_rows(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_rows_impl<NR1>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 typedef decltype(kernel_mul_mv_q8_0_f32_rows<2>) kernel_mul_mv_q8_0_f32_rows_t;
