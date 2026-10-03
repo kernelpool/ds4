@@ -48382,6 +48382,7 @@ enum {
     QWEN4_K_VIS_ATTENTION,
     QWEN4_K_VIS_BIAS_RESIDUAL,
     QWEN4_K_VIS_BIAS_ACT,
+    QWEN4_K_MOE_ROW_SHIFT,
     QWEN4_K_COUNT,
 };
 
@@ -48489,12 +48490,13 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_vis_attention",
     "kernel_qwen4_vis_bias_residual",
     "kernel_qwen4_vis_bias_act",
+    "kernel_qwen4_moe_row_shift",
 };
 
 typedef struct {
     uint32_t n_tokens, n_slots, n_out, in_dim, out_rows, weight_type, row_bytes, list_cap;
     uint64_t expert_bytes;
-    uint32_t n_expert, tiles_per_launch, tail_base, expert_major;
+    uint32_t n_expert, tiles_per_launch, tail_base, expert_major, row_shift;
 } qwen4_moe_mm_args;
 
 /* Expert-major tile order (DS4_QWEN4_MOE_MM_ORDER=0 restores the tile-major
@@ -49948,7 +49950,7 @@ int ds4_gpu_qwen4_moe_reduce_add_tensor(
 int ds4_gpu_qwen4_moe_build_lists_tensor(
         ds4_gpu_tensor *lists, ds4_gpu_tensor *counts, const ds4_gpu_tensor *selected,
         uint32_t n_tokens, uint32_t n_slots, uint32_t n_expert, uint32_t list_cap) {
-    qwen4_moe_mm_args args = { n_tokens, n_slots, 0, 0, 0, 0, 0, list_cap, 0, n_expert, 0, 0, 0 };
+    qwen4_moe_mm_args args = { n_tokens, n_slots, 0, 0, 0, 0, 0, list_cap, 0, n_expert, 0, 0, 0, 0 };
     qwen4_bind b[3];
     if (n_tokens == 0 || n_slots == 0 || n_expert == 0 || n_expert > 512 || list_cap == 0 ||
         !qwen4_bind_tensor(&b[0], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
@@ -50100,7 +50102,7 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
                        nt == 2u ? QWEN4_K_MOE_MM_MID_NT2 :
                        nt == 8u ? QWEN4_K_MOE_MM_MID_NT8 : QWEN4_K_MOE_MM_MID;
     qwen4_moe_mm_args args = { n_tokens, n_slots, n_out, in_dim, ff_dim, weight_type, row_bytes, list_cap,
-                               expert_bytes, n_expert, tiles, 0, qwen4_moe_mm_expert_major() };
+                               expert_bytes, n_expert, tiles, 0, qwen4_moe_mm_expert_major(), 0 };
     const bool tails = qwen4_moe_mm_tails(weight_type, nt);
     if (tails) args.tail_base = nt * 8u;
     qwen4_bind b[8];
@@ -50169,6 +50171,22 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
     return 1;
 }
 
+/* shifts for the rows of mid that would overflow the down tiles' half
+ * staging; the next ds4_gpu_qwen4_moe_mm_down_tensor on this mid applies them */
+static const ds4_gpu_tensor *g_qwen4_row_shift, *g_qwen4_row_shift_for;
+int ds4_gpu_qwen4_moe_row_shift_tensor(ds4_gpu_tensor *shift, const ds4_gpu_tensor *mid, uint32_t rows, uint32_t dim) {
+    const uint32_t dims[2] = { rows, dim };
+    qwen4_bind b[2];
+    if (rows == 0 || (dim % 4u) != 0 ||
+        !qwen4_bind_tensor(&b[0], mid, (uint64_t)rows * dim * sizeof(float), "moe mid") ||
+        !qwen4_bind_tensor(&b[1], shift, (uint64_t)rows * sizeof(uint32_t), "moe row shift") ||
+        !qwen4_dispatch(QWEN4_K_MOE_ROW_SHIFT, dims, sizeof(dims), b, 2, MTLSizeMake((rows + 3u) / 4u, 1, 1),
+                        MTLSizeMake(128, 1, 1), 0)) return 0;
+    g_qwen4_row_shift = shift;
+    g_qwen4_row_shift_for = mid;
+    return 1;
+}
+
 int ds4_gpu_qwen4_moe_mm_down_tensor(
         ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
         const void *model_map, uint64_t model_size, uint64_t down_offset,
@@ -50183,7 +50201,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
                        nt == 2u ? QWEN4_K_MOE_MM_DOWN_NT2 :
                        nt == 8u ? QWEN4_K_MOE_MM_DOWN_NT8 : QWEN4_K_MOE_MM_DOWN;
     qwen4_moe_mm_args args = { n_tokens, n_slots, n_out, ff_dim, out_dim, weight_type, row_bytes, list_cap,
-                               expert_bytes, n_expert, tiles, 0, qwen4_moe_mm_expert_major() };
+                               expert_bytes, n_expert, tiles, 0, qwen4_moe_mm_expert_major(), 0 };
     const bool tails = qwen4_moe_mm_tails(weight_type, nt);
     if (tails) args.tail_base = nt * 8u;
     qwen4_bind b[6];
@@ -50197,6 +50215,9 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
         !qwen4_bind_tensor(&b[4], part, (uint64_t)n_tokens * n_out * out_dim * sizeof(float), "moe partial")) {
         return 0;
     }
+    /* the NAX tiles stage their own half copy of mid and do not take the shifts */
+    const bool shifted = g_qwen4_row_shift_for == mid;
+    g_qwen4_row_shift_for = NULL;
     const uint32_t nax = qwen4_moe_mm_nax(weight_type);
     const bool nax_fx = qwen4_moe_mm_nax_fx(weight_type);
     bool nax_comp = qwen4_moe_mm_nax_comp(weight_type);
@@ -50241,14 +50262,18 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
                               qwen4_moe_mm_grid((out_dim + 63u) / 64u, n_expert, 1, args.expert_major),
                               MTLSizeMake(128, 1, 1), 8192u);
     }
-    if (!qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
+    b[5] = b[3];
+    if (shifted && !qwen4_bind_tensor(&b[5], g_qwen4_row_shift, (uint64_t)n_tokens * n_out * sizeof(uint32_t),
+                                      "moe row shift")) return 0;
+    args.row_shift = shifted;
+    if (!qwen4_dispatch(kernel, &args, sizeof(args), b, 6,
                           qwen4_moe_mm_grid((out_dim + 31u) / 32u, n_expert, tiles, args.expert_major),
                           MTLSizeMake(128, 1, 1), 0)) return 0;
     if (tails) {
         const MTLSize tail_grid = MTLSizeMake((out_dim + 31u) / 32u, n_expert, 1);
-        if (!qwen4_dispatch(QWEN4_K_MOE_MM_DOWN_NT1, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
-        if (nt > 2u && !qwen4_dispatch(QWEN4_K_MOE_MM_DOWN_NT2, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
-        if (nt > 4u && !qwen4_dispatch(QWEN4_K_MOE_MM_DOWN, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
+        if (!qwen4_dispatch(QWEN4_K_MOE_MM_DOWN_NT1, &args, sizeof(args), b, 6, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
+        if (nt > 2u && !qwen4_dispatch(QWEN4_K_MOE_MM_DOWN_NT2, &args, sizeof(args), b, 6, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
+        if (nt > 4u && !qwen4_dispatch(QWEN4_K_MOE_MM_DOWN, &args, sizeof(args), b, 6, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
     }
     return 1;
 }

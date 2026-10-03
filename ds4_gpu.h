@@ -3527,6 +3527,8 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
         const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
         uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
         uint32_t in_dim, uint32_t ff_dim, uint32_t list_cap);
+/* per-row power-of-two shifts that keep mid finite in the next mm down on it */
+int ds4_gpu_qwen4_moe_row_shift_tensor(ds4_gpu_tensor *shift, const ds4_gpu_tensor *mid, uint32_t rows, uint32_t dim);
 int ds4_gpu_qwen4_moe_mm_down_tensor(
         ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
         const void *model_map, uint64_t model_size, uint64_t down_offset,

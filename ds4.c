@@ -59460,7 +59460,7 @@ static bool qwen4_graph_forward_token(ds4_qwen4_gpu_graph *g, const ds4_model *m
  * (a batched decode is one forward over every session's row) */
 #define DS4_MIMO_SCRATCH_FIELDS(X) \
     X(h) X(xn) X(qkv) X(q) X(attn_o) X(blk) X(attn_part) X(router) X(selected) X(weights) X(mid) X(part) \
-    X(moe_lists) X(moe_counts) X(ffn_g) X(ffn_u) X(ffn_m) X(logits) X(mtp_cat)
+    X(moe_lists) X(moe_counts) X(moe_shift) X(ffn_g) X(ffn_u) X(ffn_m) X(logits) X(mtp_cat)
 #define DS4_MIMO_BATCH_MAX_ROWS 32u
 
 typedef struct ds4_mimo_gpu_graph {
@@ -59469,7 +59469,7 @@ typedef struct ds4_mimo_gpu_graph {
     uint32_t cap_tokens;
     uint32_t n_logit_rows;
     ds4_gpu_tensor *h, *xn, *qkv, *q, *attn_o, *blk, *attn_part;
-    ds4_gpu_tensor *router, *selected, *weights, *mid, *part, *moe_lists, *moe_counts;
+    ds4_gpu_tensor *router, *selected, *weights, *mid, *part, *moe_lists, *moe_counts, *moe_shift;
     ds4_gpu_tensor *ffn_g, *ffn_u, *ffn_m, *logits;
     bool owns_scratch;
     bool batch_exact;                      /* the arena: batched rows keep the single-row Q8 kernel */
@@ -59677,6 +59677,7 @@ static bool mimo_graph_alloc(ds4_mimo_gpu_graph *g, const ds4_weights *w, uint32
     MIMO_ALLOC(part, T * K * E);
     MIMO_ALLOC(moe_lists, NE * T);
     MIMO_ALLOC(moe_counts, NE);
+    MIMO_ALLOC(moe_shift, T * K);
     MIMO_ALLOC(ffn_g, T * DS4_N_FF_DENSE);
     MIMO_ALLOC(ffn_u, T * DS4_N_FF_DENSE);
     MIMO_ALLOC(ffn_m, T * DS4_N_FF_DENSE);
@@ -59852,6 +59853,7 @@ static bool mimo_graph_moe(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_
         ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, K, NE, g->cap_tokens) &&
              ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->xn, g->moe_lists, g->moe_counts, m->map, m->size,
                                              gate_off, up_off, l->ffn_gate_exps->type, NE, T, K, K, E, FF, g->cap_tokens) &&
+             ds4_gpu_qwen4_moe_row_shift_tensor(g->moe_shift, g->mid, T * K, FF) &&
              ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->moe_lists, g->moe_counts, m->map, m->size,
                                               down_off, l->ffn_down_exps->type, NE, T, K, K, FF, E, g->cap_tokens);
     } else if (ok && grouped) {

@@ -3615,6 +3615,7 @@ struct ds4_metal_args_qwen4_moe_mm {
     uint32_t tiles_per_launch;
     uint32_t tail_base; /* host binds the same value to function constant 905 */
     uint32_t expert_major; /* grid x = tile * row_blocks + row_block, z = 1 */
+    uint32_t row_shift;    /* down: midv rows carry kernel_qwen4_moe_row_shift's shifts */
 };
 
 /* Threadgroup -> (row block, first tile).  Expert-major order keeps one
@@ -3988,6 +3989,26 @@ kernel void kernel_qwen4_moe_mm_mid<4>(constant ds4_metal_args_qwen4_moe_mm &, d
 template [[host_name("kernel_qwen4_moe_mm_mid_nt8")]]
 kernel void kernel_qwen4_moe_mm_mid<8>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort);
 
+/* The down tiles stage mid as half.  A row whose largest |value| would round
+ * to inf there (>= 65520) gets shift k so that it lands in [2^14, 2^15):
+ * staged as mid * 2^-k, the output scaled back by 2^k, both exact.  Every
+ * other row gets 0 and keeps its arithmetic.  One simdgroup per row. */
+kernel void kernel_qwen4_moe_row_shift(
+        constant uint2 & dims,            /* rows, dim (a multiple of 4) */
+        device const float *x,
+        device uint        *shift,
+        uint tg [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint r = tg * 4u + sg;
+    if (r >= dims.x) return;
+    device const uint4 *u = (device const uint4 *)(x + (uint64_t)r * dims.y);
+    uint4 m = uint4(0u);
+    for (uint i = lane; i < dims.y / 4u; i += 32u) m = max(m, u[i] & 0x7fffffffu);
+    const uint mx = simd_max(max(max(m.x, m.y), max(m.z, m.w)));
+    if (lane == 0) shift[r] = mx >= 0x477ff000u ? (mx >> 23) - 141u : 0u;
+}
+
 /* part[t][slot][r] = down . mid[t][slot], same tiling with mid as B */
 template <uint NT>
 kernel void kernel_qwen4_moe_mm_down(
@@ -3997,6 +4018,7 @@ kernel void kernel_qwen4_moe_mm_down(
         device const int32_t *counts,
         device const float   *midv,       /* [T][n_out][in_dim] */
         device float         *part,       /* [T][n_out][out_rows] */
+        device const uint    *row_shift,  /* [T][n_out] when args.row_shift */
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
@@ -4033,6 +4055,8 @@ kernel void kernel_qwen4_moe_mm_down(
         const int my_pair = my_tok < n_tile ? list[t0 + my_tok] : -1;
         const uint64_t my_row = my_pair >= 0 ?
             ((uint64_t)((uint)my_pair / args.n_slots) * args.n_out + (uint)my_pair % args.n_slots) : 0;
+        const uint my_shift = args.row_shift && my_pair >= 0 ? row_shift[my_row] : 0u;
+        const float my_scale = as_type<float>((127u - my_shift) << 23);
         for (uint kb = 0; kb < nk; kb++) {
             {
                 const uint r = tid / 4, q = tid % 4;
@@ -4051,7 +4075,8 @@ kernel void kernel_qwen4_moe_mm_down(
                 constexpr uint K_PER_THREAD = QWEN4_MM_KS * TT / 128;
                 device const float *mr = midv + my_row * args.in_dim + kb * QWEN4_MM_KS + kq * K_PER_THREAD;
                 for (uint j = 0; j < K_PER_THREAD; j += 4) {
-                    const float4 v = my_pair >= 0 ? *(device const float4 *)(mr + j) : float4(0.0f);
+                    float4 v = my_pair >= 0 ? *(device const float4 *)(mr + j) : float4(0.0f);
+                    if (my_shift) v *= my_scale;
                     Bs[(kq * K_PER_THREAD + j + 0) * TT + tok] = (half)v.x;
                     Bs[(kq * K_PER_THREAD + j + 1) * TT + tok] = (half)v.y;
                     Bs[(kq * K_PER_THREAD + j + 2) * TT + tok] = (half)v.z;
@@ -4078,7 +4103,9 @@ kernel void kernel_qwen4_moe_mm_down(
                 if (tok >= n_tile || row >= args.out_rows) continue;
                 const int pair = list[t0 + tok];
                 const uint t = (uint)pair / args.n_slots, slot = (uint)pair % args.n_slots;
-                part[((uint64_t)t * args.n_out + slot) * args.out_rows + row] = Cs[sg][el];
+                const uint64_t pr = (uint64_t)t * args.n_out + slot;
+                const uint sh = args.row_shift ? row_shift[pr] : 0u;
+                part[pr * args.out_rows + row] = sh ? Cs[sg][el] * as_type<float>((127u + sh) << 23) : Cs[sg][el];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -4086,16 +4113,16 @@ kernel void kernel_qwen4_moe_mm_down(
 }
 
 template [[host_name("kernel_qwen4_moe_mm_down_nt1")]]
-kernel void kernel_qwen4_moe_mm_down<1>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort);
+kernel void kernel_qwen4_moe_mm_down<1>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, device const uint *, uint3, ushort, ushort);
 
 template [[host_name("kernel_qwen4_moe_mm_down_nt2")]]
-kernel void kernel_qwen4_moe_mm_down<2>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort);
+kernel void kernel_qwen4_moe_mm_down<2>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, device const uint *, uint3, ushort, ushort);
 
 template [[host_name("kernel_qwen4_moe_mm_down")]]
-kernel void kernel_qwen4_moe_mm_down<4>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort);
+kernel void kernel_qwen4_moe_mm_down<4>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, device const uint *, uint3, ushort, ushort);
 
 template [[host_name("kernel_qwen4_moe_mm_down_nt8")]]
-kernel void kernel_qwen4_moe_mm_down<8>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort);
+kernel void kernel_qwen4_moe_mm_down<8>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, device const uint *, uint3, ushort, ushort);
 
 /* rows of floats -> halves (round to nearest even), four values per thread;
  * the tensor-op tiles read their activation operand from this copy. */
