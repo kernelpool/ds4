@@ -1346,7 +1346,13 @@ static void ds4_gpu_invalidate_completion_counters(void) {
     g_dsv4_hc_producer_last_completion = nil;
 }
 
+static double ds4_gpu_now_ms(void);
+
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
+    /* Poll before blocking: waking from waitUntilCompleted adds about 0.3 ms
+     * to every decode step.  Waits longer than 100 ms block. */
+    const double t0 = ds4_gpu_now_ms();
+    while (cb.status < MTLCommandBufferStatusCompleted && ds4_gpu_now_ms() - t0 < 100.0) {}
     [cb waitUntilCompleted];
     if (getenv("DS4_METAL_CB_TIMES")) {
         static double prev_gpu_end;
@@ -1562,7 +1568,6 @@ static int ds4_gpu_wait_pending_command_buffers(const char *label) {
 }
 
 static double g_batch_cb_created_ms;
-static double ds4_gpu_now_ms(void);
 static void ds4_gpu_queue_keepalive_start(void);
 static void ds4_gpu_queue_keepalive_stop_thread(void);
 static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, const char *label) {
