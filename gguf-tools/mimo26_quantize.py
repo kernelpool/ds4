@@ -39,12 +39,15 @@ ARCH = "mimo2"
 FP8_BLOCK = 128
 QUANTIZATION = {
     "mxfp4": "released MXFP4 gate/up/down; Q8_0 attention/dense/head",
+    "q2": "imatrix IQ2_XXS gate/up and Q2_K down from the released MXFP4 experts; Q8_0 attention/dense/head",
+    "q4": "Q4_K gate/up/down from the released MXFP4 experts; Q8_0 attention/dense/head",
     "q8": "Q8_0 gate/up/down; Q8_0 attention/dense/head",
     "f32": "F32 everything",
 }
-MATRIX_QTYPE = {"mxfp4": QTYPE_Q8_0, "q8": QTYPE_Q8_0, "f32": QTYPE_F32}
-EXPERT_QTYPE = {"mxfp4": QTYPE_MXFP4, "q8": QTYPE_Q8_0, "f32": QTYPE_F32}
-EMBED_QTYPE = {"mxfp4": QTYPE_BF16, "q8": QTYPE_BF16, "f32": QTYPE_F32}
+MATRIX_QTYPE = {"mxfp4": QTYPE_Q8_0, "q2": QTYPE_Q8_0, "q4": QTYPE_Q8_0, "q8": QTYPE_Q8_0, "f32": QTYPE_F32}
+EXPERT_QTYPE = {"mxfp4": QTYPE_MXFP4, "q2": QTYPE_IQ2_XXS, "q4": QTYPE_Q4_K, "q8": QTYPE_Q8_0, "f32": QTYPE_F32}
+EXPERT_DOWN_QTYPE = {"q2": QTYPE_Q2_K}
+EMBED_QTYPE = {"mxfp4": QTYPE_BF16, "q2": QTYPE_BF16, "q4": QTYPE_BF16, "q8": QTYPE_BF16, "f32": QTYPE_F32}
 
 
 def scale_inv_name(name):
@@ -216,7 +219,8 @@ def build_plan(db, layout, quant):
             pattern = f"{src}.mlp.experts.{{expert}}.{part}_proj.weight"
             for expert in range(experts):
                 claim(pattern.format(expert=expert), (shape[0], shape[1] // 2), "U8")
-            plan.append(TensorPlan(f"{dst}.ffn_{part}_exps.weight", (*reversed(shape), experts), eq,
+            qtype = EXPERT_DOWN_QTYPE.get(quant, eq) if part == "down" else eq
+            plan.append(TensorPlan(f"{dst}.ffn_{part}_exps.weight", (*reversed(shape), experts), qtype,
                                    "experts", source=pattern, expert_layer=layer, expert_part=part,
                                    expert_count=experts))
 
@@ -591,6 +595,8 @@ def main():
         parser.error("source revision must be a full commit hash")
     if not 1 <= args.threads <= 32:
         parser.error("threads must be between 1 and 32")
+    if args.quant == "q2" and not args.imatrix:
+        parser.error("the q2 recipe needs --imatrix (IQ2_XXS is calibrated)")
     config = load_config(args.hf)
     layout = Layout(config, model_tp(args.hf))
     db = SourceDB(args.hf, index_validator=validate_index, scale_validator=make_scale_validator(layout))

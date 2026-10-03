@@ -59474,6 +59474,7 @@ typedef struct ds4_mimo_gpu_graph {
     bool owns_scratch;
     bool batch_exact;                      /* the arena: batched rows keep the single-row Q8 kernel */
     bool rows_exact;                       /* this forward's rows are all read (a verify block): likewise */
+    ds4_imatrix_collector *imatrix;        /* --imatrix-dataset: routed expert statistics */
     ds4_gpu_tensor *k_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *v_cache[DS4_MAX_LAYER];
     uint32_t ring[DS4_MAX_LAYER];
@@ -59824,6 +59825,43 @@ static bool mimo_graph_dense_ffn(ds4_mimo_gpu_graph *g, const ds4_model *m, cons
            mimo_gemv(g, g->blk, m, l->ffn_down, g->ffn_m, T);
 }
 
+/* --imatrix-dataset: each routed expert's gate/up input (the normalized row)
+ * and down input (the SwiGLU row times its route weight), squared and summed,
+ * as the DeepSeek graph's collector records them. */
+static bool mimo_imatrix_collect(ds4_mimo_gpu_graph *g, uint32_t il, uint32_t T) {
+    ds4_imatrix_collector *c = g->imatrix;
+    const uint32_t E = DS4_N_EMBD, K = DS4_N_EXPERT_USED, FF = DS4_N_FF_EXP;
+    if (T > c->cap_tokens) return false;
+    float *w = xmalloc((size_t)T * K * sizeof(float));
+    bool ok = ds4_gpu_end_commands() &&
+              ds4_gpu_tensor_read(g->xn, 0, c->ffn_norm_buf, (uint64_t)T * E * sizeof(float)) &&
+              ds4_gpu_tensor_read(g->mid, 0, c->routed_mid_buf, (uint64_t)T * K * FF * sizeof(float)) &&
+              ds4_gpu_tensor_read(g->selected, 0, c->selected_buf, (uint64_t)T * K * sizeof(int)) &&
+              ds4_gpu_tensor_read(g->weights, 0, w, (uint64_t)T * K * sizeof(float));
+    for (uint32_t t = 0; ok && t < T; t++) {
+        const float *x = c->ffn_norm_buf + (size_t)t * E;
+        for (uint32_t i = 0; i < E; i++) c->sq_tmp[i] = x[i] * x[i];
+        for (uint32_t k = 0; k < K; k++) {
+            const int ex = c->selected_buf[(size_t)t * K + k];
+            if (ex < 0 || (uint32_t)ex >= DS4_N_EXPERT) continue;
+            float *gu = imatrix_gate_up_ptr(c, il, (uint32_t)ex);
+            for (uint32_t i = 0; i < E; i++) gu[i] += c->sq_tmp[i];
+            const float rw = w[(size_t)t * K + k];
+            const float *mid = c->routed_mid_buf + ((size_t)t * K + k) * FF;
+            float *dn = imatrix_down_ptr(c, il, (uint32_t)ex);
+            for (uint32_t i = 0; i < FF; i++) {
+                const float v = rw * mid[i];
+                dn[i] += v * v;
+            }
+            c->gate_up_count[il][ex]++;
+            c->down_count[il][ex]++;
+            c->observed_routes++;
+        }
+    }
+    free(w);
+    return ok && glm_graph_begin_commands_if_needed();
+}
+
 /* router GEMV + sigmoid top-k, experts per (token, slot) rows or, for
  * prefill-sized batches, the expert-grouped tiled GEMMs, weighted reduce */
 static bool mimo_graph_moe(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, ds4_gpu_tensor *h,
@@ -59869,6 +59907,7 @@ static bool mimo_graph_moe(ds4_mimo_gpu_graph *g, const ds4_model *m, const ds4_
              ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, down_off,
                                            l->ffn_down_exps->type, NE, T, K, FF, E, 0u, UINT32_MAX) != 0;
     }
+    if (ok && g->imatrix && !tp) ok = mimo_imatrix_collect(g, il, T);
     if (!tp) return ok && ds4_gpu_qwen4_moe_reduce_add_tensor(h, g->part, g->weights, T, K, E) != 0;
     return ok && ds4_gpu_qwen4_moe_reduce_tensor(mimo_tp_out(g, g->blk, il, DS4_TP_GATE_FFN, T), g->part, g->weights,
                                                  NULL, NULL, NULL, NULL, T, K, K, E, 0u) &&
@@ -65737,6 +65776,110 @@ static int ds4_engine_collect_sequential_imatrix(
 #endif
     return ok ? 0 : 1;
 }
+
+#ifdef DS4_HAS_MIMO_GPU
+/* MiMo: each prompt prefills in chunks through the release graph with the
+ * collector attached to its routed layers. */
+static int ds4_engine_collect_mimo_imatrix(
+        ds4_engine *e,
+        char       *dataset,
+        size_t      dataset_len,
+        const char *dataset_path,
+        const char *output_path,
+        int         ctx_size,
+        int         max_prompts,
+        int         max_tokens,
+        int         min_expert_samples) {
+    if (e->tp.active) {
+        fprintf(stderr, "ds4: MiMo imatrix collection requires a single-host session\n");
+        return 1;
+    }
+    const uint32_t chunk = mimo_prefill_chunk_tokens((uint32_t)ctx_size);
+    ds4_mimo_gpu_graph *g = xcalloc(1, sizeof(*g));
+    ds4_imatrix_collector collector;
+    memset(&collector, 0, sizeof(collector));
+    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    bool ok = mimo_graph_alloc(g, &e->weights, (uint32_t)ctx_size, chunk, false, NULL, NULL, NULL, 0u);
+    if (ok) ok = imatrix_collector_init(&collector, chunk, dataset_path);
+    if (!ok) fprintf(stderr, "ds4: failed to allocate the MiMo imatrix graph\n");
+    g->imatrix = &collector;
+    fprintf(stderr, "ds4: collecting MiMo routed imatrix from %s (layers=%u experts=%u ctx=%d chunk=%u)\n",
+            dataset_path, DS4_N_LAYER, DS4_N_EXPERT, ctx_size, chunk);
+
+    int prompts_done = 0, tokens_done = 0;
+    bool sample_target_reached = false;
+    char *cursor = dataset;
+    const char *marker_lit = "===== DS4_IMATRIX_PROMPT";
+    while (ok && *cursor) {
+        char *start = cursor;
+        char *marker = imatrix_find_marker(dataset, cursor, marker_lit);
+        if (marker) {
+            char *nl = strchr(marker, '\n');
+            if (!nl) break;
+            start = nl + 1;
+        } else if (prompts_done != 0) {
+            break;
+        }
+        char *next = imatrix_find_marker(dataset, start, marker_lit);
+        char *end = next ? next : dataset + dataset_len;
+        const char saved = *end;
+        char *prompt_text = imatrix_trim_block(start, end);
+        if (prompt_text[0] != '\0') {
+            token_vec prompt = {0};
+            ds4_tokenize_rendered_chat(e, prompt_text, &prompt);
+            if (prompt.len > ctx_size) prompt.len = ctx_size;
+            if (max_tokens > 0 && prompt.len > max_tokens - tokens_done) prompt.len = max_tokens - tokens_done;
+            if (prompt.len > 0) {
+                mimo_graph_reset(g);
+                for (int pos = 0; ok && pos < prompt.len; pos += (int)chunk) {
+                    const uint32_t n = prompt.len - pos < (int)chunk ? (uint32_t)(prompt.len - pos) : chunk;
+                    ok = mimo_graph_forward_tokens(g, &e->model, &e->weights, prompt.v + pos, n, logits, false);
+                }
+                if (!ok) {
+                    fprintf(stderr, "ds4: MiMo imatrix failed at prompt %d\n", prompts_done + 1);
+                } else {
+                    prompts_done++;
+                    tokens_done += prompt.len;
+                    const uint32_t min_samples = imatrix_collector_min_samples(&collector, &e->weights, DS4_N_LAYER);
+                    fprintf(stderr, "ds4: MiMo imatrix prompts=%d tokens=%d routes=%llu min_samples=%u\r",
+                            prompts_done, tokens_done, (unsigned long long)collector.observed_routes, min_samples);
+                    fflush(stderr);
+                    sample_target_reached = min_expert_samples > 0 && min_samples >= (uint32_t)min_expert_samples;
+                }
+            }
+            token_vec_free(&prompt);
+        }
+        *end = saved;
+        if (sample_target_reached || !next) break;
+        cursor = next;
+        if (max_prompts > 0 && prompts_done >= max_prompts) break;
+        if (max_tokens > 0 && tokens_done >= max_tokens) break;
+    }
+    fputc('\n', stderr);
+    g->imatrix = NULL;
+    if (ok && tokens_done == 0) {
+        fprintf(stderr, "ds4: imatrix dataset contains no usable tokens\n");
+        ok = false;
+    }
+    if (ok) {
+        imatrix_collector_report_coverage(&collector, &e->weights, DS4_N_LAYER);
+        if (min_expert_samples > 0 && !sample_target_reached) {
+            fprintf(stderr, "ds4: MiMo imatrix minimum expert sample target %d was not reached\n", min_expert_samples);
+            ok = false;
+        }
+    }
+    if (ok) ok = imatrix_collector_save(&collector, &e->weights, output_path);
+    if (ok) {
+        fprintf(stderr, "ds4: wrote MiMo imatrix %s from %d prompts, %d tokens, %llu routes\n", output_path,
+                prompts_done, tokens_done, (unsigned long long)collector.observed_routes);
+    }
+    imatrix_collector_free(&collector);
+    mimo_graph_free(g);
+    free(g);
+    free(logits);
+    return ok ? 0 : 1;
+}
+#endif
 #endif
 
 int ds4_engine_collect_imatrix(ds4_engine *e,
@@ -65768,6 +65911,14 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     size_t dataset_len = 0;
     if (!imatrix_read_text_file(dataset_path, &dataset, &dataset_len)) return 1;
 
+#ifdef DS4_HAS_MIMO_GPU
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MIMO) {
+        const int rc = ds4_engine_collect_mimo_imatrix(e, dataset, dataset_len, dataset_path, output_path, ctx_size,
+                                                       max_prompts, max_tokens, min_expert_samples);
+        free(dataset);
+        return rc;
+    }
+#endif
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         const int rc = ds4_engine_collect_sequential_imatrix(e,
