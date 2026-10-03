@@ -3354,6 +3354,13 @@ int ds4_gpu_qwen4_matmul_q8_0_weights_tensor(ds4_gpu_tensor *out, const ds4_gpu_
                                              uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);
 int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch,
                                const ds4_gpu_tensor *logits, uint32_t n_vocab);
+/* argmax plus the winner's softmax probability */
+int ds4_gpu_qwen4_argmax_p_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *out_prob, ds4_gpu_tensor *scratch,
+                                  const ds4_gpu_tensor *logits, uint32_t n_vocab);
+/* The MTP draft head's Q4_0 copy (GPU tensor rows) over n_tok activation rows. */
+int ds4_gpu_qwen4_q4_0_rows_weights_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *w,
+                                           uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x,
+                                           uint32_t n_tok);
 /* M3 Ultra decode defaults; DS4_QWEN4_DECODE_FUSIONS=0 restores old paths. */
 int ds4_gpu_qwen4_decode_fusions_enabled(void);
 /* Single-token F16 injection: old_R/old_inj and next_R/inj_part must be distinct. */

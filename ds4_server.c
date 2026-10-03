@@ -13987,6 +13987,7 @@ decode_again:
                     toks, (int)(sizeof(toks) / sizeof(toks[0])),
                     err, sizeof(err));
             } else {
+                ds4_session_set_block_rewinds(slot->session, payload_temperature > 0.0f);
                 ntok = ds4_session_eval_speculative(
                     slot->session, token, max_tokens - completion,
                     eos_token, temperature, top_k, top_p, min_p, &rng,

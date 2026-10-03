@@ -5614,6 +5614,51 @@ kernel void kernel_qwen4_argmax(
     }
 }
 
+/* kernel_qwen4_argmax with the winner's softmax probability: each chunk also
+ * sums exp(logit - chunk max), the finish pass rescales the chunk sums to the
+ * global max, and p = 1 / sum.  The winner is kernel_qwen4_argmax's. */
+kernel void kernel_qwen4_argmax_p(
+        constant qwen4_argmax_args &args,
+        device const float *logits,
+        device float4 *partials,        /* (max, index bits, sum, 0) */
+        device int *out_idx,
+        device float *out_prob,
+        uint group [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint begin = args.finish ? 0u : group * 4096u;
+    const uint end = args.finish ? args.n : min(begin + 4096u, args.n);
+    float best = -1.0e30f, sum = 0.0f;
+    uint index = 0;
+    for (uint i = begin + tid; i < end; i += 256u) {
+        const float4 p = args.finish ? partials[i] : float4(logits[i], as_type<float>(i), 1.0f, 0.0f);
+        if ((as_type<uint>(p.x) & 0x7fffffffu) > 0x7f800000u) continue;
+        const uint pi = as_type<uint>(p.y);
+        if (p.x > best) { sum = sum * exp(best - p.x) + p.z; best = p.x; index = pi; }
+        else { sum += p.z * exp(p.x - best); if (p.x == best && pi < index) index = pi; }
+    }
+    float top = simd_max(best);
+    uint winner = simd_min(best == top ? index : 0xffffffffu);
+    float total = simd_sum(sum * exp(best - top));
+    threadgroup float scores[8], sums[8];
+    threadgroup uint indices[8];
+    if (!lane) { scores[sg] = top; indices[sg] = winner; sums[sg] = total; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!sg) {
+        best = lane < 8u ? scores[lane] : -1.0e30f;
+        index = lane < 8u ? indices[lane] : 0u;
+        sum = lane < 8u ? sums[lane] : 0.0f;
+        top = simd_max(best);
+        winner = simd_min(best == top ? index : 0xffffffffu);
+        total = simd_sum(sum * exp(best - top));
+        if (!lane) {
+            if (args.finish) { out_idx[0] = (int)winner; out_prob[0] = 1.0f / total; }
+            else partials[group] = float4(top, as_type<float>(winner), total, 0.0f);
+        }
+    }
+}
+
 /* Read the old residual and injection buffer; write separate next buffers.
  * Each normalization chunk writes only its own residual slice. */
 template <typename W>
@@ -5878,3 +5923,67 @@ template [[host_name("kernel_qwen4_q8_rows_conv1")]] kernel kernel_qwen4_q8_rows
 template [[host_name("kernel_qwen4_q8_rows_conv2")]] kernel kernel_qwen4_q8_rows_conv_t kernel_qwen4_q8_rows_conv<2>;
 template [[host_name("kernel_qwen4_q8_rows_conv3")]] kernel kernel_qwen4_q8_rows_conv_t kernel_qwen4_q8_rows_conv<3>;
 template [[host_name("kernel_qwen4_q8_rows_conv4")]] kernel kernel_qwen4_q8_rows_conv_t kernel_qwen4_q8_rows_conv<4>;
+
+/* Draft-only 4-bit matvec over NR1 activation rows (the MTP draft head's Q4_0
+ * copy): kernel_mul_mv_q8_0_f32_rows' walk with Q4_0 quants */
+template<short NR1>
+kernel void kernel_qwen4_q4_0_rows(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+    constexpr short NR0 = N_R0_Q8_0;
+    const int nb = args.ne00 / 32;
+    const int r0 = tgpig.x * NR0;
+    device const ds4_dense_block_q4_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const ds4_dense_block_q4_0 *) (src0 + (uint64_t)min(r0 + row, args.ne01 - 1) * args.nb01);
+    }
+    float sumf[NR1][NR0];
+    FOR_UNROLL (short j = 0; j < NR1; ++j) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[j][row] = 0.f;
+    }
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+    const short qoff = (il & 1) * NQ, sh = (il >> 1) * 4;
+    const int ib0 = sgitg * NQ + ix;
+    float yl[NR1][NQ];
+    device const float * yb[NR1];
+    FOR_UNROLL (short j = 0; j < NR1; ++j) {
+        yb[j] = (device const float *) (src1 + (uint64_t)j * args.nb11) + ib0 * 32 + il * NQ;
+    }
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        FOR_UNROLL (short j = 0; j < NR1; ++j) {
+            FOR_UNROLL (short i = 0; i < NQ; ++i) yl[j][i] = yb[j][i];
+        }
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            device const uchar * qs = ax[row][ib].qs + qoff;
+            float q[NQ];
+            FOR_UNROLL (short i = 0; i < NQ; ++i) q[i] = (float)((int)((qs[i] >> sh) & 0xF) - 8);
+            const float d = ax[row][ib].d;
+            FOR_UNROLL (short j = 0; j < NR1; ++j) {
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NQ; ++i) sumq += q[i] * yl[j][i];
+                sumf[j][row] += sumq * d;
+            }
+        }
+        FOR_UNROLL (short j = 0; j < NR1; ++j) yb[j] += NSG * NQ * 32;
+    }
+    FOR_UNROLL (short j = 0; j < NR1; ++j) {
+        helper_mv_reduce_and_write<NR0>((device float *) dst + (uint64_t)j * args.ne0, sumf[j], r0, args.ne01,
+                                        tiisg, sgitg, shmem + j * NR0 * NW * sizeof(float));
+    }
+}
+
+typedef decltype(kernel_qwen4_q4_0_rows<1>) kernel_qwen4_q4_0_rows_t;
+template [[host_name("kernel_qwen4_q4_0_rows1")]] kernel kernel_qwen4_q4_0_rows_t kernel_qwen4_q4_0_rows<1>;
+template [[host_name("kernel_qwen4_q4_0_rows2")]] kernel kernel_qwen4_q4_0_rows_t kernel_qwen4_q4_0_rows<2>;
+template [[host_name("kernel_qwen4_q4_0_rows3")]] kernel kernel_qwen4_q4_0_rows_t kernel_qwen4_q4_0_rows<3>;
+template [[host_name("kernel_qwen4_q4_0_rows4")]] kernel kernel_qwen4_q4_0_rows_t kernel_qwen4_q4_0_rows<4>;
