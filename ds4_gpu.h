@@ -3476,6 +3476,10 @@ int ds4_gpu_qwen4_idx_score_tensor(
 int ds4_gpu_qwen4_idx_select_tensor(
         ds4_gpu_tensor *sel, const ds4_gpu_tensor *score, const ds4_gpu_tensor *tile_max,
         uint32_t n_blocks, uint32_t n_tokens, uint32_t top_k);
+int ds4_gpu_qwen4_idx_select_expand_tensor(
+        ds4_gpu_tensor *sel_tokens, ds4_gpu_tensor *n_sel, const ds4_gpu_tensor *score,
+        const ds4_gpu_tensor *tile_max, uint32_t n_blocks, uint32_t n_tokens, uint32_t top_k,
+        uint32_t ratio, uint32_t pos0, uint32_t sel_stride);
 int ds4_gpu_qwen4_idx_expand_tensor(
         ds4_gpu_tensor *sel_tokens, ds4_gpu_tensor *n_sel, const ds4_gpu_tensor *sel_blocks,
         uint32_t n_tokens, uint32_t n_sel_blocks, uint32_t ratio, uint32_t pos0, uint32_t sel_stride);

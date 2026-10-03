@@ -1676,6 +1676,22 @@ static inline void qwen4_rope_neox(thread float *x, uint n_rot, uint4 p3, consta
     }
 }
 
+/* qwen4_rope_neox with one pair a lane: each pair's rotation reads and writes
+ * only its own two values, so the result is the one-thread loop's */
+static inline void qwen4_rope_neox_lanes(threadgroup float *x, uint n_rot, uint4 p3, constant float *freq,
+                                         float mscale, ushort lane) {
+    const uint nh = n_rot / 2;
+    for (uint i = lane; i < nh; i += 32) {
+        const uint m = i % 3;
+        const uint pos = m == 0 ? p3.x : (m == 1 ? p3.y : p3.z);
+        const float theta = (float)pos * freq[i];
+        const float c = cos(theta) * mscale, s = sin(theta) * mscale;
+        const float x0 = x[i], x1 = x[i + nh];
+        x[i] = x0 * c - x1 * s;
+        x[i + nh] = x0 * s + x1 * c;
+    }
+}
+
 /* One row of a decode batch for the *_rows attention kernels.  The caches
  * stay per session, so a row reaches its own through GPU addresses instead
  * of bound buffers; its transients are row r of the batch arena. */
@@ -1706,7 +1722,6 @@ static inline void qwen4_attn_prep_slot(
     const uint H = args.n_head, Hkv = args.n_head_kv, D = args.head_dim;
     const uint Hi = args.n_idx_head, Di = args.idx_dim;
     float v[8];   /* D/32 <= 8 */
-    float tmp[64];
 
     if (slot < H) {
         const uint npt = D / 32;
@@ -1719,11 +1734,7 @@ static inline void qwen4_attn_prep_slot(
         /* rope needs the pairs (i, i+n_rot/2): stage through threadgroup memory */
         for (uint i = 0; i < npt; i++) row[tiisg * npt + i] = v[i];
         simdgroup_barrier(mem_flags::mem_threadgroup);
-        if (tiisg == 0) {
-            for (uint i = 0; i < args.n_rot; i++) tmp[i] = row[i];
-            qwen4_rope_neox(tmp, args.n_rot, p3, args.rope_freq, args.rope_mscale);
-            for (uint i = 0; i < args.n_rot; i++) row[i] = tmp[i];
-        }
+        qwen4_rope_neox_lanes(row, args.n_rot, p3, args.rope_freq, args.rope_mscale, tiisg);
         simdgroup_barrier(mem_flags::mem_threadgroup);
         device float *dq = q_out + ((uint64_t)tok * H + slot) * D;
         device float *dg = gate_out + ((uint64_t)tok * H + slot) * D;
@@ -1745,11 +1756,7 @@ static inline void qwen4_attn_prep_slot(
         for (uint i = 0; i < npt; i++) v[i] = v[i] * r * g_k[tiisg * npt + i];
         for (uint i = 0; i < npt; i++) row[tiisg * npt + i] = v[i];
         simdgroup_barrier(mem_flags::mem_threadgroup);
-        if (tiisg == 0) {
-            for (uint i = 0; i < args.n_rot; i++) tmp[i] = row[i];
-            qwen4_rope_neox(tmp, args.n_rot, p3, args.rope_freq, args.rope_mscale);
-            for (uint i = 0; i < args.n_rot; i++) row[i] = tmp[i];
-        }
+        qwen4_rope_neox_lanes(row, args.n_rot, p3, args.rope_freq, args.rope_mscale, tiisg);
         simdgroup_barrier(mem_flags::mem_threadgroup);
         device half *dk = k_cache + ((uint64_t)pos * Hkv + h) * D;
         device half *dv = v_cache + ((uint64_t)pos * Hkv + h) * D;
@@ -1770,11 +1777,7 @@ static inline void qwen4_attn_prep_slot(
         for (uint i = 0; i < npt; i++) v[i] = v[i] * r * g_iq[tiisg * npt + i];
         for (uint i = 0; i < npt; i++) row[tiisg * npt + i] = v[i];
         simdgroup_barrier(mem_flags::mem_threadgroup);
-        if (tiisg == 0) {
-            for (uint i = 0; i < args.n_rot; i++) tmp[i] = row[i];
-            qwen4_rope_neox(tmp, args.n_rot, p3, args.rope_freq, args.rope_mscale);
-            for (uint i = 0; i < args.n_rot; i++) row[i] = tmp[i];
-        }
+        qwen4_rope_neox_lanes(row, args.n_rot, p3, args.rope_freq, args.rope_mscale, tiisg);
         simdgroup_barrier(mem_flags::mem_threadgroup);
         device float *dq = iq_out + ((uint64_t)tok * Hi + h) * Di;
         for (uint i = 0; i < npt; i++) dq[tiisg * npt + i] = row[tiisg * npt + i];
@@ -1868,7 +1871,6 @@ static inline void qwen4_idx_block_key_one(
     const uint Di = args.idx_dim;
     const uint npt = Di / 32;
     float v[4];
-    float tmp[64];
     for (uint i = 0; i < npt; i++) {
         float acc = 0.0f;
         for (uint t = 0; t < args.ratio; t++) acc += ik_cache[((uint64_t)b * args.ratio + t) * Di + tiisg * npt + i];
@@ -1880,11 +1882,7 @@ static inline void qwen4_idx_block_key_one(
     const float r = rsqrt(ss / (float)Di + args.eps);
     for (uint i = 0; i < npt; i++) row[tiisg * npt + i] = v[i] * r * g_ik[tiisg * npt + i];
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    if (tiisg == 0) {
-        for (uint i = 0; i < args.n_rot; i++) tmp[i] = row[i];
-        qwen4_rope_neox(tmp, args.n_rot, pos3[b * args.ratio], args.rope_freq, args.rope_mscale);
-        for (uint i = 0; i < args.n_rot; i++) row[i] = tmp[i];
-    }
+    qwen4_rope_neox_lanes(row, args.n_rot, pos3[b * args.ratio], args.rope_freq, args.rope_mscale, tiisg);
     simdgroup_barrier(mem_flags::mem_threadgroup);
     device half *dst = block_key + (uint64_t)b * Di;
     for (uint i = 0; i < npt; i++) dst[tiisg * npt + i] = (half)row[tiisg * npt + i];
@@ -1928,7 +1926,7 @@ struct ds4_metal_args_qwen4_idx_score {
     uint32_t idx_dim;
     uint32_t pos0;
     uint32_t ratio;
-    uint32_t pad0;
+    uint32_t lanes4;      /* vec scorer: four lanes a block (four 128-wide heads) */
     uint32_t pad1;
 };
 
@@ -2018,9 +2016,54 @@ kernel void kernel_qwen4_idx_score_vec(
     const uint nq = args.n_idx_head * args.idx_dim;
     if (tok >= args.n_tokens || nq > 4u * 128u || (args.idx_dim & 3u) != 0u) return;
     const uint n_tiles = (args.n_blocks + 7u) / 8u;
-    qwen4_idx_score_vec_row(args, tgpig.x * ntg.x + tid, args.n_blocks, (args.pos0 + tok + 1) / args.ratio,
-                            iq + (uint64_t)tok * nq, block_key, score + (uint64_t)tok * args.n_blocks,
-                            tile_max + (uint64_t)tok * n_tiles, qs, tid, ntg, tiisg);
+    if (!args.lanes4) {
+        qwen4_idx_score_vec_row(args, tgpig.x * ntg.x + tid, args.n_blocks, (args.pos0 + tok + 1) / args.ratio,
+                                iq + (uint64_t)tok * nq, block_key, score + (uint64_t)tok * args.n_blocks,
+                                tile_max + (uint64_t)tok * n_tiles, qs, tid, ntg, tiisg);
+        return;
+    }
+    /* four lanes a block, one per indexer head (n_idx_head == 4): each runs
+     * its head's dot chain and lane 0 sums the heads in order, so a block
+     * scores as with one thread; a simdgroup's eight blocks are one tile */
+    constexpr uint Di = 128;
+    const uint h = tiisg & 3u;
+    const uint b = (tgpig.x * ntg.x + tid) >> 2;
+    const uint visible = (args.pos0 + tok + 1) / args.ratio;
+    const bool live = b < args.n_blocks && b < visible;
+    half4 kv[Di / 4];
+    if (live) {
+        device const half4 *key = (device const half4 *)(block_key + (uint64_t)b * Di);
+        for (uint i = 0; i < Di / 4; i++) kv[i] = key[i];
+    }
+    device const float *q = iq + (uint64_t)tok * nq;
+    for (uint i = tid; i < nq; i += ntg.x) qs[i] = q[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float dot = 0.0f;
+    if (live) {
+        const threadgroup float *qh = qs + h * Di;
+        for (uint d = 0; d < Di; d += 4) {
+            const half4 k = kv[d >> 2];
+            dot += qh[d] * (float)k.x;
+            dot += qh[d + 1] * (float)k.y;
+            dot += qh[d + 2] * (float)k.z;
+            dot += qh[d + 3] * (float)k.w;
+        }
+    }
+    const uint l0 = tiisg & ~3u;
+    const float d0 = simd_shuffle(dot, l0), d1 = simd_shuffle(dot, l0 + 1u);
+    const float d2 = simd_shuffle(dot, l0 + 2u), d3 = simd_shuffle(dot, l0 + 3u);
+    float sum = -3.0e38f;
+    if (live) {
+        sum = 0.0f;
+        sum += max(d0, 0.0f);
+        sum += max(d1, 0.0f);
+        sum += max(d2, 0.0f);
+        sum += max(d3, 0.0f);
+    }
+    if (h == 0u && b < args.n_blocks) score[(uint64_t)tok * args.n_blocks + b] = sum;
+    const uint key = live && h == 0u ? as_type<uint>(max(sum, 0.0f)) : 0u;
+    const uint tmax = simd_max(key);
+    if (tiisg == 0u && (b >> 3) < n_tiles) tile_max[(uint64_t)tok * n_tiles + (b >> 3)] = tmax;
 }
 
 /* Decode batch: row r scores its own block keys against its query row.
@@ -2117,13 +2160,128 @@ struct ds4_metal_args_qwen4_idx_select {
     uint32_t pad0;
 };
 
+struct ds4_metal_args_qwen4_idx_select_expand {
+    uint32_t n_tokens;
+    uint32_t n_blocks;    /* row stride of score */
+    uint32_t top_k;
+    uint32_t ratio;
+    uint32_t pos0;
+    uint32_t sel_stride;  /* row stride of the token list */
+    uint32_t pad0;
+    uint32_t pad1;
+};
+
 /* Exact top-k per token row without sorting: scores are >= 0 or -inf, so
  * their float bits order them and a 4-pass radix select over 8-bit digits
  * finds the k-th largest key and how many of its equals to take.  The gather
  * then keeps every block above that key and, among equals, the lowest block
  * indices (invisible blocks score -inf and sit above every visible one, so
  * they never win a tie).  One threadgroup per token; blocks above the key
- * come out in ascending block order, the equals after them. */
+ * come out in ascending block order, the equals after them.  EXPAND writes
+ * kernel_qwen4_idx_expand's token list and count instead of the blocks. */
+template <bool EXPAND>
+static inline void qwen4_idx_select_row(
+        uint n, uint top_k, uint ratio, uint pos, device const float *row, device int32_t *out,
+        device uint32_t *n_sel, threadgroup atomic_uint *hist, threadgroup uint *scan, threadgroup uint *found,
+        ushort tid, uint nth, ushort sgitg, ushort tiisg) {
+    /* a thread's contiguous chunk; up to eight scores stay in registers */
+    const uint chunk = (n + nth - 1) / nth;
+    const uint b0 = min((uint)tid * chunk, n), b1 = min(b0 + chunk, n);
+    const bool cached = chunk <= 8u;
+    float vc[8];
+    for (uint u = 0; u < 8; u++) vc[u] = cached && b0 + u < b1 ? row[b0 + u] : -1.0f;
+    uint prefix = 0, need = top_k;
+    for (uint pass = 0; pass < 4; pass++) {
+        const uint shift = 24 - 8 * pass;
+        const uint mask_hi = pass == 0 ? 0u : (0xFFFFFFFFu << (shift + 8));
+        for (uint i = tid; i < 256; i += nth) atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (cached) {
+            for (uint u = 0; u < 8; u++) {
+                if (b0 + u >= b1) break;
+                const uint key = as_type<uint>(max(vc[u], 0.0f));
+                if ((key & mask_hi) == prefix) atomic_fetch_add_explicit(&hist[(key >> shift) & 0xFFu], 1u, memory_order_relaxed);
+            }
+        } else {
+            /* 16 loads per thread in flight before the counting */
+            for (uint b = tid; b < n; b += 16u * nth) {
+                float v[16];
+                for (uint u = 0; u < 16; u++) { const uint i = b + u * nth; v[u] = i < n ? row[i] : -1.0f; }
+                for (uint u = 0; u < 16; u++) {
+                    if (b + u * nth >= n) break;
+                    const uint key = as_type<uint>(max(v[u], 0.0f));
+                    if ((key & mask_hi) == prefix) atomic_fetch_add_explicit(&hist[(key >> shift) & 0xFFu], 1u, memory_order_relaxed);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        /* the first simdgroup finds the digit holding the need-th key: lane l
+         * takes digits 255 - 8l down to 248 - 8l */
+        if (sgitg == 0) {
+            uint c[8], mine = 0;
+            for (uint i = 0; i < 8; i++) {
+                c[i] = atomic_load_explicit(&hist[255 - 8 * tiisg - i], memory_order_relaxed);
+                mine += c[i];
+            }
+            uint above = simd_prefix_exclusive_sum(mine);   /* elements in digits above this lane's */
+            if (above < need && above + mine >= need) {
+                uint dig = 248 - 8 * tiisg;
+                for (uint i = 0; i < 8; i++) {
+                    if (above + c[i] >= need) { dig = 255 - 8 * tiisg - i; break; }
+                    above += c[i];
+                }
+                found[0] = prefix | (dig << shift);
+                found[1] = need - above;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix = found[0]; need = found[1];
+    }
+    /* gather: ranks by exclusive scans of both counts at once (scan: 32 + 32) */
+    uint n_gt = 0, n_eq = 0;
+    for (uint b = b0; b < b1; b += 8) {
+        float v[8];
+        for (uint u = 0; u < 8; u++) v[u] = cached ? vc[u] : b + u < b1 ? row[b + u] : -1.0f;
+        for (uint u = 0; u < 8 && b + u < b1; u++) {
+            const uint key = as_type<uint>(max(v[u], 0.0f));
+            n_gt += key > prefix; n_eq += key == prefix;
+        }
+    }
+    const uint pg = simd_prefix_exclusive_sum(n_gt), pe = simd_prefix_exclusive_sum(n_eq);
+    if (tiisg == 31) { scan[sgitg] = pg + n_gt; scan[32 + sgitg] = pe + n_eq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        const uint nsg = (nth + 31) / 32;
+        const uint sg = tiisg < nsg ? scan[tiisg] : 0u, se = tiisg < nsg ? scan[32 + tiisg] : 0u;
+        const uint xg = simd_prefix_exclusive_sum(sg), xe = simd_prefix_exclusive_sum(se);
+        if (tiisg < nsg) { scan[tiisg] = xg; scan[32 + tiisg] = xe; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint r_gt = pg + scan[sgitg], r_eq = pe + scan[32 + sgitg];
+    const uint eq_base = top_k - need;
+    for (uint b = b0; b < b1; b += 8) {
+        float v[8];
+        for (uint u = 0; u < 8; u++) v[u] = cached ? vc[u] : b + u < b1 ? row[b + u] : -1.0f;
+        for (uint u = 0; u < 8 && b + u < b1; u++) {
+            const uint key = as_type<uint>(max(v[u], 0.0f));
+            int at = -1;
+            if (key > prefix) at = (int)r_gt++;
+            else if (key == prefix) { if (r_eq < need) at = (int)(eq_base + r_eq); r_eq++; }
+            if (at < 0) continue;
+            if (EXPAND) {
+                for (uint j = 0; j < ratio; j++) out[(uint)at * ratio + j] = (int32_t)((b + u) * ratio + j);
+            } else {
+                out[at] = (int32_t)(b + u);
+            }
+        }
+    }
+    if (EXPAND) {
+        const uint tail_start = ((pos + 1) / ratio) * ratio;
+        for (uint t = tail_start + tid; t <= pos; t += nth) out[top_k * ratio + (t - tail_start)] = (int32_t)t;
+        if (tid == 0) *n_sel = top_k * ratio + (pos + 1 - tail_start);
+    }
+}
+
 kernel void kernel_qwen4_idx_select(
         constant ds4_metal_args_qwen4_idx_select & args,
         device const float *score,     /* [T][n_blocks] */
@@ -2135,86 +2293,32 @@ kernel void kernel_qwen4_idx_select(
         ushort tiisg [[thread_index_in_simdgroup]]) {
     const uint tok = tgpig.x;
     if (tok >= args.n_tokens) return;
-    const uint nth = ntg.x;
-    device const float *row = score + (uint64_t)tok * args.n_blocks;
-    device int32_t *out = sel + (uint64_t)tok * args.top_k;
-    const uint n = args.n_blocks;
     threadgroup atomic_uint hist[256];
-    threadgroup uint scan[32];
+    threadgroup uint scan[64];
     threadgroup uint found[2];
-    uint prefix = 0, need = args.top_k;
-    for (uint pass = 0; pass < 4; pass++) {
-        const uint shift = 24 - 8 * pass;
-        const uint mask_hi = pass == 0 ? 0u : (0xFFFFFFFFu << (shift + 8));
-        for (uint i = tid; i < 256; i += nth) atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        /* 16 loads per thread in flight before the counting */
-        for (uint b = tid; b < n; b += 16u * nth) {
-            float v[16];
-            for (uint u = 0; u < 16; u++) { const uint i = b + u * nth; v[u] = i < n ? row[i] : -1.0f; }
-            for (uint u = 0; u < 16; u++) {
-                if (b + u * nth >= n) break;
-                const uint key = as_type<uint>(max(v[u], 0.0f));
-                if ((key & mask_hi) == prefix) atomic_fetch_add_explicit(&hist[(key >> shift) & 0xFFu], 1u, memory_order_relaxed);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        /* suffix sums from the top digit down: the first 256 threads hold one
-         * digit each, higher threads contribute zeros */
-        const uint c = tid < 256 ? atomic_load_explicit(&hist[255 - tid], memory_order_relaxed) : 0u;
-        const uint p = simd_prefix_inclusive_sum(c);
-        if (tiisg == 31 && sgitg < 8) scan[sgitg] = p;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < 256) {
-            uint above = p - c;                     /* elements in digits above this one */
-            for (uint g = 0; g < sgitg; g++) above += scan[g];
-            if (above < need && above + c >= need) {
-                found[0] = prefix | ((255u - tid) << shift);
-                found[1] = need - above;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        prefix = found[0]; need = found[1];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    /* gather: contiguous chunk per thread, ranks by exclusive scan */
-    const uint chunk = (n + nth - 1) / nth;
-    const uint b0 = min((uint)tid * chunk, n), b1 = min(b0 + chunk, n);
-    uint n_gt = 0, n_eq = 0;
-    for (uint b = b0; b < b1; b += 8) {
-        float v[8];
-        for (uint u = 0; u < 8; u++) v[u] = b + u < b1 ? row[b + u] : -1.0f;
-        for (uint u = 0; u < 8 && b + u < b1; u++) {
-            const uint key = as_type<uint>(max(v[u], 0.0f));
-            n_gt += key > prefix; n_eq += key == prefix;
-        }
-    }
-    uint r_gt, r_eq;
-    for (uint which = 0; which < 2; which++) {
-        const uint v = which == 0 ? n_gt : n_eq;
-        const uint p = simd_prefix_exclusive_sum(v);
-        if (tiisg == 31) scan[sgitg] = p + v;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sgitg == 0) {
-            const uint nsg = (nth + 31) / 32;
-            const uint sv = tiisg < nsg ? scan[tiisg] : 0u;
-            const uint sp = simd_prefix_exclusive_sum(sv);
-            if (tiisg < nsg) scan[tiisg] = sp;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (which == 0) r_gt = p + scan[sgitg]; else r_eq = p + scan[sgitg];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    const uint eq_base = args.top_k - need;
-    for (uint b = b0; b < b1; b += 8) {
-        float v[8];
-        for (uint u = 0; u < 8; u++) v[u] = b + u < b1 ? row[b + u] : -1.0f;
-        for (uint u = 0; u < 8 && b + u < b1; u++) {
-            const uint key = as_type<uint>(max(v[u], 0.0f));
-            if (key > prefix) out[r_gt++] = (int32_t)(b + u);
-            else if (key == prefix) { if (r_eq < need) out[eq_base + r_eq] = (int32_t)(b + u); r_eq++; }
-        }
-    }
+    qwen4_idx_select_row<false>(args.n_blocks, args.top_k, 1u, 0u, score + (uint64_t)tok * args.n_blocks,
+                                sel + (uint64_t)tok * args.top_k, nullptr, hist, scan, found, tid, ntg.x, sgitg, tiisg);
+}
+
+/* kernel_qwen4_idx_select then kernel_qwen4_idx_expand in one dispatch */
+kernel void kernel_qwen4_idx_select_expand(
+        constant ds4_metal_args_qwen4_idx_select_expand & args,
+        device const float *score,       /* [T][n_blocks] */
+        device int32_t     *sel_tokens,  /* [T][sel_stride] */
+        device uint32_t    *n_sel,       /* [T] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint tok = tgpig.x;
+    if (tok >= args.n_tokens) return;
+    threadgroup atomic_uint hist[256];
+    threadgroup uint scan[64];
+    threadgroup uint found[2];
+    qwen4_idx_select_row<true>(args.n_blocks, args.top_k, args.ratio, args.pos0 + tok,
+                               score + (uint64_t)tok * args.n_blocks, sel_tokens + (uint64_t)tok * args.sel_stride,
+                               n_sel + tok, hist, scan, found, tid, ntg.x, sgitg, tiisg);
 }
 
 #define QWEN4_IDX_PRE_TILES 512   /* surviving tiles held in threadgroup memory */
@@ -2518,14 +2622,16 @@ static inline void qwen4_attn_decode_tile(
         uint n, uint n_splits, uint keys_per_split, uint part_splits, bool use_sel,
         device const float *q, device const float *gate,
         device const half *k_cache, device const half *v_cache, device const int32_t *sel,
-        device float *out, device float *part, ushort sgitg, ushort tiisg) {
+        device float *out, device float *part, threadgroup half *kvs, threadgroup float *ss,
+        ushort sgitg, ushort tiisg) {
     const uint H = args.n_head, Hkv = args.n_head_kv;
     constexpr uint D = NPT * 32;
     const uint group = H / Hkv;
     const uint hps = (group + QWEN4_ATTN_NSG - 1) / QWEN4_ATTN_NSG;
     const uint g0 = (uint)sgitg * hps;
-    if (g0 >= group) return;
-    const uint ng = min(hps, group - g0);
+    /* every simdgroup stages keys; ones past the head group only load */
+    const bool active = g0 < group;
+    const uint ng = active ? min(hps, group - g0) : 1u;
     const uint k0 = split * keys_per_split;
     const uint k1 = min(n, k0 + keys_per_split);
 
@@ -2542,13 +2648,28 @@ static inline void qwen4_attn_decode_tile(
 #pragma unroll
         for (uint i = 0; i < NPT; i++) acc[g][i] = 0.0f;
     }
-    for (uint idx = k0; idx < k1; idx++) {
-        const uint p = use_sel ? (uint)sel[idx] : idx;
-        device const half *kr = k_cache + ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
-        device const half *vr = v_cache + ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
-        float kv[NPT], vv[NPT];
+    /* sixteen keys at a time: their K and V rows are staged in threadgroup
+     * memory with every load in flight, each head's dot products are taken
+     * for all of them, then the softmax chain visits them in order */
+    const uint lt = (uint)sgitg * 32u + tiisg;
+    threadgroup float *sg_s = ss + (uint)sgitg * QWEN4_ATTN_HPS * 16u;
+    for (uint c0 = k0; c0 < k1; c0 += 16u) {
+      const uint cn = min(16u, k1 - c0);
+      if (lt / 8u < cn) {   /* eight threads a key */
+        const uint key = lt / 8u;
+        const uint p = use_sel ? (uint)sel[c0 + key] : c0 + key;
+        device const uint4 *ks = (device const uint4 *)(k_cache + ((uint64_t)p * Hkv + kvh) * D);
+        device const uint4 *vs = (device const uint4 *)(v_cache + ((uint64_t)p * Hkv + kvh) * D);
+        threadgroup uint4 *kd = (threadgroup uint4 *)(kvs + key * D);
+        threadgroup uint4 *vd = (threadgroup uint4 *)(kvs + (16u + key) * D);
+        for (uint c = lt % 8u; c < D / 8u; c += 8u) { kd[c] = ks[c]; vd[c] = vs[c]; }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint jk = 0; active && jk < cn; jk++) {
+        threadgroup const half *kr = kvs + jk * D + tiisg * NPT;
+        float kv[NPT];
 #pragma unroll
-        for (uint i = 0; i < NPT; i++) { kv[i] = (float)kr[i]; vv[i] = (float)vr[i]; }
+        for (uint i = 0; i < NPT; i++) kv[i] = (float)kr[i];
 #pragma unroll
         for (uint g = 0; g < QWEN4_ATTN_HPS; g++) {
             if (g < ng) {
@@ -2556,6 +2677,20 @@ static inline void qwen4_attn_decode_tile(
 #pragma unroll
                 for (uint i = 0; i < NPT; i++) s += qv[g][i] * kv[i];
                 s = simd_sum(s);
+                if (tiisg == 0) sg_s[g * 16u + jk] = s;
+            }
+        }
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint jk = 0; active && jk < cn; jk++) {
+        threadgroup const half *vr = kvs + (16u + jk) * D + tiisg * NPT;
+        float vv[NPT];
+#pragma unroll
+        for (uint i = 0; i < NPT; i++) vv[i] = (float)vr[i];
+#pragma unroll
+        for (uint g = 0; g < QWEN4_ATTN_HPS; g++) {
+            if (g < ng) {
+                const float s = sg_s[g * 16u + jk];
                 const float m_new = max(m[g], s);
                 const float corr = exp(m[g] - m_new);
                 const float w = exp(s - m_new);
@@ -2565,7 +2700,10 @@ static inline void qwen4_attn_decode_tile(
                 m[g] = m_new;
             }
         }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    if (!active) return;
 #pragma unroll
     for (uint g = 0; g < QWEN4_ATTN_HPS; g++) {
         if (g >= ng) break;
@@ -2604,9 +2742,11 @@ kernel void kernel_qwen4_attn_decode(
     const uint tok = tgpig.z;
     if (split >= args.n_splits || kvh >= args.n_head_kv || tok >= args.n_tokens) return;
     const uint n = args.use_sel ? n_sel[tok] : args.pos0 + tok + 1;
+    threadgroup half kvs[32u * NPT * 32u];
+    threadgroup float ss[QWEN4_ATTN_NSG * QWEN4_ATTN_HPS * 16u];
     qwen4_attn_decode_tile<NPT>(args, split, kvh, tok, n, args.n_splits, args.keys_per_split, args.n_splits,
                                 args.use_sel != 0, q, gate, k_cache, v_cache,
-                                sel_tokens + (uint64_t)tok * args.sel_stride, out, part, sgitg, tiisg);
+                                sel_tokens + (uint64_t)tok * args.sel_stride, out, part, kvs, ss, sgitg, tiisg);
 }
 
 /* The split count and width the host picks for one row from its key count
@@ -2644,10 +2784,12 @@ kernel void kernel_qwen4_attn_decode_rows(
     const uint2 sp = qwen4_attn_row_splits(n_keys, args.keys_per_split, args.n_splits);
     if (split >= sp.x) return;
     const uint n = e.use_sel ? n_sel[r] : e.pos + 1u;
+    threadgroup half kvs[32u * NPT * 32u];
+    threadgroup float ss[QWEN4_ATTN_NSG * QWEN4_ATTN_HPS * 16u];
     qwen4_attn_decode_tile<NPT>(args, split, kvh, r, n, sp.x, sp.y, args.n_splits, e.use_sel != 0, q, gate,
                                 reinterpret_cast<device const half *>(e.k_cache),
                                 reinterpret_cast<device const half *>(e.v_cache),
-                                sel_tokens + (uint64_t)r * args.sel_stride, out, part, sgitg, tiisg);
+                                sel_tokens + (uint64_t)r * args.sel_stride, out, part, kvs, ss, sgitg, tiisg);
 }
 
 /* Merge the split partials of one (token, head) and apply the gate. */
@@ -2702,7 +2844,12 @@ static inline void qwen4_attn_merge_wide_head(
     const uint64_t stride = (uint64_t)group * (2u + D);
     device const float *base = part + (((uint64_t)tok * Hkv + kvh) * part_splits * group + g) * (2u + D);
     float mm = -3.0e38f;
-    for (uint s = 0; s < n_splits; s++) mm = max(mm, base[s * stride]);
+    for (uint s0 = 0; s0 < n_splits; s0 += 16u) {
+        float pm[16];
+        const uint n_round = min(16u, n_splits - s0);
+        for (uint i = 0; i < 16u; i++) pm[i] = base[(s0 + min(i, n_round - 1u)) * stride];
+        for (uint i = 0; i < n_round; i++) mm = max(mm, pm[i]);
+    }
     float ll = 0.0f;
     float o = 0.0f;
     /* sixteen splits' values in flight per round; the chain below still
@@ -3131,8 +3278,8 @@ kernel void kernel_qwen4_multi_gemv(
     if (tok >= args.n_tokens) return;
     const uint total = args.out_rows[0] + args.out_rows[1] + args.out_rows[2] + args.out_rows[3];
     device const float *xt = x + (uint64_t)tok * args.in_dim;
-    const uint r0 = (tgpig.x * 4 + (uint)sgitg) * 2;
-    for (uint r = r0; r < r0 + 2 && r < total; r++) {
+    const uint r = tgpig.x * 4 + (uint)sgitg;
+    if (r < total) {
         uint i = 0, local = r;
         while (i + 1 < args.n_out && local >= args.out_rows[i]) { local -= args.out_rows[i]; i++; }
         device const char *w = i == 0 ? w0 : i == 1 ? w1 : i == 2 ? w2 : w3;

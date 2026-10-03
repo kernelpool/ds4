@@ -58052,7 +58052,7 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     QWEN4_ALLOC(vp, T * kv_dim);
     QWEN4_ALLOC(iq, T * iq_dim);
     QWEN4_ALLOC(ik, T * DS4_N_INDEXER_HEAD_DIM);
-    QWEN4_ALLOC(attn_part, ds4_gpu_qwen4_attn_part_floats(3u, DS4_N_HEAD, DS4_N_HEAD_DIM));
+    QWEN4_ALLOC(attn_part, ds4_gpu_qwen4_attn_part_floats(4u, DS4_N_HEAD, DS4_N_HEAD_DIM));
     QWEN4_ALLOC(q, T * q_dim);
     QWEN4_ALLOC(gate, T * q_dim);
     QWEN4_ALLOC(iqn, T * iq_dim);
@@ -58463,6 +58463,19 @@ static int qwen4_idx_select(ds4_gpu_tensor *sel, const ds4_gpu_tensor *score, co
                      : ds4_gpu_qwen4_idx_select_tensor(sel, score, tile_max, n_blocks, n_tokens, top_k);
 }
 
+/* the selected blocks' keys (and the incomplete tail) as a token list */
+static bool qwen4_idx_select_expand(ds4_qwen4_gpu_graph *g, const ds4_gpu_tensor *tile_max, uint32_t n_blocks,
+                                    uint32_t n_tokens, uint32_t ratio, uint32_t pos0) {
+#ifdef DS4_HAS_QWEN4_METAL
+    const int rc = ds4_gpu_qwen4_idx_select_expand_tensor(g->sel_tokens, g->n_sel, g->score, tile_max, n_blocks,
+                                                          n_tokens, g->k_blocks, ratio, pos0, g->sel_stride);
+    if (rc >= 0) return rc != 0;
+#endif
+    return qwen4_idx_select(g->sel_blocks, g->score, tile_max, n_blocks, n_tokens, g->k_blocks) &&
+           ds4_gpu_qwen4_idx_expand_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, n_tokens, g->k_blocks, ratio,
+                                           pos0, g->sel_stride);
+}
+
 /* Decode, verify and batch rows mix through the three-dispatch F16 kernels
  * (ds4_gpu_qwen4_hc_mix_v2_tensor), each row alone; their slice sums live in
  * inj_alt.  DS4_QWEN4_HC_LEGACY=1 keeps the
@@ -58620,6 +58633,12 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
     return ok;
 }
 
+/* rows one decode-arithmetic attention pass takes: verify rows four (the
+ * scorer, partials and merge keep each row's one-token values), others two */
+static uint32_t qwen4_attn_rows(const ds4_qwen4_gpu_graph *g) {
+    return g->verify_rows_exact ? 4u : 2u;
+}
+
 /* T tokens at positions pos0.. of one attention layer.  Tokens with no more
  * complete blocks than the budget attend densely; the rest score the pooled
  * block keys and attend their top-k blocks plus the incomplete tail.  The
@@ -58639,7 +58658,7 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
     const uint32_t n_dense = clast < sparse_pos ? cT : (sparse_pos > cpos0 ? sparse_pos - cpos0 : 0u);
     if (n_dense > 0 &&
         !ds4_gpu_qwen4_attn_decode_tensor(o_rows, q_rows, gate_rows, g->layer_k_cache[il], g->layer_v_cache[il],
-                                          g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_dense,
+                                          g->sel_tokens, g->n_sel, cT <= qwen4_attn_rows(g) ? g->attn_part : NULL, n_dense,
                                           DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, cpos0, false, g->sel_stride,
                                           scale)) {
         return false;
@@ -58657,15 +58676,13 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
             (uint64_t)n_dense * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
             (uint64_t)n_sparse * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
     const bool ok = q && gate && o && iqn &&
-        ds4_gpu_qwen4_idx_score_tensor(g->score, n_sparse <= 2u ? g->tile_max : NULL, iqn,
+        ds4_gpu_qwen4_idx_score_tensor(g->score, n_sparse <= qwen4_attn_rows(g) ? g->tile_max : NULL, iqn,
                                        g->layer_block_key[il], n_sparse, n_blocks_after,
                                        DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, sp0, ratio) &&
-        qwen4_idx_select(g->sel_blocks, g->score, n_sparse <= 2u ? g->tile_max : NULL,
-                         n_blocks_after, n_sparse, g->k_blocks) &&
-        ds4_gpu_qwen4_idx_expand_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, n_sparse, g->k_blocks, ratio,
-                                        sp0, g->sel_stride) &&
+        qwen4_idx_select_expand(g, n_sparse <= qwen4_attn_rows(g) ? g->tile_max : NULL,
+                                n_blocks_after, n_sparse, ratio, sp0) &&
         ds4_gpu_qwen4_attn_decode_tensor(o, q, gate, g->layer_k_cache[il], g->layer_v_cache[il],
-                                         g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_sparse,
+                                         g->sel_tokens, g->n_sel, cT <= qwen4_attn_rows(g) ? g->attn_part : NULL, n_sparse,
                                          DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, sp0, true, g->sel_stride,
                                          scale);
     ds4_gpu_tensor_free(iqn);
@@ -58704,12 +58721,12 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
     if (T > 1u && (g->verify_rows_exact || (il == DS4_N_LAYER - 1u && T <= 8u))) {
         /* Speculative verify: dense rows one per dispatch, since the split-K
          * follows the last row's key count; sparse rows attend a fixed
-         * selection width and pair up.  Every row then matches its
+         * selection width and go up to qwen4_attn_rows a pass.  Every row then matches its
          * one-token decode (prefill tails keep their own kernel selection).
          * The predictor's draft rows take the same split attention. */
         const uint32_t sparse_pos = (g->k_blocks + 1u) * ratio - 1u;
         for (uint32_t sub0 = 0, subT; sub0 < T; sub0 += subT) {
-            subT = T - sub0 >= 2u && pos0 + sub0 >= sparse_pos ? 2u : 1u;
+            subT = pos0 + sub0 < sparse_pos ? 1u : T - sub0 < qwen4_attn_rows(g) ? T - sub0 : qwen4_attn_rows(g);
             ds4_gpu_tensor *q = sub0 ? ds4_gpu_tensor_view(g->q, (uint64_t)sub0 * q_dim * sizeof(float),
                                                             (uint64_t)subT * q_dim * sizeof(float)) : g->q;
             ds4_gpu_tensor *gate = sub0 ? ds4_gpu_tensor_view(g->gate, (uint64_t)sub0 * q_dim * sizeof(float),
@@ -58719,9 +58736,9 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
             ds4_gpu_tensor *iqn = sub0 ? ds4_gpu_tensor_view(g->iqn,
                     (uint64_t)sub0 * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
                     (uint64_t)subT * DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float)) : g->iqn;
-            /* each sub-batch sees the block universe of its own T <= 2
+            /* each sub-batch sees the block universe of its own rows'
              * verify (a whole-chunk universe would let rows select blocks a
-             * true 2-row pass could not see) */
+             * true pass of those rows could not see) */
             const uint32_t nba_sub = (pos0 + sub0 + subT) / ratio;
             const bool ok = q && gate && o && iqn &&
                 qwen4_graph_attention_core(g, il, q, gate, iqn, o, nba_sub, pos0 + sub0, subT);

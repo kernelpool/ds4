@@ -5411,7 +5411,7 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
 static bool ds4_gpu_plain_mv_single_row(uint64_t out_dim) {
     const uint64_t override = ds4_gpu_env_u64("DS4_METAL_PLAIN_MV_NR0", 0u, 0u, 2u);
     if (override) return override == 1u;
-    return out_dim <= 1024u && ds4_gpu_device_is_m5_apple_silicon();
+    return out_dim <= 1024u && (ds4_gpu_device_is_m5_apple_silicon() || ds4_gpu_device_name_contains("M3 Ultra"));
 }
 
 static ds4_gpu_mv_dispatch ds4_gpu_make_plain_mv_dispatch(
@@ -48280,6 +48280,7 @@ enum {
     QWEN4_K_IDX_SCORE,
     QWEN4_K_IDX_SCORE_VEC,
     QWEN4_K_IDX_SELECT,
+    QWEN4_K_IDX_SELECT_EXPAND,
     QWEN4_K_IDX_SELECT_PRE,
     QWEN4_K_IDX_SCORE_MM,
     QWEN4_K_IDX_EXPAND,
@@ -48400,6 +48401,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_idx_score",
     "kernel_qwen4_idx_score_vec",
     "kernel_qwen4_idx_select",
+    "kernel_qwen4_idx_select_expand",
     "kernel_qwen4_idx_select_pre",
     "kernel_qwen4_idx_score_mm",
     "kernel_qwen4_idx_expand",
@@ -49417,7 +49419,7 @@ int ds4_gpu_qwen4_idx_score_tensor(
         ds4_gpu_tensor *score, ds4_gpu_tensor *tile_max, const ds4_gpu_tensor *iq, const ds4_gpu_tensor *block_key,
         uint32_t n_tokens, uint32_t n_blocks, uint32_t n_idx_head, uint32_t idx_dim,
         uint32_t pos0, uint32_t ratio) {
-    struct { uint32_t n_tokens, n_blocks, n_idx_head, idx_dim, pos0, ratio, pad0, pad1; } args =
+    struct { uint32_t n_tokens, n_blocks, n_idx_head, idx_dim, pos0, ratio, lanes4, pad1; } args =
         { n_tokens, n_blocks, n_idx_head, idx_dim, pos0, ratio, 0, 0 };
     qwen4_bind b[4];
     if (n_tokens == 0 || n_blocks == 0 || ratio == 0 ||
@@ -49426,24 +49428,45 @@ int ds4_gpu_qwen4_idx_score_tensor(
         !qwen4_bind_tensor(&b[2], score, (uint64_t)n_tokens * n_blocks * sizeof(float), "indexer scores")) {
         return 0;
     }
-    if (n_tokens > 2u && n_idx_head == 4u && idx_dim == 128u) {
+    if (n_tokens > (g_qwen4_verify_rows_exact ? 4u : 2u) && n_idx_head == 4u && idx_dim == 128u) {
         return qwen4_dispatch(QWEN4_K_IDX_SCORE_MM, &args, sizeof(args), b, 3,
                               MTLSizeMake((n_blocks + 63) / 64, (n_tokens + 15) / 16, 1), MTLSizeMake(128, 1, 1), 0);
     }
     /* staged queries and vector key loads, plus the tile maxima the
-     * prefiltered selector needs; measured on M5, other devices keep the
-     * scalar scorer */
+     * prefiltered selector needs; measured on M5 and M3 Ultra, other
+     * devices keep the scalar scorer */
     const int vec_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_VEC");
     const bool vec = tile_max && n_idx_head * idx_dim <= 512u && (idx_dim & 3u) == 0u &&
-        (vec_override >= 0 ? vec_override != 0 : ds4_gpu_device_is_m5_apple_silicon());
+        (vec_override >= 0 ? vec_override != 0 :
+         ds4_gpu_device_is_m5_apple_silicon() || ds4_gpu_device_name_contains("M3 Ultra"));
     if (vec) {
         if (!qwen4_bind_tensor(&b[3], tile_max, (uint64_t)n_tokens * ((n_blocks + 7u) / 8u) * sizeof(uint32_t),
                                "indexer tile maxima")) return 0;
+        /* four lanes a block (one per indexer head) up to 8192 blocks, a
+         * thread a block past that; measured on M3 Ultra */
+        args.lanes4 = n_idx_head == 4u && idx_dim == 128u && n_blocks <= 8192u;
+        const uint32_t per_tg = args.lanes4 ? 64u : 128u;
         return qwen4_dispatch(QWEN4_K_IDX_SCORE_VEC, &args, sizeof(args), b, 4,
-                              MTLSizeMake((n_blocks + 127) / 128, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
+                              MTLSizeMake((n_blocks + per_tg - 1) / per_tg, n_tokens, 1),
+                              MTLSizeMake(args.lanes4 ? 256 : 128, 1, 1), 0);
     }
     return qwen4_dispatch(QWEN4_K_IDX_SCORE, &args, sizeof(args), b, 3,
                           MTLSizeMake((n_blocks + 127) / 128, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
+}
+
+/* Long rows: bound the k-th score by the k-th tile maximum and select over
+ * the surviving tiles in threadgroup memory (exact; see the kernel).  The
+ * scorer that emits tile maxima only runs for decode batches. */
+static bool qwen4_idx_select_prefilter(const ds4_gpu_tensor *tile_max, uint32_t n_blocks, uint32_t n_tokens,
+                                       uint32_t top_k) {
+    const int pre_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_PREFILTER");
+    /* Scalar/MM scorers do not populate tile maxima. An independent
+     * scorer override must also disable their consumer. */
+    const int vec_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_VEC");
+    const bool vec = vec_override >= 0 ? vec_override != 0 :
+        ds4_gpu_device_is_m5_apple_silicon() || ds4_gpu_device_name_contains("M3 Ultra");
+    return tile_max && vec && n_tokens <= 4u && n_blocks > 8u * top_k &&
+        (pre_override >= 0 ? pre_override != 0 : ds4_gpu_device_is_m5_apple_silicon());
 }
 
 int ds4_gpu_qwen4_idx_select_tensor(
@@ -49456,17 +49479,7 @@ int ds4_gpu_qwen4_idx_select_tensor(
         !qwen4_bind_tensor(&b[2], sel, (uint64_t)n_tokens * top_k * sizeof(int32_t), "selected blocks")) {
         return 0;
     }
-    /* Long rows: bound the k-th score by the k-th tile maximum and select
-     * over the surviving tiles in threadgroup memory (exact; see the kernel).
-     * The scorer that emits tile maxima only runs for decode batches. */
-    const int pre_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_PREFILTER");
-    /* Scalar/MM scorers do not populate tile maxima. An independent
-     * scorer override must also disable their consumer. */
-    const int vec_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_VEC");
-    const bool vec = vec_override >= 0 ? vec_override != 0 : ds4_gpu_device_is_m5_apple_silicon();
-    const bool pre = tile_max && vec && n_tokens <= 2u && n_blocks > 8u * top_k &&
-        (pre_override >= 0 ? pre_override != 0 : ds4_gpu_device_is_m5_apple_silicon());
-    if (pre) {
+    if (qwen4_idx_select_prefilter(tile_max, n_blocks, n_tokens, top_k)) {
         if (!qwen4_bind_tensor(&b[1], tile_max, (uint64_t)n_tokens * ((n_blocks + 7u) / 8u) * sizeof(uint32_t),
                                "indexer tile maxima")) return 0;
         return qwen4_dispatch(QWEN4_K_IDX_SELECT_PRE, &args, sizeof(args), b, 3,
@@ -49474,6 +49487,26 @@ int ds4_gpu_qwen4_idx_select_tensor(
     }
     b[1] = b[2];
     return qwen4_dispatch(QWEN4_K_IDX_SELECT, &args, sizeof(args), b, 2,
+                          MTLSizeMake(n_tokens, 1, 1), MTLSizeMake(1024, 1, 1), 0);
+}
+
+/* The select and expand in one dispatch where the plain radix select runs;
+ * returns -1 where ds4_gpu_qwen4_idx_select_tensor would take another path. */
+int ds4_gpu_qwen4_idx_select_expand_tensor(
+        ds4_gpu_tensor *sel_tokens, ds4_gpu_tensor *n_sel, const ds4_gpu_tensor *score,
+        const ds4_gpu_tensor *tile_max, uint32_t n_blocks, uint32_t n_tokens, uint32_t top_k,
+        uint32_t ratio, uint32_t pos0, uint32_t sel_stride) {
+    if (qwen4_idx_select_prefilter(tile_max, n_blocks, n_tokens, top_k) || getenv("DS4_QWEN4_NO_IDX_SELECT")) return -1;
+    struct { uint32_t n_tokens, n_blocks, top_k, ratio, pos0, sel_stride, pad0, pad1; } args =
+        { n_tokens, n_blocks, top_k, ratio, pos0, sel_stride, 0, 0 };
+    qwen4_bind b[3];
+    if (n_tokens == 0 || top_k == 0 || top_k > n_blocks || ratio == 0 || sel_stride < top_k * ratio + ratio - 1u ||
+        !qwen4_bind_tensor(&b[0], score, (uint64_t)n_tokens * n_blocks * sizeof(float), "indexer scores") ||
+        !qwen4_bind_tensor(&b[1], sel_tokens, (uint64_t)n_tokens * sel_stride * sizeof(int32_t), "selected tokens") ||
+        !qwen4_bind_tensor(&b[2], n_sel, (uint64_t)n_tokens * sizeof(uint32_t), "selected counts")) {
+        return 0;
+    }
+    return qwen4_dispatch(QWEN4_K_IDX_SELECT_EXPAND, &args, sizeof(args), b, 3,
                           MTLSizeMake(n_tokens, 1, 1), MTLSizeMake(1024, 1, 1), 0);
 }
 
@@ -49570,10 +49603,12 @@ int ds4_gpu_qwen4_attn_decode_tensor(
     if (n_splits == 1) return 1;
     qwen4_bind mb[3] = { b[7], b[1], b[6] };
     /* One thread per dim merges the same split chain with eight times the
-     * threads; measured on M5, other devices keep the simdgroup merge. */
+     * threads; measured on M5 and M3 Ultra, other devices keep the simdgroup
+     * merge. */
     const int wide_override = ds4_gpu_env_bool("DS4_QWEN4_ATTN_MERGE_WIDE");
     const bool wide = head_dim >= 128u &&
-        (wide_override >= 0 ? wide_override != 0 : ds4_gpu_device_is_m5_apple_silicon());
+        (wide_override >= 0 ? wide_override != 0 :
+         ds4_gpu_device_is_m5_apple_silicon() || ds4_gpu_device_name_contains("M3 Ultra"));
     if (wide) {
         return qwen4_dispatch(head_dim == 256u ? QWEN4_K_ATTN_MERGE_WIDE_NPT8 : QWEN4_K_ATTN_MERGE_WIDE_NPT4,
                               &args, sizeof(args), mb, 3,
@@ -50888,7 +50923,7 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
         }
     }
     return qwen4_dispatch(QWEN4_K_MULTI_GEMV, &args, sizeof(args), b, 9,
-                          MTLSizeMake((total + 7) / 8, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
+                          MTLSizeMake((total + 3) / 4, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
 }
 
 static ds4_gpu_tensor *g_qwen4_dense_mm_partials;

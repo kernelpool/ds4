@@ -864,6 +864,43 @@ static void test_idx_select(uint32_t T, uint32_t n, uint32_t k, uint32_t visible
 }
 
 /* Prefill and split attention against scalar attention on the same inputs. */
+static void check_exact_f32(const char *what, const float *got, const float *ref, uint64_t n);
+
+/* the fused select+expand gives the token list of the select then the expand */
+static void test_idx_select_expand(uint32_t T, uint32_t n_blocks, uint32_t pos0, uint32_t k, bool ties) {
+    const uint32_t ratio = 4, stride = k * ratio + ratio;
+    float *sc = malloc((uint64_t)T * n_blocks * 4);
+    for (uint64_t i = 0; i < (uint64_t)T * n_blocks; i++) {
+        float v = (frand() + 1.0f) * 2.0f;
+        if (ties) v = (float)(int)(v * 4.0f) * 0.25f;
+        if (i % 7 == 0) v = 0.0f;
+        sc[i] = (i % n_blocks) < (pos0 + 1 + i / n_blocks) / ratio ? v : -3.0e38f;
+    }
+    ds4_gpu_tensor *gs = upload(sc, (uint64_t)T * n_blocks);
+    int32_t *tok[2];
+    uint32_t *cnt[2];
+    for (int v = 0; v < 2; v++) {
+        ds4_gpu_tensor *gt = ds4_gpu_tensor_alloc((uint64_t)T * stride * 4), *gn = ds4_gpu_tensor_alloc((uint64_t)T * 4);
+        ds4_gpu_tensor *gb = ds4_gpu_tensor_alloc((uint64_t)T * k * 4);
+        int32_t *z = calloc((uint64_t)T * stride, 4);
+        require_ok(gt && gn && gb && z && ds4_gpu_tensor_write(gt, 0, z, (uint64_t)T * stride * 4), "select+expand setup");
+        free(z);
+        require_ok(v ? ds4_gpu_qwen4_idx_select_expand_tensor(gt, gn, gs, NULL, n_blocks, T, k, ratio, pos0, stride) == 1
+                     : ds4_gpu_qwen4_idx_select_tensor(gb, gs, NULL, n_blocks, T, k) &&
+                       ds4_gpu_qwen4_idx_expand_tensor(gt, gn, gb, T, k, ratio, pos0, stride), "select+expand");
+        tok[v] = malloc((uint64_t)T * stride * 4);
+        cnt[v] = malloc((uint64_t)T * 4);
+        require_ok(ds4_gpu_tensor_read(gt, 0, tok[v], (uint64_t)T * stride * 4) &&
+                   ds4_gpu_tensor_read(gn, 0, cnt[v], (uint64_t)T * 4), "select+expand read");
+        ds4_gpu_tensor_free(gt); ds4_gpu_tensor_free(gn); ds4_gpu_tensor_free(gb);
+    }
+    require_ok(memcmp(cnt[0], cnt[1], (uint64_t)T * 4) == 0 && memcmp(tok[0], tok[1], (uint64_t)T * stride * 4) == 0,
+               "fused select+expand matches select then expand");
+    fprintf(stderr, "  idx select+expand T=%u n=%u k=%u ties=%d: byte-exact\n", T, n_blocks, k, ties);
+    free(tok[0]); free(tok[1]); free(cnt[0]); free(cnt[1]); free(sc);
+    ds4_gpu_tensor_free(gs);
+}
+
 static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k_blocks, uint32_t H, bool split) {
     const uint32_t Hkv = 2, D = 256, ratio = 4, sel_stride = k_blocks * ratio + ratio;
     const uint32_t cap = pos0 + T;
@@ -4024,6 +4061,10 @@ int main(void) {
     test_idx_select(4, 70001, 512, 69000);
     test_idx_select(3, 600, 512, 599);
     test_idx_select(2, 3000, 512, 520);
+    test_idx_select_expand(1, 520, 2081, 512, false);
+    test_idx_select_expand(2, 600, 2390, 512, true);
+    test_idx_select_expand(3, 20000, 79990, 512, true);
+    test_idx_select_expand(1, 40, 150, 6, true);
     test_attn_mm(40, 0, false);
     test_attn_mm(37, 3000, true);
     test_attn_mm(3, 100, true);
