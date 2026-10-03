@@ -3364,7 +3364,7 @@ template <uint NJ>
 static inline void qwen4_moe_mid_q8_pass(constant ds4_metal_args_qwen4_moe &args, device const char *gb,
                                          device const char *ub, device const float *x, device float *mid,
                                          device const int32_t *list, uint slot, uint tok, uint j0, uint64_t ebase,
-                                         uint row_bytes, uint row0, ushort tiisg) {
+                                         uint row_bytes, uint r, ushort tiisg) {
     const uint n_out = args.n_slots + args.has_shared;
     uint xoff[NJ], moff[NJ];
 #pragma unroll
@@ -3373,15 +3373,13 @@ static inline void qwen4_moe_mid_q8_pass(constant ds4_metal_args_qwen4_moe &args
         xoff[j] = ts.x * args.in_dim;
         moff[j] = (ts.x * n_out + ts.y) * args.out_rows;
     }
-    for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
-        const uint64_t off = ebase + (uint64_t)r * row_bytes;
-        float g[NJ], u[NJ];
-        qwen4_q8_pairs_dot<NJ>(gb + off, x, xoff, args.in_dim, tiisg, g);
-        qwen4_q8_pairs_dot<NJ>(ub + off, x, xoff, args.in_dim, tiisg, u);
-        if (tiisg == 0) {
+    const uint64_t off = ebase + (uint64_t)r * row_bytes;
+    float g[NJ], u[NJ];
+    qwen4_q8_pairs_dot<NJ>(gb + off, x, xoff, args.in_dim, tiisg, g);
+    qwen4_q8_pairs_dot<NJ>(ub + off, x, xoff, args.in_dim, tiisg, u);
+    if (tiisg == 0) {
 #pragma unroll
-            for (uint j = 0; j < NJ; j++) mid[moff[j] + r] = qwen4_silu(g[j]) * u[j];
-        }
+        for (uint j = 0; j < NJ; j++) mid[moff[j] + r] = qwen4_silu(g[j]) * u[j];
     }
 }
 
@@ -3401,8 +3399,8 @@ kernel void kernel_qwen4_moe_mid_q8_grouped(
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort3 ntg [[threads_per_threadgroup]]) {
     const uint slot = tgpig.y, tok = tgpig.z;
-    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * 2u;
-    if (row0 >= args.out_rows || slot >= args.n_slots + args.has_shared || tok >= args.n_tokens) return;
+    const uint row = tgpig.x * (ntg.x / 32u) + (uint)sgitg;
+    if (row >= args.out_rows || slot >= args.n_slots + args.has_shared || tok >= args.n_tokens) return;
     device const int32_t *list;
     uint64_t ebase;
     const uint count = qwen4_q8_group(args, selected, lists, counts, slot, tok, list, ebase);
@@ -3411,10 +3409,10 @@ kernel void kernel_qwen4_moe_mid_q8_grouped(
     const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
     for (uint j0 = 0; j0 < count; j0 += 4u) {
         switch (min(4u, count - j0)) {
-        case 1u: qwen4_moe_mid_q8_pass<1>(args, gb, ub, x, mid, list, slot, tok, j0, ebase, row_bytes, row0, tiisg); break;
-        case 2u: qwen4_moe_mid_q8_pass<2>(args, gb, ub, x, mid, list, slot, tok, j0, ebase, row_bytes, row0, tiisg); break;
-        case 3u: qwen4_moe_mid_q8_pass<3>(args, gb, ub, x, mid, list, slot, tok, j0, ebase, row_bytes, row0, tiisg); break;
-        default: qwen4_moe_mid_q8_pass<4>(args, gb, ub, x, mid, list, slot, tok, j0, ebase, row_bytes, row0, tiisg); break;
+        case 1u: qwen4_moe_mid_q8_pass<1>(args, gb, ub, x, mid, list, slot, tok, j0, ebase, row_bytes, row, tiisg); break;
+        case 2u: qwen4_moe_mid_q8_pass<2>(args, gb, ub, x, mid, list, slot, tok, j0, ebase, row_bytes, row, tiisg); break;
+        case 3u: qwen4_moe_mid_q8_pass<3>(args, gb, ub, x, mid, list, slot, tok, j0, ebase, row_bytes, row, tiisg); break;
+        default: qwen4_moe_mid_q8_pass<4>(args, gb, ub, x, mid, list, slot, tok, j0, ebase, row_bytes, row, tiisg); break;
         }
     }
 }
@@ -3423,7 +3421,7 @@ template <uint NJ>
 static inline void qwen4_moe_down_q8_pass(constant ds4_metal_args_qwen4_moe &args, device const char *db,
                                           device const float *mid, device float *part,
                                           device const int32_t *list, uint slot, uint tok, uint j0, uint64_t ebase,
-                                          uint row_bytes, uint row0, ushort tiisg) {
+                                          uint row_bytes, uint r, ushort tiisg) {
     const uint n_out = args.n_slots + args.has_shared;
     uint xoff[NJ], poff[NJ];
 #pragma unroll
@@ -3432,13 +3430,11 @@ static inline void qwen4_moe_down_q8_pass(constant ds4_metal_args_qwen4_moe &arg
         xoff[j] = (ts.x * n_out + ts.y) * args.in_dim;
         poff[j] = (ts.x * n_out + ts.y) * args.out_rows;
     }
-    for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
-        float v[NJ];
-        qwen4_q8_pairs_dot<NJ>(db + ebase + (uint64_t)r * row_bytes, mid, xoff, args.in_dim, tiisg, v);
-        if (tiisg == 0) {
+    float v[NJ];
+    qwen4_q8_pairs_dot<NJ>(db + ebase + (uint64_t)r * row_bytes, mid, xoff, args.in_dim, tiisg, v);
+    if (tiisg == 0) {
 #pragma unroll
-            for (uint j = 0; j < NJ; j++) part[poff[j] + r] = v[j];
-        }
+        for (uint j = 0; j < NJ; j++) part[poff[j] + r] = v[j];
     }
 }
 
@@ -3456,8 +3452,8 @@ kernel void kernel_qwen4_moe_down_q8_grouped(
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort3 ntg [[threads_per_threadgroup]]) {
     const uint slot = tgpig.y, tok = tgpig.z;
-    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * 2u;
-    if (row0 >= args.out_rows || slot >= args.n_slots + args.has_shared || tok >= args.n_tokens) return;
+    const uint row = tgpig.x * (ntg.x / 32u) + (uint)sgitg;
+    if (row >= args.out_rows || slot >= args.n_slots + args.has_shared || tok >= args.n_tokens) return;
     device const int32_t *list;
     uint64_t ebase;
     const uint count = qwen4_q8_group(args, selected, lists, counts, slot, tok, list, ebase);
@@ -3466,10 +3462,10 @@ kernel void kernel_qwen4_moe_down_q8_grouped(
     const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
     for (uint j0 = 0; j0 < count; j0 += 4u) {
         switch (min(4u, count - j0)) {
-        case 1u: qwen4_moe_down_q8_pass<1>(args, db, mid, part, list, slot, tok, j0, ebase, row_bytes, row0, tiisg); break;
-        case 2u: qwen4_moe_down_q8_pass<2>(args, db, mid, part, list, slot, tok, j0, ebase, row_bytes, row0, tiisg); break;
-        case 3u: qwen4_moe_down_q8_pass<3>(args, db, mid, part, list, slot, tok, j0, ebase, row_bytes, row0, tiisg); break;
-        default: qwen4_moe_down_q8_pass<4>(args, db, mid, part, list, slot, tok, j0, ebase, row_bytes, row0, tiisg); break;
+        case 1u: qwen4_moe_down_q8_pass<1>(args, db, mid, part, list, slot, tok, j0, ebase, row_bytes, row, tiisg); break;
+        case 2u: qwen4_moe_down_q8_pass<2>(args, db, mid, part, list, slot, tok, j0, ebase, row_bytes, row, tiisg); break;
+        case 3u: qwen4_moe_down_q8_pass<3>(args, db, mid, part, list, slot, tok, j0, ebase, row_bytes, row, tiisg); break;
+        default: qwen4_moe_down_q8_pass<4>(args, db, mid, part, list, slot, tok, j0, ebase, row_bytes, row, tiisg); break;
         }
     }
 }
@@ -4851,8 +4847,11 @@ kernel void kernel_qwen4_hc_combine_norm(
     device const float *r = R + ((uint64_t)tok * args.n_hc + s) * E;
     device const float *g = gamma + s * E;
     device float *o = xn + ((uint64_t)tok * args.n_hc + s) * E;
+    device float *nr = next_R + ((uint64_t)tok * args.n_hc + s) * E;
+    blk += (uint64_t)tok * E;
     const W w(w_inject);
-    const float weight = qwen4_hc_inject_weight(old_inj, args.n_hc, s);
+    const float weight = qwen4_hc_inject_weight(old_inj + (uint64_t)tok * args.n_hc * QWEN4_HC_CHUNKS * args.n_hc,
+                                                args.n_hc, s);
     float ss = 0.0f;
     for (uint i = tid; i < E; i += nth) { float v = r[i] + weight * blk[i]; ss += v * v; }
     ss = simd_sum(ss);
@@ -4866,7 +4865,7 @@ kernel void kernel_qwen4_hc_combine_norm(
     float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     for (uint i = i0 + tid; i < i1; i += nth) {
         const float combined = r[i] + weight * blk[i];
-        next_R[s * E + i] = combined;
+        nr[i] = combined;
         const float v = combined * inv * g[i];
         o[i] = v;
         for (uint j = 0; j < 4; j++) {

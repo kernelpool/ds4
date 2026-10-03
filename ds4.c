@@ -58824,13 +58824,13 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             ok = qwen4_graph_apply_steering_attn(g, il, T);
         }
         QWEN4_PROF(ds4_qwen4_layer_is_linear(il) ? 2 : 3);
-        if (T == 1u && !g->mtp_R && DS4_N_HC == 4u && ds4_gpu_qwen4_decode_fusions_enabled() &&
+        if ((T == 1u || g->verify_rows_exact) && DS4_N_HC == 4u && ds4_gpu_qwen4_decode_fusions_enabled() &&
             l->hc_ffn_inject->type == DS4_TENSOR_F16) {
             if (ok) ok = ds4_gpu_qwen4_hc_combine_norm_tensor(g->hc_u, g->blk, g->inj,
                 g->xn, g->inj_alt, g->R, m->map, m->size, l->hc_ffn_norm->abs_offset,
                 l->hc_ffn_inject->abs_offset, l->hc_ffn_inject->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC, DS4_RMS_EPS);
             if (ok) {
-                /* hc_u is unused by the single-token fused mixer. Both residual
+                /* hc_u is unused by the decode-sized fused mixer. Both residual
                  * buffers have the same capacity, including for later prefill. */
                 ds4_gpu_tensor *swap = g->R; g->R = g->hc_u; g->hc_u = swap;
                 swap = g->inj; g->inj = g->inj_alt; g->inj_alt = swap;

@@ -48417,10 +48417,10 @@ typedef struct {
 static bool qwen4_moe_mv_specialize(uint32_t type) {
     /* Constant quantization and logical width remove the generic decode
      * branches. Keep the original per-lane reduction order and padded stride.
-     * M3 Ultra uses low-bit and MXFP4 down rows; M5 uses MXFP4 down rows. */
+     * M3 Ultra uses Q8_0, low-bit and MXFP4 rows; M5 uses MXFP4 down rows. */
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MV_SPECIALIZE");
     return override >= 0 ? override != 0 :
-        ((type == 16u || type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
+        ((type == 8u || type == 16u || type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
         (type == 39u && ds4_gpu_device_is_m5_apple_silicon());
 }
 
@@ -48429,10 +48429,10 @@ static uint32_t qwen4_moe_mv_rows(void) {
 }
 
 static uint32_t qwen4_moe_mv_groups(uint32_t type) {
-    /* Q2_K and MXFP4 use sixteen groups on M3 Ultra; MXFP4 also does on M5.
-     * Each group keeps its own rows and unchanged per-lane reduction order. */
+    /* Q8_0, Q2_K and MXFP4 use sixteen groups on M3 Ultra; MXFP4 also does on
+     * M5.  Each group keeps its own rows and unchanged per-lane reduction order. */
     const uint32_t default_nsg =
-        ((type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
+        ((type == 8u || type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
         (type == 39u && ds4_gpu_device_is_m5_apple_silicon()) ? 16u : 8u;
     return (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_MOE_MV_NSG", default_nsg, 1u, 16u);
 }
@@ -48588,7 +48588,7 @@ int ds4_gpu_qwen4_hc_combine_norm_tensor(
     struct { uint32_t n_tokens, n_embd, n_hc, n_inject; float eps; uint32_t pad0, pad1, pad2; } args =
         { n_tokens, n_embd, n_hc, n_inject, eps, 0, 0, 0 };
     qwen4_bind b[8];
-    if (n_tokens != 1u || weight_type != 1u || n_inject != n_hc) return 0;
+    if (weight_type != 1u || n_inject != n_hc) return 0;
     if (ds4_gpu_tensor_buffer(next_R) == ds4_gpu_tensor_buffer(R) ||
         ds4_gpu_tensor_buffer(inj_part) == ds4_gpu_tensor_buffer(old_inj)) return 0;
     if (n_tokens == 0 || n_embd == 0 || n_hc == 0 || n_hc > 8 || n_inject > 4 || wrow == 0 || (dim % 32) != 0 ||
@@ -48608,11 +48608,12 @@ int ds4_gpu_qwen4_hc_combine_norm_tensor(
         b[2] = b[1];
         b[4] = b[3];
     }
-    if (!qwen4_bind_tensor(&b[5], next_R, dim * sizeof(float), "combine norm next R") ||
-        !qwen4_bind_tensor(&b[6], blk, n_embd * sizeof(float), "combine norm block") ||
-        !qwen4_bind_tensor(&b[7], old_inj, n_hc * DS4_QWEN4_HC_CHUNKS * n_hc * sizeof(float), "combine norm old inject")) return 0;
+    if (!qwen4_bind_tensor(&b[5], next_R, n_tokens * dim * sizeof(float), "combine norm next R") ||
+        !qwen4_bind_tensor(&b[6], blk, (uint64_t)n_tokens * n_embd * sizeof(float), "combine norm block") ||
+        !qwen4_bind_tensor(&b[7], old_inj, (uint64_t)n_tokens * n_hc * DS4_QWEN4_HC_CHUNKS * n_hc * sizeof(float),
+                           "combine norm old inject")) return 0;
     return qwen4_dispatch(QWEN4_K_HC_COMBINE_NORM, &args, sizeof(args), b, 8,
-        MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, 1, 1), MTLSizeMake(128, 1, 1), 0);
+        MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_hc_norm_tensor(
@@ -48677,10 +48678,12 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
     }
     const bool pair = n_tokens == 2u && !g_qwen4_verify_rows_exact && getenv("DS4_QWEN4_NO_HC_PAIR") == NULL;
     /* Register-prefetched F16 rows (same lane order and rounding, pinned
-     * against the plain kernel by tests/test_qwen4_kernels.c); M5 default. */
+     * against the plain kernel by tests/test_qwen4_kernels.c); M5 and M3 Ultra
+     * default. */
     const int prefetch_override = ds4_gpu_env_bool("DS4_QWEN4_HC_MIX_PREFETCH");
     const bool prefetch = weight_type == 1u &&
-        (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_apple_silicon());
+        (prefetch_override >= 0 ? prefetch_override > 0 :
+         ds4_gpu_device_is_m5_apple_silicon() || ds4_gpu_device_name_contains("M3 Ultra"));
     const int kernel = pair ? (prefetch ? QWEN4_K_HC_GATE_MIX_PAIR_F16_PF
                                         : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_PAIR_F16,
                                               QWEN4_K_HC_GATE_MIX_PAIR_F32, QWEN4_K_HC_GATE_MIX_PAIR_Q8))
@@ -49753,7 +49756,7 @@ int ds4_gpu_qwen4_moe_mid_grouped_tensor(
             b[5] = b[0];
             b[6] = b[1];
         }
-        const uint32_t nsg = 4u, rows_per_tg = 2u * nsg;
+        const uint32_t nsg = 4u, rows_per_tg = nsg;
         return qwen4_dispatch(QWEN4_K_MOE_MID_Q8_GROUPED, &args, sizeof(args), b, 9,
                               MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
                               MTLSizeMake(32u * nsg, 1, 1), 0);
@@ -49807,7 +49810,7 @@ int ds4_gpu_qwen4_moe_down_grouped_tensor(
         } else {
             b[4] = b[0];
         }
-        const uint32_t nsg = 4u, rows_per_tg = 2u * nsg;
+        const uint32_t nsg = 4u, rows_per_tg = nsg;
         return qwen4_dispatch(QWEN4_K_MOE_DOWN_Q8_GROUPED, &args, sizeof(args), b, 7,
                               MTLSizeMake((out_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
                               MTLSizeMake(32u * nsg, 1, 1), 0);
@@ -50313,9 +50316,11 @@ int ds4_gpu_qwen4_gdn_front_tensor(
     }
     /* One threadgroup per key head: simdgroups 0/1 normalize, the rest take
      * the alpha/beta rows, and every channel's conv stays on one thread, so
-     * the thread count only spreads the conv wider.  M5 measured 1024. */
+     * the thread count only spreads the conv wider.  M5 and M3 Ultra measured
+     * 1024. */
     const uint64_t nth = ds4_gpu_env_u64("DS4_QWEN4_GDN_FRONT_THREADS",
-                                         ds4_gpu_device_is_m5_apple_silicon() ? 1024u : 256u, 96u, 1024u);
+                                         ds4_gpu_device_is_m5_apple_silicon() ||
+                                         ds4_gpu_device_name_contains("M3 Ultra") ? 1024u : 256u, 96u, 1024u);
     return qwen4_dispatch(QWEN4_K_GDN_FRONT, &args, sizeof(args), b, 12,
                           MTLSizeMake(n_k_head, 1, 1), MTLSizeMake((NSUInteger)(nth / 32u * 32u), 1, 1), 0);
 }
