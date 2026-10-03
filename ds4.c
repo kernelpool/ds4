@@ -63803,6 +63803,9 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 #ifdef DS4_HAS_QWEN4_GPU
 static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows);
 #endif
+#ifdef DS4_HAS_MIMO_GPU
+static uint64_t mimo_payload_body_bytes(const ds4_mimo_gpu_graph *g, uint32_t rows);
+#endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
@@ -63828,6 +63831,13 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
             s->ds41_graph.pos != (uint32_t)s->checkpoint.len) return 0;
         return DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
                ds41_payload_body_bytes(&s->ds41_graph, (uint32_t)s->checkpoint.len);
+    }
+#endif
+#ifdef DS4_HAS_MIMO_GPU
+    if (ds4_session_is_mimo(s)) {
+        if (!s->mimo_graph_ready || s->mimo_graph.pos != (uint32_t)s->checkpoint.len) return 0;
+        return DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
+               mimo_payload_body_bytes(&s->mimo_graph, (uint32_t)s->checkpoint.len);
     }
 #endif
     if (ds4_session_is_cpu(s)) {
@@ -64238,6 +64248,22 @@ static int mimo_dflash_payload(ds4_mimo_gpu_graph *g, FILE *fp, uint32_t rows, u
             mimo_dflash_span_io(fp, g->df_v_cache[il], rows - n, n, g->df_ring, vb, buf, remaining, err, errlen)) return 1;
     }
     return 0;
+}
+
+/* what mimo_session_save_payload writes after the header */
+static uint64_t mimo_payload_body_bytes(const ds4_mimo_gpu_graph *g, uint32_t rows) {
+    uint64_t bytes = (uint64_t)rows * sizeof(uint32_t) + (uint64_t)DS4_N_VOCAB * sizeof(float);
+    const uint32_t n_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT + (g->mtp_a ? DS4_N_NEXTN_PREDICT : 0u);
+    for (uint32_t il = 0; il < n_layers; il++) {
+        bytes += 2u * sizeof(uint32_t) + (uint64_t)mimo_payload_rows(g, il, rows) * mimo_graph_kv(g, il) *
+                                         (DS4_N_HEAD_DIM + DS4_N_VALUE_DIM) * 2u;
+    }
+    if (g->df) {
+        const ds4_dflash_weights *d = g->df;
+        const uint64_t n = rows < d->window ? rows : d->window;
+        bytes += 4u * sizeof(uint32_t) + d->n_layer * n * d->n_head_kv * (d->head_dim + d->value_dim) * 2u;
+    }
+    return bytes;
 }
 
 static int mimo_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
