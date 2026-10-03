@@ -3524,6 +3524,13 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
         uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
         uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap);
 /* weight_type covers both the alpha and the beta projection */
+int ds4_gpu_qwen4_gdn_front_rows_tensor(
+        ds4_gpu_tensor *qkv, const ds4_gpu_tensor *mixed, ds4_gpu_tensor *ga, ds4_gpu_tensor *gb,
+        const void *model_map, uint64_t model_size, uint64_t conv_offset,
+        uint64_t alpha_offset, uint64_t beta_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
+        uint32_t weight_type, const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_gdn_row *rows,
+        uint32_t n_rows, uint32_t n_batch_rows, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t conv_kernel, uint32_t in_dim);
 int ds4_gpu_qwen4_gdn_front_tensor(
         ds4_gpu_tensor *qkv, ds4_gpu_tensor *state, const ds4_gpu_tensor *mixed,
         ds4_gpu_tensor *ga, ds4_gpu_tensor *gb,

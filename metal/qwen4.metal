@@ -4780,6 +4780,79 @@ kernel void kernel_qwen4_gdn_front(
     }
 }
 
+/* kernel_qwen4_gdn_front over a batch's row table: entry tgpig.y walks its
+ * one or two tokens (rows row0..) against its own conv history, the window
+ * after the first written to its snapshot when it has one.  The body is the
+ * front kernel's, so each row's results are those of its own front. */
+kernel void kernel_qwen4_gdn_front_rows(
+        constant ds4_metal_args_qwen4_gdn_front & args,
+        device float       *qkv,      /* [rows][C] */
+        device const ds4_metal_qwen4_gdn_row *entries,
+        device const float *conv_w,
+        device const float *mixed,    /* [rows][in_dim] */
+        device const char  *w_alpha,
+        device const char  *w_beta,
+        device const float *ssm_a,
+        device const float *dt_bias,
+        device float       *ga,       /* [rows][Hv] */
+        device float       *gb,       /* [rows][Hv] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint h = tgpig.x;
+    const uint Hk = args.n_k_head, Hv = args.n_v_head, D = args.head_dim, K = args.conv_kernel;
+    if (h >= Hk || tgpig.y >= args.n_tokens) return;
+    const ds4_metal_qwen4_gdn_row e = entries[tgpig.y];
+    device float *state = reinterpret_cast<device float *>(e.hist);
+    const uint C = 2 * Hk * D + Hv * D;
+    const uint per_k = Hv / Hk;
+    const uint n_ch = (2 + per_k) * D;
+    const uint nth = ntg.x;
+    const uint nsg = nth / 32;
+    const uint npt = D / 32;
+    for (uint tok = 0; tok < e.n_tok; tok++) {
+        const uint gr = e.row0 + tok;
+        device float *row = qkv + (uint64_t)gr * C;
+        for (uint cl = tid; cl < n_ch; cl += nth) {
+            const uint grp = cl / D, i = cl - grp * D;
+            const uint c = (grp == 0 ? h * D : grp == 1 ? Hk * D + h * D : 2 * Hk * D + (h + (grp - 2) * Hk) * D) + i;
+            const float raw = row[c];
+            float acc = conv_w[c * K + K - 1] * raw;
+            for (uint t = 0; t + 1 < K; t++) acc += conv_w[c * K + t] * state[t * C + c];
+            for (uint t = 0; t + 2 < K; t++) state[t * C + c] = state[(t + 1) * C + c];
+            state[(K - 2) * C + c] = raw;
+            row[c] = qwen4_silu(acc);
+            if (tok == 0 && e.snap_hist) {
+                device float *slot = reinterpret_cast<device float *>(e.snap_hist);
+                for (uint t = 0; t + 1 < K; t++) slot[t * C + c] = state[t * C + c];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+        if (sgitg < 2) {
+            device float *v = row + (sgitg == 0 ? h * D : Hk * D + h * D);
+            float ss = 0.0f;
+            for (uint r = 0; r < npt; r++) ss += v[tiisg + 32 * r] * v[tiisg + 32 * r];
+            ss = simd_sum(ss);
+            const float sc = rsqrt(ss + 1e-6f) * (sgitg == 0 ? rsqrt((float)D) : 1.0f);
+            for (uint r = 0; r < npt; r++) v[tiisg + 32 * r] *= sc;
+        } else {
+            device const float *x = mixed + (uint64_t)gr * args.in_dim;
+            for (uint rr = (uint)sgitg - 2u; rr < 2 * per_k; rr += nsg - 2u) {
+                const uint j = h + (rr / 2) * Hk;
+                device const char *wrow = (rr & 1u) ? w_beta : w_alpha;
+                const float v = qwen4_row_dot(wrow + (uint64_t)j * args.row_bytes, x, args.weight_type, args.in_dim, tiisg);
+                if (tiisg == 0) {
+                    if (rr & 1u) gb[(uint64_t)gr * Hv + j] = qwen4_sigmoid(v);
+                    else ga[(uint64_t)gr * Hv + j] = exp(ssm_a[j] * qwen4_softplus(v + dt_bias[j]));
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+}
+
 /* The predictor needs a token ID, not a CPU copy of the entire vocabulary.
  * First reduce independent 4096-value chunks; then merge their winners.
  * The -1e30 initial score and index-zero fallback match sample_argmax. */

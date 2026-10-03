@@ -48227,6 +48227,7 @@ enum {
     QWEN4_K_MTP_STAGE,
     QWEN4_K_MTP_COMBINE,
     QWEN4_K_GDN_FRONT,
+    QWEN4_K_GDN_FRONT_ROWS,
     QWEN4_K_MOE_BUILD_LISTS,
     QWEN4_K_MOE_MM_MID,
     QWEN4_K_MOE_MM_MID_NT1,
@@ -48334,6 +48335,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_mtp_stage",
     "kernel_qwen4_mtp_combine",
     "kernel_qwen4_gdn_front",
+    "kernel_qwen4_gdn_front_rows",
     "kernel_qwen4_moe_build_lists",
     "kernel_qwen4_moe_mm_mid",
     "kernel_qwen4_moe_mm_mid_nt1",
@@ -50268,6 +50270,47 @@ int ds4_gpu_qwen4_mtp_combine_tensor(
     const uint32_t n = n_embd * n_hc;
     return qwen4_dispatch(QWEN4_K_MTP_COMBINE, &args, sizeof(args), b, 2,
                           MTLSizeMake((n + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1), 0);
+}
+
+/* ds4_gpu_qwen4_gdn_front_tensor for every entry of a staged row table (one
+ * or two tokens each, against its own history). */
+int ds4_gpu_qwen4_gdn_front_rows_tensor(
+        ds4_gpu_tensor *qkv, const ds4_gpu_tensor *mixed, ds4_gpu_tensor *ga, ds4_gpu_tensor *gb,
+        const void *model_map, uint64_t model_size, uint64_t conv_offset,
+        uint64_t alpha_offset, uint64_t beta_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
+        uint32_t weight_type, const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_gdn_row *rows,
+        uint32_t n_rows, uint32_t n_batch_rows, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t conv_kernel, uint32_t in_dim) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, in_dim);
+    struct { uint32_t n_tokens, n_k_head, n_v_head, head_dim, conv_kernel, weight_type, in_dim, row_bytes,
+                      snap_tok, snap2_tok, snap_rows, pad2; } args =
+        { n_rows, n_k_head, n_v_head, head_dim, conv_kernel, weight_type, in_dim, row_bytes, 0, 0, 0, 0 };
+    const uint64_t conv_dim = 2ull * n_k_head * head_dim + (uint64_t)n_v_head * head_dim;
+    const uint64_t proj_bytes = (uint64_t)n_v_head * row_bytes;
+    const uint64_t vhead_bytes = (uint64_t)n_v_head * sizeof(float);
+    qwen4_bind b[10], res[QWEN4_ATTN_ROWS_MAX * 4u];
+    if (n_rows == 0u || n_rows > QWEN4_ATTN_ROWS_MAX || n_k_head == 0 || head_dim % 32 != 0 ||
+        n_v_head % n_k_head != 0 || conv_kernel < 2 || conv_kernel > 4 || row_bytes == 0 ||
+        !qwen4_bind_tensor(&b[0], qkv, (uint64_t)n_batch_rows * conv_dim * sizeof(float), "gdn front rows qkv") ||
+        !qwen4_bind_gdn_rows(&b[1], table, entry0, n_rows) ||
+        !qwen4_bind_weight(&b[2], model_map, model_size, conv_offset, conv_dim * conv_kernel * sizeof(float),
+                           "gdn front rows conv weight") ||
+        !qwen4_bind_tensor(&b[3], mixed, (uint64_t)n_batch_rows * in_dim * sizeof(float), "gdn front rows input") ||
+        !qwen4_bind_weight(&b[4], model_map, model_size, alpha_offset, proj_bytes, "gdn front rows alpha") ||
+        !qwen4_bind_weight(&b[5], model_map, model_size, beta_offset, proj_bytes, "gdn front rows beta") ||
+        !qwen4_bind_weight(&b[6], model_map, model_size, ssm_a_offset, vhead_bytes, "gdn front rows ssm_a") ||
+        !qwen4_bind_weight(&b[7], model_map, model_size, dt_bias_offset, vhead_bytes, "gdn front rows dt_bias") ||
+        !qwen4_bind_tensor(&b[8], ga, (uint64_t)n_batch_rows * n_v_head * sizeof(float), "gdn front rows decay") ||
+        !qwen4_bind_tensor(&b[9], gb, (uint64_t)n_batch_rows * n_v_head * sizeof(float), "gdn front rows beta out")) {
+        return 0;
+    }
+    const uint64_t nth = ds4_gpu_env_u64("DS4_QWEN4_GDN_FRONT_THREADS",
+                                         ds4_gpu_device_is_m5_apple_silicon() ||
+                                         ds4_gpu_device_name_contains("M3 Ultra") ? 1024u : 256u, 96u, 1024u);
+    return qwen4_dispatch_resident(QWEN4_K_GDN_FRONT_ROWS, &args, sizeof(args), b, 10,
+                                   MTLSizeMake(n_k_head, n_rows, 1), MTLSizeMake((NSUInteger)(nth / 32u * 32u), 1, 1),
+                                   0, res, qwen4_gdn_rows_resident(res, rows, n_rows));
 }
 
 int ds4_gpu_qwen4_gdn_front_tensor(
