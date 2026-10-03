@@ -39632,6 +39632,22 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
 #ifdef DS4_HAS_DEEPSEEK41_GPU
 static ds4_context_memory ds41_graph_memory(uint32_t ctx);
 #endif
+/* Prefill chunks end at multiples of cap past the first uncached token; a
+ * long first chunk runs a short head of its own first, so few n-gram rows
+ * (disk reads that layer 1 waits for) stand before the GPU and the rest are
+ * read while the head runs.  Splits into chunks of more than 64 rows leave
+ * the arithmetic unchanged. */
+static uint32_t qwen4_prefill_next_chunk(uint32_t done, uint32_t left, uint32_t cap) {
+    uint32_t chunk = cap - done % cap;
+    if (chunk > left) chunk = left;
+    /* the head's compute must outlast the rest's reads: an eighth, 512 at least */
+    if (done == 0 && chunk >= 3072u) {
+        const uint32_t head = (chunk / 8u + 255u) & ~255u;
+        chunk = head > 512u ? head : 512u;
+    }
+    return chunk;
+}
+
 static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
     const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
     const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
@@ -57344,6 +57360,24 @@ static int generate_glm_metal_argmax(
 static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out);
 static void qwen4_ple_step(int token, int *prev, uint32_t *rows);
 
+/* Rows read from the disk-only table stay in a direct-mapped cache of 2^21
+ * rows (656 MB at most, filled as rows are read): n-grams repeat across
+ * prompts and turns.  A slot's sequence number is odd while it is written; a
+ * reader keeps its copy only if the number was even and did not change. */
+#define QWEN4_NGRAM_CACHE_SLOTS (1u << 21)
+static struct { uint32_t *seq, *tag; uint8_t *rows; } g_qwen4_ngram_cache;
+static pthread_once_t g_qwen4_ngram_cache_once = PTHREAD_ONCE_INIT;
+
+static void qwen4_ngram_cache_init(void) {
+    g_qwen4_ngram_cache.seq = calloc(QWEN4_NGRAM_CACHE_SLOTS, sizeof(uint32_t));
+    g_qwen4_ngram_cache.tag = calloc(QWEN4_NGRAM_CACHE_SLOTS, sizeof(uint32_t));   /* row + 1, 0 empty */
+    g_qwen4_ngram_cache.rows = calloc(QWEN4_NGRAM_CACHE_SLOTS, 320);
+    if (!g_qwen4_ngram_cache.seq || !g_qwen4_ngram_cache.tag || !g_qwen4_ngram_cache.rows) {
+        free(g_qwen4_ngram_cache.seq); free(g_qwen4_ngram_cache.tag); free(g_qwen4_ngram_cache.rows);
+        memset(&g_qwen4_ngram_cache, 0, sizeof(g_qwen4_ngram_cache));
+    }
+}
+
 static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
     const ds4_tensor *t = m->ngram_tensor;
     if (!t || m->ngram_fd < 0 || !out || row >= t->dim[1] ||
@@ -57354,7 +57388,22 @@ static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
     uint8_t raw[320];
     const uint32_t bytes = (uint32_t)t->dim[0] * 2u;
     const uint64_t offset = t->abs_offset + (uint64_t)row * bytes;
-    uint32_t done = 0;
+    pthread_once(&g_qwen4_ngram_cache_once, qwen4_ngram_cache_init);
+    const bool use_cache = g_qwen4_ngram_cache.rows != NULL;
+    const uint32_t slot = row & (QWEN4_NGRAM_CACHE_SLOTS - 1u);
+    uint32_t *seq = use_cache ? g_qwen4_ngram_cache.seq + slot : NULL;
+    uint32_t *tag = use_cache ? g_qwen4_ngram_cache.tag + slot : NULL;
+    uint8_t *cached = use_cache ? g_qwen4_ngram_cache.rows + (uint64_t)slot * 320u : NULL;
+    bool hit = false;
+    if (use_cache) {
+        const uint32_t s0 = __atomic_load_n(seq, __ATOMIC_ACQUIRE);
+        if (!(s0 & 1u) && __atomic_load_n(tag, __ATOMIC_RELAXED) == row + 1u) {
+            memcpy(raw, cached, bytes);
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            hit = __atomic_load_n(seq, __ATOMIC_RELAXED) == s0;
+        }
+    }
+    uint32_t done = hit ? bytes : 0;
     while (done < bytes) {
         ssize_t n = pread(m->ngram_fd, raw + done, bytes - done, (off_t)(offset + done));
         if (n < 0 && errno == EINTR) continue;
@@ -57363,6 +57412,12 @@ static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
             return false;
         }
         done += (uint32_t)n;
+    }
+    uint32_t s0 = use_cache && !hit ? __atomic_load_n(seq, __ATOMIC_RELAXED) : 1u;
+    if (!(s0 & 1u) && __atomic_compare_exchange_n(seq, &s0, s0 + 1u, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        __atomic_store_n(tag, row + 1u, __ATOMIC_RELAXED);
+        memcpy(cached, raw, bytes);
+        __atomic_store_n(seq, s0 + 2u, __ATOMIC_RELEASE);
     }
     for (size_t i = 0; i < t->dim[0]; i++) {
         uint32_t bits = ((uint32_t)raw[2*i] | ((uint32_t)raw[2*i+1] << 8)) << 16;
@@ -57594,6 +57649,12 @@ typedef struct ds4_qwen4_gpu_graph {
     ds4_gpu_tensor *qkv, *z, *ga, *gb, *lin_o;
     ds4_gpu_tensor *ple_emb, *ple_key, *ple_val, *ple_gated, *ple_normed, *ple_hist;
     int ple_prev[DS4_MAX_PLE_NGRAM];
+    /* n-gram rows of the next prefill chunk, read while the GPU runs this
+     * one (next_tokens: a one-shot hint from the prefill loop) */
+    const int *next_tokens;
+    uint32_t next_T, pre_rows;
+    float *pre_emb;
+    uint32_t *pre_ids;
     ds4_gpu_tensor *qg, *kp, *vp, *iq, *ik, *q, *gate, *iqn, *attn_o;
     ds4_gpu_tensor *score, *tile_max, *sel_blocks, *sel_tokens, *n_sel, *attn_part;
     ds4_gpu_tensor *router, *selected, *weights, *mid, *part, *sh_gate_logit;
@@ -57794,6 +57855,11 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         free(g->host_row);
     }
     g->host_row = NULL;
+    free(g->pre_emb);
+    free(g->pre_ids);
+    g->pre_emb = NULL;
+    g->pre_ids = NULL;
+    g->pre_rows = 0;
     free(g->host_pos3);
     free(g->draft_ids);
     g->draft_ids = NULL;
@@ -58712,12 +58778,20 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
         if (t == 1u && g->snap_after_second) g->snap2_mrope_delta = g->mrope_delta;
         if (t < g->lk_snap_rows) g->lk_snap_mrope[t] = g->mrope_delta;
     }
-    if (!ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float)) ||
-        !ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u))
-        return false;
-    uint32_t ids[256 * DS4_MAX_PLE_HEADS];
+    return ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float)) &&
+           ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u);
+}
+
+/* PLE n-gram rows (uncached disk reads), first needed by layer
+ * DS4_N_PLE_LAYER: the forward runs the layers before it meanwhile. */
+static bool qwen4_graph_stage_ple(ds4_qwen4_gpu_graph *g, const ds4_model *m, const int *tokens, uint32_t T) {
+    const uint32_t E = DS4_N_EMBD;
+    float *row = g->host_row;
+    uint32_t ids_small[16u * DS4_MAX_PLE_HEADS];
+    uint32_t *ids = T <= 16u ? ids_small : malloc((size_t)T * DS4_N_PLE_HEADS * sizeof(*ids));
+    if (!ids) return false;
     for (uint32_t t = 0; t < T; t++) {
-        qwen4_ple_step(tokens[t], g->ple_prev, ids + (t % 256u) * DS4_N_PLE_HEADS);
+        qwen4_ple_step(tokens[t], g->ple_prev, ids + (uint64_t)t * DS4_N_PLE_HEADS);
         if (t == 0 && g->snap_after_first) {
             memcpy(g->snap_ple_prev, g->ple_prev, sizeof(g->snap_ple_prev));
             g->snap_pos = g->pos + 1u;
@@ -58730,16 +58804,35 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
             memcpy(g->lk_snap_prev[t], g->ple_prev, sizeof(g->lk_snap_prev[t]));
             g->lk_snap_pos[t] = g->pos + t + 1u;
         }
-        if (t % 256u == 255u || t + 1 == T) {
-            const uint32_t start = t / 256u * 256u;
-            if (!qwen4_ngram_read(m, ids, (t-start+1u) * DS4_N_PLE_HEADS,
-                                  row + (uint64_t)start * E)) {
-                fprintf(stderr, "ds4: n-gram read failed: %s\n", strerror(errno));
-                return false;
-            }
+    }
+    const size_t n_rows = (size_t)T * DS4_N_PLE_HEADS;
+    const bool pre = g->pre_rows == n_rows && !memcmp(ids, g->pre_ids, n_rows * sizeof(*ids));
+    g->pre_rows = 0;
+    const bool read_ok = pre || qwen4_ngram_read(m, ids, n_rows, row);
+    if (!read_ok) fprintf(stderr, "ds4: n-gram read failed: %s\n", strerror(errno));
+    if (ids != ids_small) free(ids);
+    if (!read_ok) return false;
+    return ds4_gpu_tensor_write(g->ple_emb, 0, pre ? g->pre_emb : row, (uint64_t)T * E * sizeof(float)) != 0;
+}
+
+/* Read the next chunk's rows from the PLE context this chunk leaves. */
+static void qwen4_graph_prefetch_ple(ds4_qwen4_gpu_graph *g, const ds4_model *m, const int *tokens, uint32_t T) {
+    g->pre_rows = 0;
+    if (!tokens || T == 0 || T > g->cap_tokens) return;
+    const size_t n_rows = (size_t)T * DS4_N_PLE_HEADS;
+    if (!g->pre_emb) {
+        g->pre_emb = malloc((size_t)g->cap_tokens * DS4_N_EMBD * sizeof(float));
+        g->pre_ids = malloc((size_t)g->cap_tokens * DS4_N_PLE_HEADS * sizeof(uint32_t));
+        if (!g->pre_emb || !g->pre_ids) {
+            free(g->pre_emb); free(g->pre_ids);
+            g->pre_emb = NULL; g->pre_ids = NULL;
+            return;
         }
     }
-    return ds4_gpu_tensor_write(g->ple_emb, 0, row, (uint64_t)T * E * sizeof(float)) != 0;
+    int prev[DS4_MAX_PLE_NGRAM];
+    memcpy(prev, g->ple_prev, sizeof(prev));
+    for (uint32_t t = 0; t < T; t++) qwen4_ple_step(tokens[t], prev, g->pre_ids + (uint64_t)t * DS4_N_PLE_HEADS);
+    if (qwen4_ngram_read(m, g->pre_ids, n_rows, g->pre_emb)) g->pre_rows = (uint32_t)n_rows;
 }
 
 /* Forward T tokens at g->pos..; logits (optional) receive the last token's
@@ -58760,6 +58853,8 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     const uint32_t pos0 = g->pos;
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     const uint32_t hc_dim = DS4_N_EMBD * DS4_N_HC;
+    const int *next_tokens = g->next_tokens;
+    g->next_tokens = NULL;
     static int timing = -1;
     if (timing < 0) {
         const char *tv = getenv("DS4_QWEN4_TIMING");
@@ -58777,7 +58872,15 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         }
     }
     const double t0 = timing ? now_sec() : 0.0;
+    /* Metal runs the layers before the PLE layer while the n-gram rows are
+     * read; a flush elsewhere synchronizes the device */
+#ifdef DS4_HAS_QWEN4_METAL
+    const uint32_t ple_stage_layer = DS4_N_PLE_LAYER;
+#else
+    const uint32_t ple_stage_layer = 0u;
+#endif
     if (!qwen4_graph_stage_inputs(g, m, w, tokens, T)) return false;
+    if (ple_stage_layer == 0u && !qwen4_graph_stage_ple(g, m, tokens, T)) return false;
     const double t1 = timing ? now_sec() : 0.0;
     if (!glm_graph_begin_commands_if_needed()) return false;
     bool ok = true;
@@ -58798,7 +58901,8 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (ds4_qwen4_layer_is_ple(il)) {
-            ok = qwen4_gemv(g->ple_key, m, l->ple_key, g->ple_emb, T) &&
+            if (il > 0u && il == ple_stage_layer) ok = ds4_gpu_flush_commands() != 0 && qwen4_graph_stage_ple(g, m, tokens, T);
+            ok = ok && qwen4_gemv(g->ple_key, m, l->ple_key, g->ple_emb, T) &&
                  qwen4_gemv(g->ple_val, m, l->ple_value, g->ple_emb, T) &&
                  ds4_gpu_qwen4_ple_gate_tensor(g->ple_gated, g->ple_normed, g->R, g->ple_key, g->ple_val,
                                                m->map, m->size, l->ple_norm_key->abs_offset,
@@ -58880,6 +58984,10 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         if (ok) ok = qwen4_gemv(g->logits, m, w->output, g->mixed, 1);
     }
     const double t2 = timing ? now_sec() : 0.0;
+    if (ok && next_tokens && ple_stage_layer > 0u) {
+        ok = ds4_gpu_flush_commands() != 0;
+        qwen4_graph_prefetch_ple(g, m, next_tokens, g->next_T);
+    }
     if (!ds4_gpu_end_commands()) ok = false;
     const double t3 = timing ? now_sec() : 0.0;
     if (ok && logits_out) {
@@ -59305,8 +59413,10 @@ static int generate_qwen4_metal_argmax(
     const double t_prefill0 = now_sec();
     bool ok = true;
     for (int i = 0; i < prompt->len && ok;) {
-        uint32_t chunk = (uint32_t)(prompt->len - i);
-        if (chunk > g->cap_tokens) chunk = g->cap_tokens;
+        const uint32_t left = (uint32_t)(prompt->len - i);
+        const uint32_t chunk = qwen4_prefill_next_chunk((uint32_t)i, left, g->cap_tokens);
+        g->next_tokens = left > chunk ? prompt->v + i + chunk : NULL;
+        g->next_T = left > chunk ? qwen4_prefill_next_chunk((uint32_t)i + chunk, left - chunk, g->cap_tokens) : 0u;
         ok = qwen4_graph_forward_tokens(g, model, weights, prompt->v + i, chunk,
                                         i + (int)chunk == prompt->len ? logits : NULL, false);
         i += (int)chunk;
@@ -75658,12 +75768,14 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 prefill_rc = DS4_SESSION_SYNC_INTERRUPTED;
                 break;
             }
-            uint32_t chunk = (uint32_t)(prompt->len - i);
-            if (chunk > s->qwen4_graph.cap_tokens) chunk = s->qwen4_graph.cap_tokens;
+            const uint32_t left = (uint32_t)(prompt->len - i), cap = s->qwen4_graph.cap_tokens;
+            const uint32_t chunk = qwen4_prefill_next_chunk((uint32_t)(i - start), left, cap);
             /* Progress callbacks may persist this frontier, and cancellation
              * may leave it as the live session. Every completed chunk needs
              * its own logits as well as recurrent/KV state. */
             s->checkpoint_valid = false;
+            s->qwen4_graph.next_tokens = left > chunk ? prompt->v + i + chunk : NULL;
+            s->qwen4_graph.next_T = left > chunk ? qwen4_prefill_next_chunk((uint32_t)(i - start) + chunk, left - chunk, cap) : 0u;
             if (!qwen4_graph_forward_tokens(&s->qwen4_graph, &e->model, &e->weights,
                                             prompt->v + i, chunk, s->logits, false)) {
                 snprintf(err, errlen, "Qwen3.8 prefill failed at token %d", i);

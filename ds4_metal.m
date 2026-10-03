@@ -19487,9 +19487,11 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         const bool bc_out =
             (out_dim % 64u) != 0 || (generic_rows % 32u) != 0;
         /* Amortize dequantization across token tiles with identical half
-         * operands. Default is scoped by the Qwen entry point to M3 Ultra. */
+         * operands; below 2048 rows the tiles' own dequantization is faster
+         * (measured on M3 Ultra).  Default is scoped by the Qwen entry point
+         * to M3 Ultra. */
         const int unpack_override = ds4_gpu_env_bool("DS4_QWEN4_Q8_PREFILL_UNPACK");
-        const bool prefill_unpack = generic_rows >= 32u &&
+        const bool prefill_unpack = generic_rows >= (unpack_override == 1 ? 32u : 2048u) &&
             (unpack_override >= 0 ? unpack_override == 1 : prefill_default);
         const char *fn = "kernel_mul_mm_q8_0_f32";
         id<MTLBuffer> mat_weights = wbuf;
@@ -48237,6 +48239,8 @@ enum {
     QWEN4_K_MOE_MM_DOWN_NT2,
     QWEN4_K_MOE_MM_DOWN_NT8,
     QWEN4_K_MOE_MM_MID_NT8,
+    QWEN4_K_MOE_MM_MID_NT8_K32,
+    QWEN4_K_MOE_MM_DOWN_NT8_K32,
     QWEN4_K_MOE_MM_MID_NAX,
     QWEN4_K_MOE_MM_DOWN_NAX,
     QWEN4_K_MOE_MM_MID_NAX64,
@@ -48345,6 +48349,8 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mm_down_nt2",
     "kernel_qwen4_moe_mm_down_nt8",
     "kernel_qwen4_moe_mm_mid_nt8",
+    "kernel_qwen4_moe_mm_mid_nt8_k32",
+    "kernel_qwen4_moe_mm_down_nt8_k32",
     "kernel_qwen4_moe_mm_mid_nax",
     "kernel_qwen4_moe_mm_down_nax",
     "kernel_qwen4_moe_mm_mid_nax64",
@@ -49921,6 +49927,9 @@ static uint32_t qwen4_moe_mm_nt(uint32_t n_tokens, uint32_t type, const char *en
      * 8/16/32-token kernels).  Measured on M5 Max, see
      * speed-bench/qwen38-m5-round4.md. */
     if ((type == 12u || type == 39u) && n_tokens >= 4096u && ds4_gpu_device_is_m5_apple_silicon()) default_nt = 8u;
+    /* M3 Ultra Q8_0: 64-token tiles in 32-wide K steps with remainder tiles,
+     * faster at every measured prefill size (300 to 32k tokens). */
+    if (type == 8u && ds4_gpu_device_name_contains("M3 Ultra")) default_nt = 8u;
     const uint32_t nt = (uint32_t)ds4_gpu_env_u64(env_name, default_nt, 1u, 8u);
     return nt == 1u || nt == 2u || nt == 4u || nt == 8u ? nt : default_nt;
 }
@@ -50012,8 +50021,14 @@ static bool qwen4_moe_mm_tails(uint32_t type, uint32_t nt) {
      * for Q4_K gate/up with MXFP4 down. */
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_TAILS");
     return nt > 1u && (override >= 0 ? override != 0 :
-        ((type == 16u || type == 10u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
+        ((type == 16u || type == 10u || type == 8u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
         ((type == 12u || type == 39u) && ds4_gpu_device_is_m5_apple_silicon()));
+}
+
+/* 64-token tiles in 32-wide K steps (DS4_QWEN4_MOE_MM_KS=64 restores 64). */
+static bool qwen4_moe_mm_k32(uint32_t type) {
+    const uint64_t ks = ds4_gpu_env_u64("DS4_QWEN4_MOE_MM_KS", 0u, 32u, 64u);
+    return ks ? ks == 32u : type == 8u && ds4_gpu_device_name_contains("M3 Ultra");
 }
 
 int ds4_gpu_qwen4_moe_mm_mid_tensor(
@@ -50027,7 +50042,8 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
     const uint32_t nt = qwen4_moe_mm_nt(n_tokens, weight_type, "DS4_QWEN4_MOE_MID_NT");
     const int kernel = nt == 1u ? QWEN4_K_MOE_MM_MID_NT1 :
                        nt == 2u ? QWEN4_K_MOE_MM_MID_NT2 :
-                       nt == 8u ? QWEN4_K_MOE_MM_MID_NT8 : QWEN4_K_MOE_MM_MID;
+                       nt == 8u ? (qwen4_moe_mm_k32(weight_type) ? QWEN4_K_MOE_MM_MID_NT8_K32 : QWEN4_K_MOE_MM_MID_NT8) :
+                       QWEN4_K_MOE_MM_MID;
     qwen4_moe_mm_args args = { n_tokens, n_slots, n_out, in_dim, ff_dim, weight_type, row_bytes, list_cap,
                                expert_bytes, n_expert, tiles, 0, qwen4_moe_mm_expert_major() };
     const bool tails = qwen4_moe_mm_tails(weight_type, nt);
@@ -50110,7 +50126,8 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     const uint32_t nt = qwen4_moe_mm_nt(n_tokens, weight_type, "DS4_QWEN4_MOE_DOWN_NT");
     const int kernel = nt == 1u ? QWEN4_K_MOE_MM_DOWN_NT1 :
                        nt == 2u ? QWEN4_K_MOE_MM_DOWN_NT2 :
-                       nt == 8u ? QWEN4_K_MOE_MM_DOWN_NT8 : QWEN4_K_MOE_MM_DOWN;
+                       nt == 8u ? (qwen4_moe_mm_k32(weight_type) ? QWEN4_K_MOE_MM_DOWN_NT8_K32 : QWEN4_K_MOE_MM_DOWN_NT8) :
+                       QWEN4_K_MOE_MM_DOWN;
     qwen4_moe_mm_args args = { n_tokens, n_slots, n_out, ff_dim, out_dim, weight_type, row_bytes, list_cap,
                                expert_bytes, n_expert, tiles, 0, qwen4_moe_mm_expert_major() };
     const bool tails = qwen4_moe_mm_tails(weight_type, nt);
