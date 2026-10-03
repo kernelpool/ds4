@@ -59165,10 +59165,12 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         if (ok && g->dump_prompt_rows) qwen4_graph_dump_last_ffn(g, il, T);
         if (ok) ok = qwen4_graph_apply_steering_ffn(g, il, T);
         QWEN4_PROF(5);
-        /* Submit this prefix while the host encodes the remaining layers.
+        /* Submit this prefix while the host encodes the remaining layers,
+         * then every two layers so the GPU never waits on the encoder.
          * Flush keeps the same ordered queue and retains pending buffers;
-         * end_commands below waits for both batches before inputs are reused. */
-        if (ok && il + 1u == flush_layer) ok = ds4_gpu_flush_commands() != 0;
+         * end_commands below waits for all batches before inputs are reused. */
+        if (ok && flush_layer && il + 1u >= flush_layer && (il + 1u - flush_layer) % 2u == 0 && il + 1u < n_trunk)
+            ok = ds4_gpu_flush_commands() != 0;
     }
     if (prof_on) {
         fprintf(stderr, "ds4: Qwen3.8 prefill stage ms/chunk (pos=%u T=%u ok=%d): "
