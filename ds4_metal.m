@@ -20267,6 +20267,45 @@ int ds4_gpu_matmul_q8_0_rows_scalar_tensor(
     return 1;
 }
 
+static uint32_t qwen4_expert_row_bytes(uint32_t weight_type, uint32_t in_dim);
+
+/* The delta net's alpha/beta row dots, taken by the qkv projection's leading
+ * threadgroups (kernel_qwen4_gdn_ab_dots): bound after the projection's buffers. */
+typedef struct {
+    struct { uint32_t n_v_head, in_dim, row_bytes, weight_type, n_groups, pad0, pad1, pad2; } args;
+    id<MTLBuffer> buf[4];
+    NSUInteger off[4];
+} ds4_gpu_gdn_ab;
+
+static bool ds4_gpu_gdn_ab_init(ds4_gpu_gdn_ab *ab, ds4_gpu_tensor *ga, ds4_gpu_tensor *gb, const void *model_map,
+                                uint64_t model_size, uint64_t alpha_offset, uint64_t beta_offset, uint32_t weight_type,
+                                uint32_t n_v_head, uint64_t in_dim, uint32_t n_tok) {
+    const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, (uint32_t)in_dim);
+    const uint64_t g_bytes = (uint64_t)n_tok * n_v_head * sizeof(float);
+    uint64_t inner[2] = { 0, 0 };
+    if (!row_bytes || !n_v_head || !ga || !gb || ds4_gpu_tensor_bytes(ga) < g_bytes || ds4_gpu_tensor_bytes(gb) < g_bytes)
+        return false;
+    ab->args = (__typeof__(ab->args)){ n_v_head, (uint32_t)in_dim, row_bytes, weight_type, 0, 0, 0, 0 };
+    ab->buf[0] = ds4_gpu_wrap_model_range(model_map, model_size, alpha_offset, (uint64_t)n_v_head * row_bytes, &inner[0]);
+    ab->buf[1] = ds4_gpu_wrap_model_range(model_map, model_size, beta_offset, (uint64_t)n_v_head * row_bytes, &inner[1]);
+    ab->buf[2] = ds4_gpu_tensor_buffer(ga);
+    ab->buf[3] = ds4_gpu_tensor_buffer(gb);
+    ab->off[0] = (NSUInteger)inner[0];
+    ab->off[1] = (NSUInteger)inner[1];
+    ab->off[2] = ds4_gpu_tensor_offset(ga);
+    ab->off[3] = ds4_gpu_tensor_offset(gb);
+    return ab->buf[0] && ab->buf[1] && ab->buf[2] && ab->buf[3];
+}
+
+/* binds the row dots of n_tok rows for nsg-simdgroup threadgroups; returns their threadgroup count */
+static uint32_t ds4_gpu_gdn_ab_bind(id<MTLComputeCommandEncoder> enc, ds4_gpu_gdn_ab *ab, NSUInteger index,
+                                    uint32_t n_tok, uint32_t nsg) {
+    ab->args.n_groups = (2u * ab->args.n_v_head * n_tok + nsg - 1u) / nsg;
+    [enc setBytes:&ab->args length:sizeof(ab->args) atIndex:index];
+    for (NSUInteger i = 0; i < 4; i++) [enc setBuffer:ab->buf[i] offset:ab->off[i] atIndex:index + 1 + i];
+    return ab->args.n_groups;
+}
+
 static int ds4_gpu_matmul_q8_0_pair_impl(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,
@@ -20279,9 +20318,9 @@ static int ds4_gpu_matmul_q8_0_pair_impl(
         uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok, bool concat,
-        ds4_gpu_tensor       *conv_state, uint64_t conv_offset, uint32_t conv_k) {
+        ds4_gpu_tensor       *conv_state, uint64_t conv_offset, uint32_t conv_k, ds4_gpu_gdn_ab *ab) {
     if (concat && (!in_dim || ((out0_dim | out1_dim) & 1u))) return 0;
-    if (conv_state && (!concat || conv_k < 2u || ds4_gpu_tensor_bytes(conv_state) < (uint64_t)(conv_k - 1u) * out0_dim * 4u))
+    if (conv_state && (!concat || !ab || conv_k < 2u || ds4_gpu_tensor_bytes(conv_state) < (uint64_t)(conv_k - 1u) * out0_dim * 4u))
         return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out0 || !out1 || !model_map || !x || n_tok != 1 ||
@@ -20358,14 +20397,16 @@ static int ds4_gpu_matmul_q8_0_pair_impl(
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:4];
         [enc setBuffer:out0buf offset:ds4_gpu_tensor_offset(out0) atIndex:5];
         [enc setBuffer:out1buf offset:ds4_gpu_tensor_offset(out1) atIndex:6];
+        NSUInteger ab_groups = 0;
         if (conv_state) {
             [enc setBuffer:ds4_gpu_tensor_buffer(conv_state) offset:ds4_gpu_tensor_offset(conv_state) atIndex:7];
             [enc setBuffer:convbuf offset:(NSUInteger)conv_inner atIndex:8];
             [enc setBytes:&conv_k length:sizeof(conv_k) atIndex:9];
+            ab_groups = ds4_gpu_gdn_ab_bind(enc, ab, 10, 1, (uint32_t)dispatch0.nsg);
         }
         [enc setThreadgroupMemoryLength:2u * dispatch0.smem atIndex:0];
         const uint64_t max_out_dim = concat ? out0_dim + out1_dim : (out0_dim > out1_dim ? out0_dim : out1_dim);
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)max_out_dim +
+        [enc dispatchThreadgroups:MTLSizeMake(ab_groups + ((NSUInteger)max_out_dim +
                                                (NSUInteger)dispatch0.nr0 - 1u) /
                                               (NSUInteger)dispatch0.nr0,
                                               1,
@@ -20391,7 +20432,7 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
-    return ds4_gpu_matmul_q8_0_pair_impl(out0, out1, model_map, model_size, weight0_offset, weight1_offset, in_dim, out0_dim, out1_dim, x, n_tok, false, NULL, 0, 0);
+    return ds4_gpu_matmul_q8_0_pair_impl(out0, out1, model_map, model_size, weight0_offset, weight1_offset, in_dim, out0_dim, out1_dim, x, n_tok, false, NULL, 0, 0, NULL);
 }
 
 int ds4_gpu_qwen4_q8_pair_tensor(
@@ -20406,19 +20447,24 @@ int ds4_gpu_qwen4_q8_pair_tensor(
         uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
-    return ds4_gpu_matmul_q8_0_pair_impl(out0, out1, model_map, model_size, weight0_offset, weight1_offset, in_dim, out0_dim, out1_dim, x, n_tok, true, NULL, 0, 0);
+    return ds4_gpu_matmul_q8_0_pair_impl(out0, out1, model_map, model_size, weight0_offset, weight1_offset, in_dim, out0_dim, out1_dim, x, n_tok, true, NULL, 0, 0, NULL);
 }
 
 /* ds4_gpu_qwen4_q8_pair_tensor with kernel_qwen4_gdn_front's conv applied to
  * out0's channels (history conv_state [K-1][out0_dim], weights [out0_dim][K]
- * at conv_offset): out0 holds silu(conv) and the history advances */
+ * at conv_offset): out0 holds silu(conv) and the history advances; ga / gb
+ * receive the alpha / beta row dots */
 int ds4_gpu_qwen4_q8_pair_conv_tensor(
-        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1, ds4_gpu_tensor *conv_state,
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1, ds4_gpu_tensor *conv_state, ds4_gpu_tensor *ga, ds4_gpu_tensor *gb,
         const void *model_map, uint64_t model_size, uint64_t weight0_offset, uint64_t weight1_offset,
-        uint64_t conv_offset, uint32_t conv_k, uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
-        const ds4_gpu_tensor *x) {
+        uint64_t conv_offset, uint64_t alpha_offset, uint64_t beta_offset, uint32_t ab_type, uint32_t n_v_head,
+        uint32_t conv_k, uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim, const ds4_gpu_tensor *x) {
+    ds4_gpu_gdn_ab ab;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_gpu_gdn_ab_init(&ab, ga, gb, model_map, model_size, alpha_offset, beta_offset, ab_type, n_v_head, in_dim, 1))
+        return 0;
     return ds4_gpu_matmul_q8_0_pair_impl(out0, out1, model_map, model_size, weight0_offset, weight1_offset, in_dim,
-                                         out0_dim, out1_dim, x, 1, true, conv_state, conv_offset, conv_k);
+                                         out0_dim, out1_dim, x, 1, true, conv_state, conv_offset, conv_k, &ab);
 }
 
 int ds4_gpu_matmul_q8_0_f16_out_tensor(
@@ -50542,34 +50588,128 @@ int ds4_gpu_qwen4_gdn_front_rows_tensor(
                                    0, res, qwen4_gdn_rows_resident(res, rows, n_rows));
 }
 
-/* one token's gdn_front (after the conv) + gdn_scan + gdn_out: kernel_qwen4_gdn_fused */
+/* gdn_front (after the conv and the alpha/beta row dots ga / gb, [T][Hv]) +
+ * gdn_scan + gdn_out for up to 16 tokens with gdn_scan's state snapshots:
+ * kernel_qwen4_gdn_fused */
 int ds4_gpu_qwen4_gdn_fused_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *z,
-        const ds4_gpu_tensor *mixed, const void *model_map, uint64_t model_size,
-        uint64_t alpha_offset, uint64_t beta_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
-        uint64_t norm_offset, uint32_t weight_type, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
-        uint32_t in_dim, float eps) {
-    const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, in_dim);
-    struct { uint32_t n_k_head, n_v_head, head_dim, weight_type, in_dim, row_bytes; float eps; uint32_t pad0; } args =
-        { n_k_head, n_v_head, head_dim, weight_type, in_dim, row_bytes, eps, 0 };
+        const ds4_gpu_tensor *ga, const ds4_gpu_tensor *gb, const void *model_map, uint64_t model_size,
+        uint64_t ssm_a_offset, uint64_t dt_bias_offset, uint64_t norm_offset, uint32_t n_tokens, uint32_t n_k_head,
+        uint32_t n_v_head, uint32_t head_dim, float eps, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
+        ds4_gpu_tensor *snap2_state, uint32_t snap2_tok) {
+    struct { uint32_t n_k_head, n_v_head, head_dim; float eps; uint32_t n_tokens, snap_tok, snap2_tok, snap_rows; } args =
+        { n_k_head, n_v_head, head_dim, eps, n_tokens, snap_state ? snap_tok : UINT32_MAX,
+          snap2_state ? snap2_tok : UINT32_MAX, snap_state ? g_qwen4_snap_rows : 0u };
     const uint64_t conv_dim = 2ull * n_k_head * head_dim + (uint64_t)n_v_head * head_dim;
     const uint64_t v_dim = (uint64_t)n_v_head * head_dim;
-    qwen4_bind b[10];
-    if (head_dim != 128 || n_k_head == 0 || n_v_head % n_k_head != 0 || row_bytes == 0 ||
-        !qwen4_bind_tensor(&b[0], qkv, conv_dim * sizeof(float), "gdn fused qkv") ||
-        !qwen4_bind_tensor(&b[1], mixed, (uint64_t)in_dim * sizeof(float), "gdn fused input") ||
-        !qwen4_bind_weight(&b[2], model_map, model_size, alpha_offset, (uint64_t)n_v_head * row_bytes, "gdn fused alpha") ||
-        !qwen4_bind_weight(&b[3], model_map, model_size, beta_offset, (uint64_t)n_v_head * row_bytes, "gdn fused beta") ||
-        !qwen4_bind_weight(&b[4], model_map, model_size, ssm_a_offset, n_v_head * sizeof(float), "gdn fused ssm_a") ||
-        !qwen4_bind_weight(&b[5], model_map, model_size, dt_bias_offset, n_v_head * sizeof(float), "gdn fused dt_bias") ||
-        !qwen4_bind_tensor(&b[6], state, v_dim * head_dim * sizeof(float), "gdn fused state") ||
-        !qwen4_bind_tensor(&b[7], z, v_dim * sizeof(float), "gdn fused gate") ||
-        !qwen4_bind_weight(&b[8], model_map, model_size, norm_offset, head_dim * sizeof(float), "gdn fused norm") ||
-        !qwen4_bind_tensor(&b[9], out, v_dim * sizeof(float), "gdn fused out")) {
+    const uint64_t state_bytes = v_dim * head_dim * sizeof(float);
+    qwen4_bind b[11];
+    if (n_tokens == 0 || n_tokens > 16u || head_dim != 128 || n_k_head == 0 || n_v_head % n_k_head != 0 ||
+        !qwen4_bind_tensor(&b[0], qkv, (uint64_t)n_tokens * conv_dim * sizeof(float), "gdn fused qkv") ||
+        !qwen4_bind_tensor(&b[1], ga, (uint64_t)n_tokens * n_v_head * sizeof(float), "gdn fused alpha") ||
+        !qwen4_bind_tensor(&b[2], gb, (uint64_t)n_tokens * n_v_head * sizeof(float), "gdn fused beta") ||
+        !qwen4_bind_weight(&b[3], model_map, model_size, ssm_a_offset, n_v_head * sizeof(float), "gdn fused ssm_a") ||
+        !qwen4_bind_weight(&b[4], model_map, model_size, dt_bias_offset, n_v_head * sizeof(float), "gdn fused dt_bias") ||
+        !qwen4_bind_tensor(&b[5], state, state_bytes, "gdn fused state") ||
+        !qwen4_bind_tensor(&b[6], z, (uint64_t)n_tokens * v_dim * sizeof(float), "gdn fused gate") ||
+        !qwen4_bind_weight(&b[7], model_map, model_size, norm_offset, head_dim * sizeof(float), "gdn fused norm") ||
+        !qwen4_bind_tensor(&b[8], out, (uint64_t)n_tokens * v_dim * sizeof(float), "gdn fused out")) {
         return 0;
     }
-    return qwen4_dispatch(QWEN4_K_GDN_FUSED, &args, sizeof(args), b, 10, MTLSizeMake(n_v_head, 1, 1),
+    if (snap_state) {
+        if (!qwen4_bind_tensor(&b[9], snap_state, args.snap_rows * state_bytes, "gdn fused snapshot")) return 0;
+    } else {
+        b[9] = b[5];
+    }
+    if (snap2_state) {
+        if (!qwen4_bind_tensor(&b[10], snap2_state, state_bytes, "gdn fused snapshot 2")) return 0;
+    } else {
+        b[10] = b[5];
+    }
+    return qwen4_dispatch(QWEN4_K_GDN_FUSED, &args, sizeof(args), b, 11, MTLSizeMake(n_v_head, 1, 1),
                           MTLSizeMake(1024, 1, 1), 0);
+}
+
+/* ds4_gpu_qwen4_matmul_q8_0_tensor's verify rows (four a pass) with gdn_front's
+ * conv on the output channels: qkv holds silu(conv) per token, the history
+ * conv_state advances, and gdn_front's history snapshots are taken; ga / gb
+ * receive the alpha / beta row dots */
+int ds4_gpu_qwen4_q8_rows_conv_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *conv_state, ds4_gpu_tensor *ga, ds4_gpu_tensor *gb,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t conv_offset,
+        uint64_t alpha_offset, uint64_t beta_offset, uint32_t ab_type, uint32_t n_v_head, uint32_t conv_k,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok, ds4_gpu_tensor *snap_state,
+        uint32_t snap_tok, ds4_gpu_tensor *snap2_state, uint32_t snap2_tok) {
+    static const char *names[5] = { NULL, "kernel_qwen4_q8_rows_conv1", "kernel_qwen4_q8_rows_conv2",
+                                    "kernel_qwen4_q8_rows_conv3", "kernel_qwen4_q8_rows_conv4" };
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint64_t hist_bytes = (uint64_t)(conv_k - 1u) * out_dim * sizeof(float);
+    struct { uint32_t conv_k, tok0, snap_tok, snap2_tok, snap_rows, pad0, pad1, pad2; } cargs =
+        { conv_k, 0, snap_state ? snap_tok : UINT32_MAX, snap2_state ? snap2_tok : UINT32_MAX,
+          snap_state ? g_qwen4_snap_rows : 0u, 0, 0, 0 };
+    if (!out || !x || !conv_state || !model_map || n_tok == 0 || conv_k < 2u || conv_k > 4u ||
+        (in_dim & 31u) != 0 || in_dim > UINT32_MAX || out_dim == 0 || out_dim > UINT32_MAX ||
+        ds4_gpu_tensor_bytes(x) < (uint64_t)n_tok * in_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < (uint64_t)n_tok * out_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(conv_state) < hist_bytes ||
+        (snap_state && ds4_gpu_tensor_bytes(snap_state) < (uint64_t)cargs.snap_rows * hist_bytes) ||
+        (snap2_state && ds4_gpu_tensor_bytes(snap2_state) < hist_bytes)) {
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        id<MTLBuffer> hbuf = ds4_gpu_tensor_buffer(conv_state);
+        const uint64_t row_bytes = (in_dim / 32u) * 34u;
+        const uint64_t weight_bytes = out_dim * row_bytes;
+        if (!xbuf || !outbuf || !hbuf || weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+        uint64_t inner_offset = 0, conv_inner = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+        id<MTLBuffer> cbuf = ds4_gpu_wrap_model_range(model_map, model_size, conv_offset,
+                                                      out_dim * conv_k * sizeof(float), &conv_inner);
+        ds4_gpu_gdn_ab ab;
+        if (!wbuf || !cbuf ||
+            !ds4_gpu_gdn_ab_init(&ab, ga, gb, model_map, model_size, alpha_offset, beta_offset, ab_type, n_v_head,
+                                 in_dim, n_tok)) {
+            return 0;
+        }
+        /* the single-row dispatch: same simdgroups, so the same K walk */
+        ds4_gpu_mv_dispatch dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        if (out_dim > 65536u) dispatch.nsg = 8;
+        ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+        args.nr0 = dispatch.nr0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        for (uint32_t t = 0; t < n_tok;) {
+            const uint32_t n = n_tok - t < 4u ? n_tok - t : 4u;
+            id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(names[n], dispatch.nsg);
+            if (!pipeline) return 0;
+            cargs.tok0 = t;
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) + (NSUInteger)((uint64_t)t * in_dim * sizeof(float)) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) + (NSUInteger)((uint64_t)t * out_dim * sizeof(float))
+                   atIndex:3];
+            [enc setThreadgroupMemoryLength:dispatch.smem * n atIndex:0];
+            [enc setBytes:&cargs length:sizeof(cargs) atIndex:4];
+            [enc setBuffer:hbuf offset:ds4_gpu_tensor_offset(conv_state) atIndex:5];
+            [enc setBuffer:cbuf offset:(NSUInteger)conv_inner atIndex:6];
+            [enc setBuffer:snap_state ? ds4_gpu_tensor_buffer(snap_state) : hbuf
+                    offset:snap_state ? ds4_gpu_tensor_offset(snap_state) : ds4_gpu_tensor_offset(conv_state) atIndex:7];
+            [enc setBuffer:snap2_state ? ds4_gpu_tensor_buffer(snap2_state) : hbuf
+                    offset:snap2_state ? ds4_gpu_tensor_offset(snap2_state) : ds4_gpu_tensor_offset(conv_state) atIndex:8];
+            const NSUInteger ab_groups = ds4_gpu_gdn_ab_bind(enc, &ab, 9, n, (uint32_t)dispatch.nsg);
+            [enc dispatchThreadgroups:MTLSizeMake(ab_groups + ((NSUInteger)out_dim + (NSUInteger)dispatch.nr0 - 1u) /
+                                                  (NSUInteger)dispatch.nr0, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            t += n;
+        }
+        return ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 rows matvec with conv");
+    }
 }
 
 int ds4_gpu_qwen4_gdn_front_tensor(

@@ -1200,81 +1200,97 @@ struct ds4_metal_args_qwen4_gdn_fused {
     uint32_t n_k_head;
     uint32_t n_v_head;
     uint32_t head_dim;
-    uint32_t weight_type;
-    uint32_t in_dim;
-    uint32_t row_bytes;
     float    eps;
-    uint32_t pad0;
+    uint32_t n_tokens;     /* <= 16 */
+    uint32_t snap_tok;     /* gdn_scan's state snapshots */
+    uint32_t snap2_tok;
+    uint32_t snap_rows;
 };
 
-/* One token's gated delta net after the conv (done in the qkv projection):
- * one threadgroup of 32 simdgroups per value head h.  Simdgroups 0/1 normalize
- * q/k of k-head h % Hk into threadgroup memory as kernel_qwen4_gdn_front does
- * in place, 2/3 take h's alpha/beta rows; simdgroup s then scans state rows
- * 4s .. 4s + 3 as kernel_qwen4_gdn_scan_r4, and simdgroup 0 applies
+/* T tokens of the gated delta net after the conv and the alpha/beta row dots
+ * (done in the qkv projection): one threadgroup of 32 simdgroups per value head
+ * h.  Simdgroups take each token's q/k normalization (k-head h % Hk, into
+ * threadgroup memory as kernel_qwen4_gdn_front does in place) and gates; simdgroup s
+ * then scans state rows 4s .. 4s + 3 through the tokens in order as
+ * kernel_qwen4_gdn_scan_r4 (with its snapshots), and a simdgroup a token applies
  * kernel_qwen4_gdn_out's norm and gate: their values in one dispatch. */
 kernel void kernel_qwen4_gdn_fused(
         constant ds4_metal_args_qwen4_gdn_fused & args,
-        device const float *qkv,      /* [C] conv'd */
-        device const float *mixed,    /* [in_dim] */
-        device const char  *w_alpha,  /* [Hv] rows */
-        device const char  *w_beta,   /* [Hv] rows */
+        device const float *qkv,      /* [T][C] conv'd */
+        device const float *ga,       /* [T][Hv] alpha row dots */
+        device const float *gb,       /* [T][Hv] beta row dots */
         device const float *ssm_a,    /* [Hv] */
         device const float *dt_bias,  /* [Hv] */
         device float       *state,    /* [Hv][D][D] */
-        device const float *z,        /* [Hv*D] */
+        device const float *z,        /* [T][Hv*D] */
         device const float *weight,   /* [D] */
-        device float       *out,      /* [Hv*D] */
+        device float       *out,      /* [T][Hv*D] */
+        device float       *snap_state,
+        device float       *snap2_state,
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]]) {
-    const uint h = tgpig.x;
-    const uint Hk = args.n_k_head, D = 128, npt = D / 32;
+    const uint h = tgpig.x, T = args.n_tokens;
+    const uint Hk = args.n_k_head, Hv = args.n_v_head, D = 128;
+    const uint npt = args.head_dim / 32;   /* the reference kernels' runtime loop counts */
+    const uint C = 2 * Hk * D + Hv * D;
     const uint kh = h % Hk;
-    threadgroup float qs[128], ks[128], ys[128];
-    threadgroup float gates[2];
-    if (sgitg < 2) {
-        device const float *v = qkv + (sgitg == 0 ? kh * D : Hk * D + kh * D);
-        threadgroup float *dst = sgitg == 0 ? qs : ks;
-        float ss = 0.0f;
-        for (uint r = 0; r < npt; r++) ss += v[tiisg + 32 * r] * v[tiisg + 32 * r];
-        ss = simd_sum(ss);
-        const float sc = rsqrt(ss + 1e-6f) * (sgitg == 0 ? rsqrt((float)D) : 1.0f);
-        for (uint r = 0; r < npt; r++) dst[tiisg + 32 * r] = v[tiisg + 32 * r] * sc;
-    } else if (sgitg < 4) {
-        device const char *wrow = sgitg == 3 ? w_beta : w_alpha;
-        const float v = qwen4_row_dot(wrow + (uint64_t)h * args.row_bytes, mixed, args.weight_type, args.in_dim, tiisg);
-        if (tiisg == 0) gates[sgitg - 2] = sgitg == 3 ? qwen4_sigmoid(v) : exp(ssm_a[h] * qwen4_softplus(v + dt_bias[h]));
+    threadgroup float qs[16][128], ks[16][128], ys[16][128];
+    threadgroup float gates[16][2];
+    for (uint task = sgitg; task < 4 * T; task += 32) {
+        const uint t = task / 4, kind = task % 4;
+        if (kind < 2) {
+#pragma clang fp reassociate(off)
+            device const float *v = qkv + (uint64_t)t * C + (kind == 0 ? kh * D : Hk * D + kh * D);
+            threadgroup float *dst = kind == 0 ? qs[t] : ks[t];
+            float ss = 0.0f;
+            for (uint r = 0; r < npt; r++) ss += v[tiisg + 32 * r] * v[tiisg + 32 * r];
+            ss = simd_sum(ss);
+            const float sc = rsqrt(ss + 1e-6f) * (kind == 0 ? rsqrt((float)args.head_dim) : 1.0f);
+            for (uint r = 0; r < npt; r++) dst[tiisg + 32 * r] = v[tiisg + 32 * r] * sc;
+        } else if (tiisg == 0) {
+            const float v = (kind == 3 ? gb : ga)[t * Hv + h];
+            gates[t][kind - 2] = kind == 3 ? qwen4_sigmoid(v) : exp(ssm_a[h] * qwen4_softplus(v + dt_bias[h]));
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint dv0 = sgitg * 4, dk0 = tiisg * 4;
     float4 s[4];
     device float *srow = state + ((uint64_t)h * D + dv0) * D + dk0;
+    device float *snaprow = snap_state + ((uint64_t)h * D + dv0) * D + dk0;
+    device float *snap2row = snap2_state + ((uint64_t)h * D + dv0) * D + dk0;
     for (uint r = 0; r < 4; r++) s[r] = *(device const float4 *)(srow + r * D);
-    {
-        const float4 q = *(threadgroup const float4 *)(qs + dk0);
-        const float4 k = *(threadgroup const float4 *)(ks + dk0);
-        const float4 v = *(device const float4 *)(qkv + 2 * Hk * D + h * D + dv0);
-        const float g = gates[0];
-        const float beta = gates[1];
+    for (uint t = 0; t < T; t++) {
+        const float4 q = *(threadgroup const float4 *)(qs[t] + dk0);
+        const float4 k = *(threadgroup const float4 *)(ks[t] + dk0);
+        const float4 v = *(device const float4 *)(qkv + (uint64_t)t * C + 2 * Hk * D + h * D + dv0);
+        const float g = gates[t][0];
+        const float beta = gates[t][1];
         float u[4], o[4];
         for (uint r = 0; r < 4; r++) { s[r] *= g; u[r] = dot(s[r], k); }
         for (uint r = 0; r < 4; r++) u[r] = simd_sum(u[r]);
         for (uint r = 0; r < 4; r++) { s[r] += k * ((v[r] - u[r]) * beta); o[r] = dot(s[r], q); }
         for (uint r = 0; r < 4; r++) o[r] = simd_sum(o[r]);
-        if (tiisg == 0) *(threadgroup float4 *)(ys + dv0) = float4(o[0], o[1], o[2], o[3]);
+        if (tiisg == 0) *(threadgroup float4 *)(ys[t] + dv0) = float4(o[0], o[1], o[2], o[3]);
+        if (t - args.snap_tok < args.snap_rows) {
+            device float *slot = snaprow + (uint64_t)(t - args.snap_tok) * Hv * D * D;
+            for (uint r = 0; r < 4; r++) *(device float4 *)(slot + r * D) = s[r];
+        }
+        if (t == args.snap2_tok) {
+            for (uint r = 0; r < 4; r++) *(device float4 *)(snap2row + r * D) = s[r];
+        }
     }
     for (uint r = 0; r < 4; r++) *(device float4 *)(srow + r * D) = s[r];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sgitg == 0) {
+    for (uint t = sgitg; t < T; t += 32) {
+#pragma clang fp reassociate(off)
         const uint base = tiisg * npt;
         float ss = 0.0f;
-        for (uint i = 0; i < npt; i++) ss += ys[base + i] * ys[base + i];
+        for (uint i = 0; i < npt; i++) ss += ys[t][base + i] * ys[t][base + i];
         ss = simd_sum(ss);
-        const float r = rsqrt(ss / (float)D + args.eps);
-        for (uint i = 0; i < npt; i++) {
-            out[(uint64_t)h * D + base + i] = ys[base + i] * r * weight[base + i] * qwen4_sigmoid(z[(uint64_t)h * D + base + i]);
-        }
+        const float r = rsqrt(ss / (float)args.head_dim + args.eps);
+        const uint64_t at = ((uint64_t)t * Hv + h) * D + base;
+        for (uint i = 0; i < npt; i++) out[at + i] = ys[t][base + i] * r * weight[base + i] * qwen4_sigmoid(z[at + i]);
     }
 }
 
@@ -5680,9 +5696,35 @@ kernel void kernel_qwen4_q8_concat(
     else { group.x -= first; kernel_mul_mv_q8_0_f32_impl<2, constant ds4_metal_args_mul_mv &>(b, wb, x, ob, shared, group, lane, sg); }
 }
 
+struct ds4_metal_args_qwen4_gdn_ab {
+    uint32_t n_v_head;
+    uint32_t in_dim;
+    uint32_t row_bytes;
+    uint32_t weight_type;
+    uint32_t n_groups;     /* leading threadgroups that take the row dots */
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+/* The delta net's alpha and beta row dots for n_tok rows of x, one simdgroup
+ * each (task = (token * 2 + beta) * Hv + head), stored raw at [tok0 + token][Hv]:
+ * kernel_qwen4_gdn_fused takes them from there. */
+static inline void qwen4_gdn_ab_dots(constant ds4_metal_args_qwen4_gdn_ab &ab, device const char *w_alpha,
+                                     device const char *w_beta, device const char *x, uint64_t x_stride, uint n_tok,
+                                     uint tok0, device float *ga, device float *gb, uint task, ushort lane) {
+    const uint Hv = ab.n_v_head;
+    if (task >= 2 * Hv * n_tok) return;
+    const uint j = task / (2 * Hv), beta = task / Hv % 2, h = task % Hv;
+    const float v = qwen4_row_dot((beta ? w_beta : w_alpha) + (uint64_t)h * ab.row_bytes,
+                                  (device const float *)(x + j * x_stride), ab.weight_type, ab.in_dim, lane);
+    if (lane == 0) (beta ? gb : ga)[(tok0 + j) * Hv + h] = v;
+}
+
 /* kernel_qwen4_q8_concat with kernel_qwen4_gdn_front's causal conv on the first
  * matrix's rows (the qkv channels): the thread that writes channel c then
- * convolves it with c's history, advances the history and stores silu(conv). */
+ * convolves it with c's history, advances the history and stores silu(conv).
+ * The leading threadgroups take the alpha/beta row dots. */
 kernel void kernel_qwen4_q8_concat_conv(
     constant ds4_metal_args_mul_mv &a, constant ds4_metal_args_mul_mv &b,
     device const char *wa, device const char *wb, device const char *x,
@@ -5690,8 +5732,16 @@ kernel void kernel_qwen4_q8_concat_conv(
     device float *state,              /* [K-1][C] */
     device const float *conv_w,       /* [C][K] */
     constant uint &K,
+    constant ds4_metal_args_qwen4_gdn_ab &ab,
+    device const char *w_alpha, device const char *w_beta,
+    device float *ga, device float *gb,
     uint3 group [[threadgroup_position_in_grid]],
     ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    if (group.x < ab.n_groups) {
+        qwen4_gdn_ab_dots(ab, w_alpha, w_beta, x, 0, 1, 0, ga, gb, group.x * FC_mul_mv_nsg + sg, lane);
+        return;
+    }
+    group.x -= ab.n_groups;
     const uint first = (a.ne01 + 1) / 2;
     if (group.x >= first) {
         group.x -= first;
@@ -5713,3 +5763,118 @@ kernel void kernel_qwen4_q8_concat_conv(
         row[c] = qwen4_silu(acc);
     }
 }
+
+struct ds4_metal_args_qwen4_rows_conv {
+    uint32_t conv_k;
+    uint32_t tok0;         /* the forward's index of this call's first row */
+    uint32_t snap_tok;     /* gdn_front's history snapshots */
+    uint32_t snap2_tok;
+    uint32_t snap_rows;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+/* kernel_mul_mv_q8_0_f32_rows with kernel_qwen4_gdn_front's conv on its rows (the
+ * qkv channels): the thread that writes channel c convolves its NR1 tokens in
+ * order, advancing the history and taking gdn_front's history snapshots.  The
+ * leading threadgroups take the rows' alpha/beta row dots. */
+template<short NR1>
+kernel void kernel_qwen4_q8_rows_conv(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        constant ds4_metal_args_qwen4_rows_conv & cargs,
+        device float *state,              /* [K-1][C] */
+        device const float *conv_w,       /* [C][K] */
+        device float *snap_state,
+        device float *snap2_state,
+        constant ds4_metal_args_qwen4_gdn_ab & ab,
+        device const char *w_alpha,
+        device const char *w_beta,
+        device float *ga,
+        device float *gb,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    if (tgpig.x < ab.n_groups) {
+        qwen4_gdn_ab_dots(ab, w_alpha, w_beta, src1, args.nb11, NR1, cargs.tok0, ga, gb, tgpig.x * NSG + sgitg, tiisg);
+        return;
+    }
+    tgpig.x -= ab.n_groups;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+    constexpr short NR0 = N_R0_Q8_0;
+    const int nb = args.ne00/QK8_0;
+    const int r0 = tgpig.x*NR0;
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *) (src0 + (uint64_t)(r0 + row)*args.nb01);
+    }
+    float sumf[NR1][NR0];
+    FOR_UNROLL (short j = 0; j < NR1; ++j) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[j][row] = 0.f;
+    }
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+    const int ib0 = sgitg*NQ + ix;
+    float yl[NR1][NQ];
+    device const float * yb[NR1];
+    FOR_UNROLL (short j = 0; j < NR1; ++j) {
+        yb[j] = (device const float *) (src1 + (uint64_t)j*args.nb11) + ib0*QK8_0 + il*NQ;
+    }
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        FOR_UNROLL (short j = 0; j < NR1; ++j) {
+            for (short i = 0; i < NQ; ++i) {
+                yl[j][i] = yb[j][i];
+            }
+        }
+        for (short row = 0; row < NR0; row++) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+            FOR_UNROLL (short j = 0; j < NR1; ++j) {
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    sumq += qs[i] * yl[j][i];
+                }
+                sumf[j][row] += sumq*ax[row][ib].d;
+            }
+        }
+        FOR_UNROLL (short j = 0; j < NR1; ++j) yb[j] += NSG*NQ*QK8_0;
+    }
+    FOR_UNROLL (short j = 0; j < NR1; ++j) {
+        helper_mv_reduce_and_write<NR0>((device float *) dst + (uint64_t)j*args.ne0, sumf[j], r0, args.ne01,
+                                        tiisg, sgitg, shmem + j*NR0*NW*sizeof(float));
+    }
+    if (tiisg != 0 || sgitg != 0) return;
+    const uint C = args.ne01, K = cargs.conv_k;
+    for (short row = 0; row < NR0; row++) {
+        const uint c = r0 + row;
+        if (c >= C) break;
+        for (short j = 0; j < NR1; j++) {
+            device float *out = (device float *) dst + (uint64_t)j*args.ne0;
+            const float raw = out[c];
+            float acc = conv_w[c * K + K - 1] * raw;
+            for (uint t = 0; t + 1 < K; t++) acc += conv_w[c * K + t] * state[t * C + c];
+            for (uint t = 0; t + 2 < K; t++) state[t * C + c] = state[(t + 1) * C + c];
+            state[(K - 2) * C + c] = raw;
+            out[c] = qwen4_silu(acc);
+            const uint tok = cargs.tok0 + (uint)j;
+            if (tok - cargs.snap_tok < cargs.snap_rows) {
+                device float *slot = snap_state + (uint64_t)(tok - cargs.snap_tok) * (K - 1) * C;
+                for (uint t = 0; t + 1 < K; t++) slot[t * C + c] = state[t * C + c];
+            }
+            if (tok == cargs.snap2_tok) {
+                for (uint t = 0; t + 1 < K; t++) snap2_state[t * C + c] = state[t * C + c];
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_qwen4_q8_rows_conv<1>) kernel_qwen4_q8_rows_conv_t;
+template [[host_name("kernel_qwen4_q8_rows_conv1")]] kernel kernel_qwen4_q8_rows_conv_t kernel_qwen4_q8_rows_conv<1>;
+template [[host_name("kernel_qwen4_q8_rows_conv2")]] kernel kernel_qwen4_q8_rows_conv_t kernel_qwen4_q8_rows_conv<2>;
+template [[host_name("kernel_qwen4_q8_rows_conv3")]] kernel kernel_qwen4_q8_rows_conv_t kernel_qwen4_q8_rows_conv<3>;
+template [[host_name("kernel_qwen4_q8_rows_conv4")]] kernel kernel_qwen4_q8_rows_conv_t kernel_qwen4_q8_rows_conv<4>;

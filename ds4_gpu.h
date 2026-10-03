@@ -3557,19 +3557,29 @@ int ds4_gpu_qwen4_gdn_front_rows_tensor(
         uint32_t weight_type, const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_gdn_row *rows,
         uint32_t n_rows, uint32_t n_batch_rows, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
         uint32_t conv_kernel, uint32_t in_dim);
-/* one token's gdn_front after the conv + gdn_scan + gdn_out in one dispatch, the same values */
+/* gdn_front after the conv and the alpha/beta row dots + gdn_scan + gdn_out for up to 16 tokens in one
+ * dispatch, the same values */
 int ds4_gpu_qwen4_gdn_fused_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *z,
-        const ds4_gpu_tensor *mixed, const void *model_map, uint64_t model_size,
-        uint64_t alpha_offset, uint64_t beta_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
-        uint64_t norm_offset, uint32_t weight_type, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
-        uint32_t in_dim, float eps);
-/* the paired qkv/z Q8 projection with gdn_front's conv applied to qkv's channels */
+        const ds4_gpu_tensor *ga, const ds4_gpu_tensor *gb, const void *model_map, uint64_t model_size,
+        uint64_t ssm_a_offset, uint64_t dt_bias_offset, uint64_t norm_offset, uint32_t n_tokens, uint32_t n_k_head,
+        uint32_t n_v_head, uint32_t head_dim, float eps, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
+        ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
+/* the Q8 verify rows of the qkv projection with gdn_front's conv (and history snapshots) on its channels
+ * and the alpha/beta row dots into ga / gb */
+int ds4_gpu_qwen4_q8_rows_conv_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *conv_state, ds4_gpu_tensor *ga, ds4_gpu_tensor *gb,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t conv_offset,
+        uint64_t alpha_offset, uint64_t beta_offset, uint32_t ab_type, uint32_t n_v_head, uint32_t conv_k,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok, ds4_gpu_tensor *snap_state,
+        uint32_t snap_tok, ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
+/* the paired qkv/z Q8 projection with gdn_front's conv applied to qkv's channels and the alpha/beta row
+ * dots into ga / gb */
 int ds4_gpu_qwen4_q8_pair_conv_tensor(
-        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1, ds4_gpu_tensor *conv_state,
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1, ds4_gpu_tensor *conv_state, ds4_gpu_tensor *ga, ds4_gpu_tensor *gb,
         const void *model_map, uint64_t model_size, uint64_t weight0_offset, uint64_t weight1_offset,
-        uint64_t conv_offset, uint32_t conv_k, uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
-        const ds4_gpu_tensor *x);
+        uint64_t conv_offset, uint64_t alpha_offset, uint64_t beta_offset, uint32_t ab_type, uint32_t n_v_head,
+        uint32_t conv_k, uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim, const ds4_gpu_tensor *x);
 int ds4_gpu_qwen4_gdn_front_tensor(
         ds4_gpu_tensor *qkv, ds4_gpu_tensor *state, const ds4_gpu_tensor *mixed,
         ds4_gpu_tensor *ga, ds4_gpu_tensor *gb,

@@ -58460,15 +58460,36 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
     if (T == 1u && !g->mtp_R && ds4_gpu_qwen4_decode_fusions_enabled() && !g->lk_snap_rows && !g->snap_after_first &&
         !g->snap_after_second && l->lin_qkv->type == DS4_TENSOR_Q8_0 && l->lin_gate->type == DS4_TENSOR_Q8_0 &&
         getenv("DS4_QWEN4_GDN_UNFUSED") == NULL) {
-        return ds4_gpu_qwen4_q8_pair_conv_tensor(g->qkv, g->z, g->layer_lin_hist[il], m->map, m->size,
+        return ds4_gpu_qwen4_q8_pair_conv_tensor(g->qkv, g->z, g->layer_lin_hist[il], g->ga, g->gb, m->map, m->size,
                                                  l->lin_qkv->abs_offset, l->lin_gate->abs_offset,
-                                                 l->lin_conv->abs_offset, DS4_N_LIN_CONV, DS4_N_EMBD,
-                                                 l->lin_qkv->dim[1], l->lin_gate->dim[1], g->mixed) != 0 &&
-               ds4_gpu_qwen4_gdn_fused_tensor(g->lin_o, g->layer_lin_state[il], g->qkv, g->z, g->mixed, m->map,
-                                              m->size, l->lin_alpha->abs_offset, l->lin_beta->abs_offset,
-                                              l->lin_a->abs_offset, l->lin_dt_bias->abs_offset,
-                                              l->lin_norm->abs_offset, l->lin_alpha->type, DS4_N_LIN_K_HEAD,
-                                              DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_N_EMBD, DS4_RMS_EPS) != 0 &&
+                                                 l->lin_conv->abs_offset, l->lin_alpha->abs_offset,
+                                                 l->lin_beta->abs_offset, l->lin_alpha->type, DS4_N_LIN_V_HEAD,
+                                                 DS4_N_LIN_CONV, DS4_N_EMBD, l->lin_qkv->dim[1], l->lin_gate->dim[1],
+                                                 g->mixed) != 0 &&
+               ds4_gpu_qwen4_gdn_fused_tensor(g->lin_o, g->layer_lin_state[il], g->qkv, g->z, g->ga, g->gb, m->map,
+                                              m->size, l->lin_a->abs_offset, l->lin_dt_bias->abs_offset,
+                                              l->lin_norm->abs_offset, 1, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
+                                              DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS, NULL, 0u, NULL, 0u) != 0 &&
+               qwen4_gemv(g->blk, m, l->lin_out, g->lin_o, T);
+    }
+    /* Verify rows likewise: the conv (and its history snapshots) in the qkv
+     * rows projection, the rest in one kernel walking the rows in order. */
+    if (T > 1u && T <= 16u && g->verify_rows_exact && ds4_gpu_qwen4_decode_fusions_enabled() &&
+        l->lin_qkv->type == DS4_TENSOR_Q8_0 && getenv("DS4_QWEN4_GDN_UNFUSED") == NULL) {
+        ds4_gpu_tensor *snap_hist = g->lk_snap_rows ? g->lk_snap_hist[il] : g->snap_after_first ? g->snap_lin_hist[il] : NULL;
+        ds4_gpu_tensor *snap_state = g->lk_snap_rows ? g->lk_snap_state[il] : g->snap_after_first ? g->snap_lin_state[il] : NULL;
+        return ds4_gpu_qwen4_q8_rows_conv_tensor(g->qkv, g->layer_lin_hist[il], g->ga, g->gb, m->map, m->size,
+                                                 l->lin_qkv->abs_offset, l->lin_conv->abs_offset,
+                                                 l->lin_alpha->abs_offset, l->lin_beta->abs_offset,
+                                                 l->lin_alpha->type, DS4_N_LIN_V_HEAD, DS4_N_LIN_CONV, DS4_N_EMBD,
+                                                 l->lin_qkv->dim[1], g->mixed, T, snap_hist, 0u,
+                                                 g->snap_after_second ? g->snap2_lin_hist[il] : NULL, 1u) != 0 &&
+               qwen4_gemv(g->z, m, l->lin_gate, g->mixed, T) &&
+               ds4_gpu_qwen4_gdn_fused_tensor(g->lin_o, g->layer_lin_state[il], g->qkv, g->z, g->ga, g->gb, m->map,
+                                              m->size, l->lin_a->abs_offset, l->lin_dt_bias->abs_offset,
+                                              l->lin_norm->abs_offset, T, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
+                                              DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS, snap_state, 0u,
+                                              g->snap_after_second ? g->snap2_lin_state[il] : NULL, 1u) != 0 &&
                qwen4_gemv(g->blk, m, l->lin_out, g->lin_o, T);
     }
     bool paired = false;

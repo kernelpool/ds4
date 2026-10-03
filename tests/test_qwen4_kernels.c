@@ -2075,7 +2075,7 @@ static void test_gdn_fused(arena_t *a) {
         st[i] = upload(state0, (uint64_t)Hv * D * D); hs[i] = upload(hist0, (uint64_t)(K - 1) * C);
         qkv[i] = upload(NULL, C); z[i] = upload(NULL, vd); out[i] = upload(NULL, vd);
     }
-    ds4_gpu_tensor *ga = upload(NULL, Hv), *gb = upload(NULL, Hv);
+    ds4_gpu_tensor *ga = upload(NULL, Hv), *gb = upload(NULL, Hv), *ga1 = upload(NULL, Hv), *gb1 = upload(NULL, Hv);
     for (uint32_t tok = 0; tok < 2; tok++) {
         float *x = rand_vec(E, 1.0f);
         ds4_gpu_tensor *gx = upload(x, E);
@@ -2085,10 +2085,10 @@ static void test_gdn_fused(arena_t *a) {
                    ds4_gpu_qwen4_gdn_scan_tensor(out[0], st[0], qkv[0], ga, gb, 1, Hk, Hv, D, NULL, 0u, NULL, 0u) &&
                    ds4_gpu_qwen4_gdn_out_tensor(out[0], z[0], a->base, a->size, norm_off, 1, Hv, D, 1e-6f),
                    "gdn three kernels");
-        require_ok(ds4_gpu_qwen4_q8_pair_conv_tensor(qkv[1], z[1], hs[1], a->base, a->size, qkv_off, z_off, conv_off, K,
-                                                     E, C, vd, gx) &&
-                   ds4_gpu_qwen4_gdn_fused_tensor(out[1], st[1], qkv[1], z[1], gx, a->base, a->size, alpha_off,
-                                                  beta_off, a_off, dt_off, norm_off, 8u, Hk, Hv, D, E, 1e-6f),
+        require_ok(ds4_gpu_qwen4_q8_pair_conv_tensor(qkv[1], z[1], hs[1], ga1, gb1, a->base, a->size, qkv_off, z_off,
+                                                     conv_off, alpha_off, beta_off, 8u, Hv, K, E, C, vd, gx) &&
+                   ds4_gpu_qwen4_gdn_fused_tensor(out[1], st[1], qkv[1], z[1], ga1, gb1, a->base, a->size, a_off,
+                                                  dt_off, norm_off, 1, Hk, Hv, D, 1e-6f, NULL, 0u, NULL, 0u),
                    "gdn fused");
         const uint64_t n[3] = {vd, (uint64_t)Hv * D * D, (uint64_t)(K - 1) * C};
         ds4_gpu_tensor **t[3] = {out, st, hs};
@@ -2105,7 +2105,76 @@ static void test_gdn_fused(arena_t *a) {
         ds4_gpu_tensor_free(st[i]); ds4_gpu_tensor_free(hs[i]); ds4_gpu_tensor_free(qkv[i]);
         ds4_gpu_tensor_free(z[i]); ds4_gpu_tensor_free(out[i]);
     }
-    ds4_gpu_tensor_free(ga); ds4_gpu_tensor_free(gb); free(state0); free(hist0);
+    ds4_gpu_tensor_free(ga); ds4_gpu_tensor_free(gb); ds4_gpu_tensor_free(ga1); ds4_gpu_tensor_free(gb1);
+    free(state0); free(hist0);
+}
+
+/* verify rows of the delta net: the rows projection with the conv in its epilogue
+ * and kernel_qwen4_gdn_fused against the rows projection, gdn_front, gdn_scan and
+ * gdn_out, with their snapshots (MTP: after rows 0 and 1; lookup: one per row) */
+static void test_gdn_fused_rows(arena_t *a, uint32_t T, bool lookup) {
+    const uint32_t Hk = 16, Hv = 48, D = 128, E = 2560, K = 4, C = 2 * Hk * D + Hv * D, vd = Hv * D;
+    const uint64_t hist_n = (uint64_t)(K - 1) * C, state_n = (uint64_t)Hv * D * D;
+    const uint32_t srows = lookup ? T : 1u;
+    double *sh;
+    const uint64_t qkv_off = arena_q8_0(a, C, E, &sh, 0.05f); free(sh);
+    const uint64_t conv_off = arena_f32(a, (uint64_t)C * K, &sh, -0.5f, 0.5f); free(sh);
+    const uint64_t alpha_off = arena_q8_0(a, Hv, E, &sh, 0.05f); free(sh);
+    const uint64_t beta_off = arena_q8_0(a, Hv, E, &sh, 0.05f); free(sh);
+    const uint64_t a_off = arena_f32(a, Hv, &sh, -8.0f, -0.1f); free(sh);
+    const uint64_t dt_off = arena_f32(a, Hv, &sh, 0.2f, 1.5f); free(sh);
+    const uint64_t norm_off = arena_f32(a, D, &sh, 0.8f, 1.2f); free(sh);
+    float *state0 = rand_vec(state_n, 0.1f), *hist0 = rand_vec(hist_n, 1.0f);
+    float *x = rand_vec((uint64_t)T * E, 1.0f), *zv = rand_vec((uint64_t)T * vd, 1.0f);
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E), *gz = upload(zv, (uint64_t)T * vd);
+    ds4_gpu_tensor *st[2], *hs[2], *qkv[2], *out[2], *ss[2], *sh1[2], *ss2[2], *sh2[2];
+    for (uint32_t i = 0; i < 2; i++) {
+        st[i] = upload(state0, state_n); hs[i] = upload(hist0, hist_n);
+        qkv[i] = upload(NULL, (uint64_t)T * C); out[i] = upload(NULL, (uint64_t)T * vd);
+        ss[i] = upload(NULL, srows * state_n); sh1[i] = upload(NULL, srows * hist_n);
+        ss2[i] = upload(NULL, state_n); sh2[i] = upload(NULL, hist_n);
+    }
+    ds4_gpu_tensor *ga = upload(NULL, (uint64_t)T * Hv), *gb = upload(NULL, (uint64_t)T * Hv);
+    ds4_gpu_tensor *ga1 = upload(NULL, (uint64_t)T * Hv), *gb1 = upload(NULL, (uint64_t)T * Hv);
+    ds4_gpu_qwen4_set_verify_rows_exact(true);
+    ds4_gpu_qwen4_set_snapshot_rows(srows);
+    ds4_gpu_tensor *s2s0 = lookup ? NULL : ss2[0], *s2h0 = lookup ? NULL : sh2[0];
+    ds4_gpu_tensor *s2s1 = lookup ? NULL : ss2[1], *s2h1 = lookup ? NULL : sh2[1];
+    require_ok(ds4_gpu_qwen4_matmul_q8_0_tensor(qkv[0], a->base, a->size, qkv_off, E, C, gx, T) &&
+               ds4_gpu_qwen4_gdn_front_tensor(qkv[0], hs[0], gx, ga, gb, a->base, a->size, conv_off, alpha_off, beta_off,
+                                              a_off, dt_off, 8u, T, Hk, Hv, D, K, E, sh1[0], 0u, s2h0, 1u) &&
+               ds4_gpu_qwen4_gdn_scan_tensor(out[0], st[0], qkv[0], ga, gb, T, Hk, Hv, D, ss[0], 0u, s2s0, 1u) &&
+               ds4_gpu_qwen4_gdn_out_tensor(out[0], gz, a->base, a->size, norm_off, T, Hv, D, 1e-6f),
+               "gdn rows three kernels");
+    require_ok(ds4_gpu_qwen4_q8_rows_conv_tensor(qkv[1], hs[1], ga1, gb1, a->base, a->size, qkv_off, conv_off,
+                                                 alpha_off, beta_off, 8u, Hv, K, E, C, gx, T, sh1[1], 0u, s2h1, 1u) &&
+               ds4_gpu_qwen4_gdn_fused_tensor(out[1], st[1], qkv[1], gz, ga1, gb1, a->base, a->size, a_off, dt_off,
+                                              norm_off, T, Hk, Hv, D, 1e-6f, ss[1], 0u, s2s1, 1u),
+               "gdn rows fused");
+    ds4_gpu_qwen4_set_verify_rows_exact(false);
+    ds4_gpu_qwen4_set_snapshot_rows(1);
+    const uint64_t n[6] = {(uint64_t)T * vd, state_n, hist_n, srows * state_n, srows * hist_n, state_n};
+    ds4_gpu_tensor **t[6] = {out, st, hs, ss, sh1, ss2};
+    const char *what[6] = {"gdn rows output", "gdn rows state", "gdn rows history", "gdn rows state snapshots",
+                           "gdn rows history snapshots", "gdn rows second state snapshot"};
+    for (uint32_t k = 0; k < (lookup ? 5u : 6u); k++) {
+        float *v0 = download(t[k][0], n[k]), *v1 = download(t[k][1], n[k]);
+        check_exact_f32(what[k], v1, v0, n[k]);
+        free(v0); free(v1);
+    }
+    if (!lookup) {
+        float *v0 = download(sh2[0], hist_n), *v1 = download(sh2[1], hist_n);
+        check_exact_f32("gdn rows second history snapshot", v1, v0, hist_n);
+        free(v0); free(v1);
+    }
+    printf("  gdn fused rows T=%u %s: equal front + scan + out\n", T, lookup ? "lookup" : "mtp");
+    for (uint32_t i = 0; i < 2; i++) {
+        ds4_gpu_tensor_free(st[i]); ds4_gpu_tensor_free(hs[i]); ds4_gpu_tensor_free(qkv[i]); ds4_gpu_tensor_free(out[i]);
+        ds4_gpu_tensor_free(ss[i]); ds4_gpu_tensor_free(sh1[i]); ds4_gpu_tensor_free(ss2[i]); ds4_gpu_tensor_free(sh2[i]);
+    }
+    ds4_gpu_tensor_free(ga); ds4_gpu_tensor_free(gb); ds4_gpu_tensor_free(ga1); ds4_gpu_tensor_free(gb1);
+    ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gz);
+    free(state0); free(hist0); free(x); free(zv);
 }
 
 /* Q8_0 verify rows: the grouped gate/up kernel against the per-token one, bit for bit */
@@ -3827,7 +3896,7 @@ static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
 
 int main(void) {
     arena_t arena;
-    arena.size = (uint64_t)2048 << 20;
+    arena.size = (uint64_t)2560 << 20;
     arena.base = mmap(NULL, arena.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     arena.used = 0;
     if (arena.base == MAP_FAILED) { perror("mmap"); return 1; }
@@ -3918,6 +3987,10 @@ int main(void) {
     test_hc(&arena, 64, 8, 3, 8u);
     printf("gated delta net\n");
     test_gdn_fused(&arena);
+    test_gdn_fused_rows(&arena, 2, false);
+    test_gdn_fused_rows(&arena, 3, false);
+    test_gdn_fused_rows(&arena, 5, true);
+    test_gdn_fused_rows(&arena, 16, true);
     test_moe_mid_grouped_q8(&arena, 32, 10, 2);
     test_moe_mid_grouped_q8(&arena, 16, 10, 7);
     test_gdn(&arena, 16, 48, 128, 5);
