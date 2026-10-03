@@ -1,6 +1,6 @@
 /* MiMo-V2.6 vision tower glue around kernel_qwen4_dense_mm and the Qwen3.8
  * vision helpers: fused GQA qkv rows with the 2-D rope, attention with a
- * banded window and a per-head sink on key 0, SwiGLU with biases, and the
+ * banded window and a per-head sink, SwiGLU with biases, and the
  * merge-unit reorder of the column-window blocks.  Rows are patches in 2x2
  * merge-window order; positions travel with the rows. */
 
@@ -58,9 +58,9 @@ kernel void kernel_mimo_vis_qkv_rope(
 }
 
 /* One simdgroup per (row, head), head_dim 32 or 64: lanes hold dims lane
- * and lane + 32.  Windowed blocks see keys within the window and add the
- * head's sink to key 0's logit when it is in range, as the reference's
- * additive mask does. */
+ * and lane + 32.  Windowed blocks see keys within the window; the head's sink
+ * is an extra logit in the softmax denominator, as Xiaomi's serving code
+ * computes it (the checkpoint's modeling file adds it to key 0 instead). */
 kernel void kernel_mimo_vis_attention(
         constant ds4_metal_args_mimo_vis & args,
         device const float *q,
@@ -83,10 +83,10 @@ kernel void kernel_mimo_vis_attention(
         hi = min(args.rows - 1, row + args.window);
     }
     float acc0 = 0.0f, acc1 = 0.0f, m = -INFINITY, denom = 0.0f;
+    if (args.has_sink) { m = sinks[head]; denom = 1.0f; }
     for (uint key = lo; key <= hi; key++) {
         const uint64_t kb = (uint64_t)key * Hkv * D + kvh * D;
         float score = simd_sum(q0 * k[kb + lane] + (has1 ? q1 * k[kb + lane + 32] : 0.0f)) * args.scale;
-        if (args.has_sink && key == 0) score += sinks[head];
         const float nm = max(m, score);
         const float old = m == -INFINITY ? 0.0f : exp(m - nm);
         const float p = exp(score - nm);

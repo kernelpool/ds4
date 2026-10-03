@@ -92,7 +92,8 @@ int ds4_image_preprocess_qwen4(
         char              *error,
         size_t             error_cap);
 
-/* MiMo-V2.6: the same resize and patch order with the CLIP mean/std */
+/* MiMo-V2.6: the same resize and patch order with the ImageNet mean/std that
+ * Xiaomi's serving code uses (preprocessor_config.json lists CLIP's) */
 int ds4_image_preprocess_mimo(
         ds4_image_patches *out,
         const ds4_image   *image,

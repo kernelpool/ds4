@@ -3,8 +3,11 @@
 
 The HF tower comes from the checkpoint's own modeling file, loaded with the
 weights of the mmproj GGUF (implementation parity) and with the original
-checkpoint weights (quantization quality, reported separately). Images go
-through the Qwen2-VL image processor with the checkpoint's mean/std.
+checkpoint weights (quantization quality, reported separately). It is run as
+Xiaomi's serving code (SGLang, vLLM) runs it: the windowed blocks' sinks are an
+extra softmax logit rather than a bias on key 0, the merger's ln_q is an
+RMSNorm, and images go through the Qwen2-VL image processor with the ImageNet
+mean/std (preprocessor_config.json lists CLIP's).
 
   python tests/mimo_vision_ref.py --snapshot /path/to/MiMo-V2.6-Flash-RL \\
       --mmproj MiMo-V2.6-Flash-Vision-F32.gguf \\
@@ -23,8 +26,8 @@ from types import SimpleNamespace
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_MEAN = [0.48145466, 0.4578275, 0.40821073]
-DEFAULT_STD = [0.26862954, 0.26130258, 0.27577711]
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
 def load_lenient_json(path):
@@ -58,7 +61,48 @@ def hf_tower(snapshot, mmproj=None):
     missing = [m for m in missing if "inv_freq" not in m]
     if missing or unexpected:
         sys.exit(f"vision weights mismatch: missing={missing[:5]} unexpected={unexpected[:5]}")
+    serving_semantics(tower, sys.modules[tower_class.__module__])
     return tower, config
+
+
+def serving_semantics(tower, modeling):
+    """ln_q as an RMSNorm and the sinks as an extra softmax logit, as SGLang and vLLM run the tower."""
+    import types
+    import torch
+    import torch.nn.functional as F
+
+    tower.merger.ln_q.forward = types.MethodType(
+        lambda self, x: (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)) * self.weight, tower.merger.ln_q)
+
+    def forward(self, hidden_states, cu_seqlens, position_embeddings, full_attn=False):
+        seq_len = hidden_states.shape[0]
+        qkv = self.qkv(hidden_states)
+        q_dim, kv_dim = self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim
+        q = qkv[:, :q_dim].view(seq_len, self.num_heads, self.head_dim)
+        k = qkv[:, q_dim:q_dim + kv_dim].view(seq_len, self.num_kv_heads, self.head_dim)
+        v = qkv[:, q_dim + kv_dim:].view(seq_len, self.num_kv_heads, self.head_dim)
+        q, k = modeling._apply_rotary_pos_emb_vision(q, k, *position_embeddings)
+        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        outputs = []
+        for q_c, k_c, v_c in zip(torch.split(q, lengths), torch.split(k, lengths), torch.split(v, lengths)):
+            q_c, k_c, v_c = (t.unsqueeze(0).transpose(1, 2) for t in (q_c, k_c, v_c))
+            if self.num_kv_groups > 1:
+                k_c = k_c.repeat_interleave(self.num_kv_groups, dim=1)
+                v_c = v_c.repeat_interleave(self.num_kv_groups, dim=1)
+            scores = torch.matmul(q_c, k_c.transpose(-1, -2)) * self.scaling
+            mask = None if full_attn else self._build_window_mask(q_c.shape[2], q_c.device, q_c.dtype)
+            if mask is not None:
+                scores = scores + mask
+            if self.sinks is not None:
+                sink = self.sinks.view(1, -1, 1, 1).expand(*scores.shape[:3], 1).to(scores.dtype)
+                probs = F.softmax(torch.cat([scores, sink], dim=-1), dim=-1)[..., :-1]
+            else:
+                probs = F.softmax(scores, dim=-1)
+            outputs.append(torch.matmul(probs, v_c).squeeze(0).transpose(0, 1))
+        return self.proj(torch.cat(outputs, dim=0).reshape(seq_len, -1))
+
+    for block in tower.blocks:
+        block.attn.forward = types.MethodType(forward, block.attn)
 
 
 def gguf_state(tower, path):
@@ -114,11 +158,9 @@ def hf_embeddings(tower, config, snapshot, image_path, min_tokens, max_tokens):
     from PIL import Image
     from transformers.models.qwen2_vl.image_processing_pil_qwen2_vl import Qwen2VLImageProcessorPil as Qwen2VLImageProcessor
 
-    pp_path = os.path.join(snapshot, "preprocessor_config.json")
-    pp = load_lenient_json(pp_path) if os.path.exists(pp_path) else {}
     ip = Qwen2VLImageProcessor(min_pixels=min_tokens * 32 * 32, max_pixels=max_tokens * 32 * 32,
                                patch_size=16, merge_size=2, temporal_patch_size=2,
-                               image_mean=pp.get("image_mean", DEFAULT_MEAN), image_std=pp.get("image_std", DEFAULT_STD))
+                               image_mean=IMAGENET_MEAN, image_std=IMAGENET_STD)
     img = Image.open(image_path).convert("RGB")
     out = ip(images=img, return_tensors="pt")
     with torch.no_grad():

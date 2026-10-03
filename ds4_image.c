@@ -678,8 +678,8 @@ int ds4_image_preprocess_mimo(
         uint32_t max_image_tokens,
         char *error,
         size_t error_cap) {
-    static const float mean[3] = { 0.48145466f, 0.4578275f, 0.40821073f };
-    static const float std[3] = { 0.26862954f, 0.26130258f, 0.27577711f };
+    static const float mean[3] = { 0.485f, 0.456f, 0.406f };
+    static const float std[3] = { 0.229f, 0.224f, 0.225f };
     return image_preprocess_qwen2vl(out, image, min_image_tokens, max_image_tokens, mean, std, error, error_cap);
 }
 

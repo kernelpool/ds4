@@ -51211,13 +51211,10 @@ int ds4_gpu_mimo_vision_encode(float *out, const float *patches, uint32_t n_patc
     }
     if (ok && prev_mode == 1) ok = mimo_vis_reorder(&a, &x, &scratch, idx_row, E);
     if (ok) {
-        /* merger: LayerNorm (weight only), 4-row groups through mm.0, GELU, mm.2 */
-        qa.rows = n_patches; qa.width = E;
-        ok = qwen4_vis_t(&b[0], x, N * E, "vision x") &&
-             qwen4_vis_w(&b[1], map, size, w->post_ln_w, E, "vision post ln") &&
-             qwen4_vis_t(&b[2], zero, E, "vision zero bias") &&
-             qwen4_vis_t(&b[3], tmp, N * E, "vision tmp") &&
-             qwen4_vis_rows(QWEN4_K_VIS_LAYERNORM, &qa, b, 4, n_patches, 1) &&
+        /* merger: RMSNorm (as Xiaomi's serving code; the modeling file has a
+         * LayerNorm whose bias the checkpoint lacks), 4-row groups through
+         * mm.0, GELU, mm.2 */
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(tmp, x, map, size, w->post_ln_w, E, n_patches, w->eps) &&
              ds4_gpu_qwen4_dense_mm_tensor(m0, tmp, map, size, w->mm0_w, w->mm0_type, n_units, ME, ME);
         qa.rows = n_units; qa.width = ME; qa.mode = 1;
         ok = ok && qwen4_vis_t(&b[0], m0, (uint64_t)n_units * ME, "vision merger") &&

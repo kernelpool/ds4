@@ -78,15 +78,19 @@ reproduces the checkpoint's BF16 tower; a Q8_0 encoder is smaller but
 measurably less exact. The CLI accepts `/read image.png`; the server accepts
 `image_url` parts. Each image is resized to multiples of 32 pixels within 64
 to 1024 tokens (`DS4_MIMO_IMAGE_MAX_TOKENS` raises the cap), normalised with
-the checkpoint's mean and standard deviation, and encoded on the GPU: 28
+the ImageNet mean and standard deviation, and encoded on the GPU: 28
 blocks alternating full attention with a 64-token banded window and
 per-head sinks, the column-major reordering of the window blocks, and the
 merger that maps 2x2 patch groups to text embeddings. The image tokens take
-plain sequential positions in the text model. `make test-mimo-vision`
-compares the tower with the Hugging Face implementation on the same GGUF
-weights (it feeds DS4's own patches to both, so resizing differences do not
-hide tower differences) and reports GGUF-versus-original quality
-separately.
+plain sequential positions in the text model. The tower follows Xiaomi's
+serving code (SGLang, vLLM) where it differs from the checkpoint's modeling
+file: the sinks are an extra softmax logit rather than a bias on the first
+key, the merger's norm is an RMSNorm, and the mean and standard deviation
+are ImageNet's rather than the CLIP values in `preprocessor_config.json`.
+`make test-mimo-vision` compares the tower with the Hugging Face
+implementation, run with those three changes, on the same GGUF weights (it
+feeds DS4's own patches to both, so resizing differences do not hide tower
+differences) and reports GGUF-versus-original quality separately.
 
 ## Quality
 
