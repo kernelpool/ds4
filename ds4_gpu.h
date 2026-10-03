@@ -3378,6 +3378,15 @@ int ds4_gpu_qwen4_hc_norm_tensor(
         ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *R,
         const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_inject, float eps);
+/* F16 hyper-connection mixer of decode rows (three dispatches, several rows four): optional
+ * write-back of blk (inject gates from inj), slice sums of squares, down +
+ * inject rows, up + mix; inj then holds this mixer's inject logits */
+int ds4_gpu_qwen4_hc_mix_v2_tensor(
+        ds4_gpu_tensor *mixed, ds4_gpu_tensor *inj, ds4_gpu_tensor *R, const ds4_gpu_tensor *blk,
+        ds4_gpu_tensor *ssp, ds4_gpu_tensor *xn, ds4_gpu_tensor *lo,
+        const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t down_offset,
+        uint64_t inject_offset, uint64_t up_offset,
+        uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_rank, uint32_t n_inject, float eps);
 int ds4_gpu_qwen4_hc_gate_mix_tensor(
         ds4_gpu_tensor *mixed, const ds4_gpu_tensor *xn, const ds4_gpu_tensor *lo,
         const void *model_map, uint64_t model_size, uint64_t up_offset,
@@ -3504,6 +3513,23 @@ int ds4_gpu_qwen4_moe_down_grouped_tensor(
 /* shared_gate NULL: no shared expert; shared NULL: the shared output is part
  * slot n_slots, otherwise `shared` [T][dim] holds it.  part_stride = slots per
  * token in part. */
+/* router_topk + moe_mid (shared slot) in one dispatch, the same values; not Q4_K */
+int ds4_gpu_qwen4_moe_mid_route_tensor(
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *shared_gate,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *logits,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t in_dim, uint32_t ff_dim,
+        uint64_t shared_gate_offset, uint64_t shared_up_offset, uint32_t shared_type,
+        uint64_t gate_inp_offset, uint32_t gate_inp_type);
+/* moe_down + moe_reduce (shared slot, hc combine into R) in one dispatch, the same values */
+int ds4_gpu_qwen4_moe_down_reduce_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *R, const ds4_gpu_tensor *inj,
+        const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *shared_gate,
+        const void *model_map, uint64_t model_size, uint64_t down_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t ff_dim, uint32_t out_dim, uint64_t shared_down_offset, uint32_t shared_type, uint32_t n_hc);
 int ds4_gpu_qwen4_moe_reduce_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *shared_gate, const ds4_gpu_tensor *shared, ds4_gpu_tensor *R, const ds4_gpu_tensor *inj,
@@ -3531,6 +3557,19 @@ int ds4_gpu_qwen4_gdn_front_rows_tensor(
         uint32_t weight_type, const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_gdn_row *rows,
         uint32_t n_rows, uint32_t n_batch_rows, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
         uint32_t conv_kernel, uint32_t in_dim);
+/* one token's gdn_front after the conv + gdn_scan + gdn_out in one dispatch, the same values */
+int ds4_gpu_qwen4_gdn_fused_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *mixed, const void *model_map, uint64_t model_size,
+        uint64_t alpha_offset, uint64_t beta_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
+        uint64_t norm_offset, uint32_t weight_type, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t in_dim, float eps);
+/* the paired qkv/z Q8 projection with gdn_front's conv applied to qkv's channels */
+int ds4_gpu_qwen4_q8_pair_conv_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1, ds4_gpu_tensor *conv_state,
+        const void *model_map, uint64_t model_size, uint64_t weight0_offset, uint64_t weight1_offset,
+        uint64_t conv_offset, uint32_t conv_k, uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+        const ds4_gpu_tensor *x);
 int ds4_gpu_qwen4_gdn_front_tensor(
         ds4_gpu_tensor *qkv, ds4_gpu_tensor *state, const ds4_gpu_tensor *mixed,
         ds4_gpu_tensor *ga, ds4_gpu_tensor *gb,
