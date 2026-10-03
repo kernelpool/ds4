@@ -114,29 +114,32 @@ struct ds4_metal_args_mimo_attn {
 #define MIMO_ATTN_NSG 4          /* simdgroups per threadgroup */
 #define MIMO_ATTN_MAX_SPLITS 64  /* as in ds4_metal.m */
 #define MIMO_ATTN_HPS 4          /* q heads per simdgroup: group <= NSG * HPS */
+#define MIMO_ATTN_DBK 16         /* decode: K/V rows staged per block */
 
 static inline uint mimo_attn_lo(constant ds4_metal_args_mimo_attn &args, uint pos) {
     uint lo = args.n_swa && pos + 1u > args.n_swa ? pos + 1u - args.n_swa : 0u;
     return max(lo, args.first);
 }
 
-/* One (key split, kv head, token): the simdgroups share the K/V rows and
- * own disjoint query heads; lane j owns qk dims j*NPTK.. and value dims
- * j*NPTV.. (template constants keep the per-lane arrays in registers).
- * The sink enters split 0 as an extra logit whose value is dropped. */
+/* One (key split, kv head, token): the simdgroups share the K/V rows,
+ * staged a block at a time in threadgroup memory, and own disjoint query
+ * heads; lane j owns qk dims j*NPTK.. and value dims j*NPTV.. (template
+ * constants keep the per-lane arrays in registers).  The lane's dot is spelled
+ * as the compiler emits it (fma chain on the unscaled q, times scale), so the
+ * bits do not depend on fast-math choices.  The sink enters split 0 as an
+ * extra logit whose value is dropped. */
 template <uint NPTK, uint NPTV>
 static inline void mimo_attn_tile(
         constant ds4_metal_args_mimo_attn &args, uint split, uint kvh, uint tok,
         device const float *q, device const half *k_cache, device const half *v_cache,
         device const float *sinks, device float *out, device float *part,
-        ushort sgitg, ushort tiisg) {
+        threadgroup half *sk, threadgroup half *sv, ushort tiitg, ushort sgitg, ushort tiisg) {
     const uint H = args.n_head, Hkv = args.n_head_kv;
     constexpr uint Dk = NPTK * 32, Dv = NPTV * 32;
     const uint group = H / Hkv;
     const uint hps = (group + MIMO_ATTN_NSG - 1) / MIMO_ATTN_NSG;
     const uint g0 = (uint)sgitg * hps;
-    if (g0 >= group) return;
-    const uint ng = min(hps, group - g0);
+    const uint ng = g0 < group ? min(hps, group - g0) : 0u;
     const uint pos = args.pos0 + tok;
     const uint lo = mimo_attn_lo(args, pos);
     const uint end = args.hi_end ? args.hi_end : pos + 1u;
@@ -154,41 +157,56 @@ static inline void mimo_attn_tile(
     float m[MIMO_ATTN_HPS], l[MIMO_ATTN_HPS], acc[MIMO_ATTN_HPS][NPTV];
 #pragma unroll
     for (uint g = 0; g < MIMO_ATTN_HPS; g++) {
-        const uint h = kvh * group + g0 + min(g, ng - 1u);
+        const uint h = kvh * group + min(g0 + g, group - 1u);
         device const float *qh = q + ((uint64_t)tok * H + h) * Dk + tiisg * NPTK;
 #pragma unroll
-        for (uint i = 0; i < NPTK; i++) qv[g][i] = qh[i] * args.scale;
+        for (uint i = 0; i < NPTK; i++) qv[g][i] = qh[i];
         const bool sink = args.has_sink && split == 0;
         m[g] = sink ? sinks[h] : -3.0e38f;
         l[g] = sink ? 1.0f : 0.0f;
 #pragma unroll
         for (uint i = 0; i < NPTV; i++) acc[g][i] = 0.0f;
     }
+    constexpr uint BK = MIMO_ATTN_DBK, NT = 32u * MIMO_ATTN_NSG;
     uint row = k0 % args.ring;
-    for (uint p = k0; p < k1; p++, row = row + 1u == args.ring ? 0u : row + 1u) {
-        device const half *kr = k_cache + ((uint64_t)row * Hkv + kvh) * Dk + tiisg * NPTK;
-        device const half *vr = v_cache + ((uint64_t)row * Hkv + kvh) * Dv + tiisg * NPTV;
-        float kv[NPTK], vv[NPTV];
+    for (uint kb = k0; kb < k1; kb += BK) {
+        const uint nk = min(BK, k1 - kb);
+        for (uint i = tiitg; i < nk * (Dk / 4); i += NT) {
+            const uint j = i / (Dk / 4), r = row + j < args.ring ? row + j : row + j - args.ring;
+            ((threadgroup half4 *)sk)[i] = ((device const half4 *)(k_cache + ((uint64_t)r * Hkv + kvh) * Dk))[i % (Dk / 4)];
+        }
+        for (uint i = tiitg; i < nk * (Dv / 4); i += NT) {
+            const uint j = i / (Dv / 4), r = row + j < args.ring ? row + j : row + j - args.ring;
+            ((threadgroup half4 *)sv)[i] = ((device const half4 *)(v_cache + ((uint64_t)r * Hkv + kvh) * Dv))[i % (Dv / 4)];
+        }
+        row = row + nk < args.ring ? row + nk : row + nk - args.ring;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint j = 0; j < nk; j++) {
+            threadgroup const half *kr = sk + j * Dk + tiisg * NPTK;
+            threadgroup const half *vr = sv + j * Dv + tiisg * NPTV;
+            float kv[NPTK], vv[NPTV];
 #pragma unroll
-        for (uint i = 0; i < NPTK; i++) kv[i] = (float)kr[i];
+            for (uint i = 0; i < NPTK; i++) kv[i] = (float)kr[i];
 #pragma unroll
-        for (uint i = 0; i < NPTV; i++) vv[i] = (float)vr[i];
+            for (uint i = 0; i < NPTV; i++) vv[i] = (float)vr[i];
 #pragma unroll
-        for (uint g = 0; g < MIMO_ATTN_HPS; g++) {
-            if (g < ng) {
-                float s = 0.0f;
+            for (uint g = 0; g < MIMO_ATTN_HPS; g++) {
+                if (g < ng) {
+                    float s = qv[g][0] * kv[0];
 #pragma unroll
-                for (uint i = 0; i < NPTK; i++) s += qv[g][i] * kv[i];
-                s = simd_sum(s);
-                const float m_new = max(m[g], s);
-                const float corr = exp(m[g] - m_new);
-                const float w = exp(s - m_new);
-                l[g] = l[g] * corr + w;
+                    for (uint i = 1; i < NPTK; i++) s = fma(qv[g][i], kv[i], s);
+                    s = simd_sum(s * args.scale);
+                    const float m_new = max(m[g], s);
+                    const float corr = exp(m[g] - m_new);
+                    const float w = exp(s - m_new);
+                    l[g] = l[g] * corr + w;
 #pragma unroll
-                for (uint i = 0; i < NPTV; i++) acc[g][i] = acc[g][i] * corr + w * vv[i];
-                m[g] = m_new;
+                    for (uint i = 0; i < NPTV; i++) acc[g][i] = acc[g][i] * corr + w * vv[i];
+                    m[g] = m_new;
+                }
             }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 #pragma unroll
     for (uint g = 0; g < MIMO_ATTN_HPS; g++) {
@@ -237,8 +255,11 @@ kernel void kernel_mimo_attn(
         device float       *part,       /* [T][Hkv][n_splits][group][2+Dv] */
         device const float *qkv,        /* [1][H*Dk + Hkv*Dk + Hkv*Dv] when fuse_prep */
         uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]]) {
+    threadgroup half sk[MIMO_ATTN_DBK * NPTK * 32];
+    threadgroup half sv[MIMO_ATTN_DBK * NPTV * 32];
     const uint split = tgpig.x;
     const uint kvh = tgpig.y;
     const uint tok = tgpig.z;
@@ -260,7 +281,7 @@ kernel void kernel_mimo_attn(
         }
         threadgroup_barrier(mem_flags::mem_device);
     }
-    mimo_attn_tile<NPTK, NPTV>(args, split, kvh, tok, q, k_cache, v_cache, sinks, out, part, sgitg, tiisg);
+    mimo_attn_tile<NPTK, NPTV>(args, split, kvh, tok, q, k_cache, v_cache, sinks, out, part, sk, sv, tiitg, sgitg, tiisg);
 }
 
 /* Prefill rows (one key split) as mimo_attn_tile computes them, several
@@ -404,7 +425,7 @@ kernel void kernel_mimo_attn_merge(
 template [[host_name("kernel_mimo_attn_k" #NPTK_ "v" #NPTV_)]] \
 kernel void kernel_mimo_attn<NPTK_, NPTV_>(constant ds4_metal_args_mimo_attn &, device float *, \
         device half *, device half *, device const float *, device float *, device float *, \
-        device const float *, uint3, ushort, ushort);
+        device const float *, uint3, ushort, ushort, ushort);
 MIMO_ATTN_INSTANCE(6, 4)   /* MiMo-V2.6: qk 192, value 128 */
 MIMO_ATTN_INSTANCE(3, 2)   /* mini: qk 96, value 64 */
 MIMO_ATTN_INSTANCE(4, 4)   /* DFlash drafter: 128/128 */
