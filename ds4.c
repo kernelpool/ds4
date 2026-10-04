@@ -59683,8 +59683,9 @@ static bool qwen4_graph_mtp_step(ds4_qwen4_gpu_graph *g, const ds4_model *m, con
  * draft logits go to the logit rows after the verify's. */
 static bool qwen4_graph_mtp_spec(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                  uint32_t T, uint32_t idx) {
+    const bool bf16 = w->token_embd->type == DS4_TENSOR_BF16;
     if (!g->mtp_R || !g->vrf_argmax || T == 0u || 2u * T > g->n_logit_rows ||
-        w->token_embd->type != DS4_TENSOR_Q8_0) return false;
+        (w->token_embd->type != DS4_TENSOR_Q8_0 && !bf16)) return false;
     const uint32_t V = DS4_N_VOCAB;
     const ds4_layer_weights *l = &w->layer[DS4_N_LAYER - 1u];
     const uint64_t row_bytes = (uint64_t)V * sizeof(float);
@@ -59693,8 +59694,10 @@ static bool qwen4_graph_mtp_spec(ds4_qwen4_gpu_graph *g, const ds4_model *m, con
         if (pass) {
             ds4_gpu_tensor *R_save = g->R;
             ds4_gpu_tensor *dl = ds4_gpu_tensor_view(g->logits, T * row_bytes, T * row_bytes);
-            ok = dl && ds4_gpu_embed_tokens_q8_0_tensor(g->mtp_e, g->vrf_argmax, m->map, m->size,
-                                                        w->token_embd->abs_offset, V, T, DS4_N_EMBD) != 0 &&
+            ok = dl && (bf16 ? ds4_gpu_glm53_embedding_bf16(g->mtp_e, m->map, m->size, w->token_embd->abs_offset,
+                                                            g->vrf_argmax, T, DS4_N_EMBD, V) != 0
+                             : ds4_gpu_embed_tokens_q8_0_tensor(g->mtp_e, g->vrf_argmax, m->map, m->size,
+                                                                w->token_embd->abs_offset, V, T, DS4_N_EMBD) != 0) &&
                  qwen4_graph_mtp_layer(g, m, w, 0, T, idx, false) &&
                  (g->mtp_rows = true, qwen4_graph_hc_mix(g, m, l->nextn_hc_head_norm, l->nextn_hc_head_down,
                                                          l->nextn_hc_head_up, NULL, T)) &&
