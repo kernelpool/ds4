@@ -39635,13 +39635,15 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx);
 /* Prefill chunks end at multiples of cap past the first uncached token; a
  * long first chunk runs a short head of its own first, so few n-gram rows
  * (disk reads that layer 1 waits for) stand before the GPU and the rest are
- * read while the head runs.  Splits into chunks of more than 64 rows leave
- * the arithmetic unchanged. */
+ * read while the head runs.  With Q8_0 experts, splits into chunks of more
+ * than 64 rows leave the arithmetic unchanged; other expert types round by
+ * chunk size, so their chunks keep the plain boundaries. */
+static bool g_qwen4_prefill_head = true;
 static uint32_t qwen4_prefill_next_chunk(uint32_t done, uint32_t left, uint32_t cap) {
     uint32_t chunk = cap - done % cap;
     if (chunk > left) chunk = left;
     /* the head's compute must outlast the rest's reads: an eighth, 512 at least */
-    if (done == 0 && chunk >= 3072u) {
+    if (g_qwen4_prefill_head && done == 0 && chunk >= 3072u) {
         const uint32_t head = (chunk / 8u + 255u) & ~255u;
         chunk = head > 512u ? head : 512u;
     }
@@ -58000,6 +58002,11 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
                               ds4_gpu_tensor *const *hist_pool, uint32_t slot) {
     memset(g, 0, sizeof(*g));
     if (!qwen4_graph_weights_supported(w)) return false;
+    g_qwen4_prefill_head = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (w->layer[il].ffn_gate_exps->type != DS4_TENSOR_Q8_0 || w->layer[il].ffn_down_exps->type != DS4_TENSOR_Q8_0)
+            g_qwen4_prefill_head = false;
+    }
     mtp = mtp && DS4_N_NEXTN_PREDICT != 0;
     const uint64_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc, T = cap_tokens;
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
