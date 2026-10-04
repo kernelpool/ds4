@@ -128,7 +128,7 @@ but not bit-identical to it.
 Prefill is not chunk-invariant at the last bit, so two identical prompts
 whose prefills were split differently (the server interleaves 128-token
 quanta while other slots generate) can part at a near tie;
-`--mixed-prefill-quantum` sets that split. There is no Q2 release yet.
+`--mixed-prefill-quantum` sets that split.
 
 ## Conversion
 
@@ -138,7 +138,10 @@ attention, MXFP4 experts) and writes the main GGUF and the DFlash sidecar;
 `mimovl` layout; see [GGUF conversion](../gguf-tools/README.md#mimo-v26-flash).
 The converter de-interleaves the tensor-parallel chunks of the fused QKV
 projection and repacks the MXFP4 experts into ggml blocks without
-requantizing them.
+requantizing them. `--quant q4` (Q4_K experts) and `--quant q2` (IQ2_XXS
+gate/up, Q2_K down) requantize the experts with a routed-expert importance
+matrix that `ds4 --imatrix-dataset FILE --imatrix-out FILE` collects on a
+MiMo GGUF.
 
 ## Testing
 

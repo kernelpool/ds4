@@ -375,6 +375,20 @@ de-interleaved from its tensor-parallel chunks. `--resume` continues an
 interrupted run and `--dry-run` prints the plan. The same command converts
 MiMo-V2.6 Pro RL; `general.source.url` follows the snapshot's repository.
 
+`--quant q4` (Q4_K gate/up/down) and `--quant q2` (IQ2_XXS gate/up, Q2_K
+down) requantize the released MXFP4 experts with a routed-expert importance
+matrix (required for q2). DS4 collects it on the MXFP4 GGUF over the
+calibration prompts of `imatrix/dataset` rendered with MiMo's chat template;
+the one used for the published Flash MOPD files is in
+`kernelpool/MiMo-V2.6-Flash-MOPD-GGUF`:
+
+```sh
+./ds4 -m /path/to/MiMo-V2.6-Flash-MXFP4.gguf --imatrix-dataset /path/to/rendered_prompts.txt \
+  --imatrix-out /path/to/MiMo-V2.6-Flash-routed-moe.dat
+python3 gguf-tools/mimo26_quantize.py --hf /path/to/MiMo-V2.6-Flash-MOPD --source-revision <commit> \
+  --out /path/to/MiMo-V2.6-Flash-MOPD-Q2.gguf --quant q2 --imatrix /path/to/MiMo-V2.6-Flash-routed-moe.dat
+```
+
 `mimo26_vision.py` writes the vision tower as a llama.cpp clip mmproj
 (`mimovl`), splitting the Conv3D patch embedding into its two temporal taps:
 
