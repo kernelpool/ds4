@@ -58484,9 +58484,9 @@ static bool qwen4_idx_select_expand(ds4_qwen4_gpu_graph *g, const ds4_gpu_tensor
 }
 
 /* Decode, verify and batch rows mix through the three-dispatch F16 kernels
- * (ds4_gpu_qwen4_hc_mix_v2_tensor), each row alone; their slice sums live in
- * inj_alt.  DS4_QWEN4_HC_LEGACY=1 keeps the
- * norm / GEMV / gate-mix kernels. */
+ * (ds4_gpu_qwen4_hc_mix_v2_tensor), each row alone, with the norm / GEMV /
+ * gate-mix kernels' bits; their stream norms live in inj_alt.
+ * DS4_QWEN4_HC_LEGACY=1 keeps those kernels. */
 static bool qwen4_hc_v2(const ds4_qwen4_gpu_graph *g, const ds4_tensor *down, const ds4_tensor *up,
                         const ds4_tensor *inject, uint32_t T) {
 #ifdef DS4_HAS_QWEN4_METAL

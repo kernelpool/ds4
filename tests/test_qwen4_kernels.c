@@ -2041,11 +2041,11 @@ static void test_hc_v2(arena_t *a, uint32_t T, bool write_back, uint32_t n_injec
     }
     /* all rows in one call, then each row alone (verify rows: the per-row kernels) */
     ds4_gpu_qwen4_set_verify_rows_exact(true);
-    float *got[2][3];
+    float *got[2][4];
     for (uint32_t pass = 0; pass < 2; pass++) {
         const uint32_t calls = pass ? T : 1u, rows = pass ? 1u : T;
         float *mix_all = malloc((uint64_t)T * E * 4), *R_all = malloc((uint64_t)T * dim * 4);
-        float *inj_all = malloc((uint64_t)T * hc * CH * hc * 4);
+        float *inj_all = malloc((uint64_t)T * hc * CH * hc * 4), *lo_all = malloc((uint64_t)T * rank * 4);
         for (uint32_t c = 0; c < calls; c++) {
             ds4_gpu_tensor *gR = upload(R + (uint64_t)c * dim, (uint64_t)rows * dim);
             ds4_gpu_tensor *gblk = upload(blk + (uint64_t)c * E, (uint64_t)rows * E);
@@ -2060,12 +2060,13 @@ static void test_hc_v2(arena_t *a, uint32_t T, bool write_back, uint32_t n_injec
             ds4_gpu_tensor_free(gxn);
             require_ok(ds4_gpu_tensor_read(gmix, 0, mix_all + (uint64_t)c * E, (uint64_t)rows * E * 4) &&
                        ds4_gpu_tensor_read(gR, 0, R_all + (uint64_t)c * dim, (uint64_t)rows * dim * 4) &&
-                       ds4_gpu_tensor_read(ginj, 0, inj_all + (uint64_t)c * hc * CH * hc, (uint64_t)rows * hc * CH * hc * 4),
+                       ds4_gpu_tensor_read(ginj, 0, inj_all + (uint64_t)c * hc * CH * hc, (uint64_t)rows * hc * CH * hc * 4) &&
+                       ds4_gpu_tensor_read(gpart, 0, lo_all + (uint64_t)c * rank, (uint64_t)rows * rank * 4),
                        "hc v2 read");
             ds4_gpu_tensor_free(gR); ds4_gpu_tensor_free(gblk); ds4_gpu_tensor_free(ginj);
             ds4_gpu_tensor_free(gmix); ds4_gpu_tensor_free(gssp); ds4_gpu_tensor_free(gpart);
         }
-        got[pass][0] = mix_all; got[pass][1] = R_all; got[pass][2] = inj_all;
+        got[pass][0] = mix_all; got[pass][1] = R_all; got[pass][2] = inj_all; got[pass][3] = lo_all;
     }
     ds4_gpu_qwen4_set_verify_rows_exact(false);
     char name[96];
@@ -2074,20 +2075,42 @@ static void test_hc_v2(arena_t *a, uint32_t T, bool write_back, uint32_t n_injec
     snprintf(name, sizeof(name), "hc v2 T=%u wb=%d inject=%u: residual", T, write_back, n_inject);
     check_close(name, got[0][1], Rw, (uint64_t)T * dim, 1e-6);
     if (n_inject) {
-        double *ref = calloc((uint64_t)T * hc * CH * hc, sizeof(double));
+        float *sum = calloc((uint64_t)T * hc, sizeof(float));
         for (uint32_t t = 0; t < T; t++)
-            for (uint32_t j = 0; j < hc; j++) ref[(uint64_t)t * hc * CH * hc + j] = ij[t * hc + j];
+            for (uint32_t src = 0; src < hc * CH; src++)
+                for (uint32_t j = 0; j < hc; j++) sum[t * hc + j] += got[0][2][((uint64_t)t * hc * CH + src) * hc + j];
         snprintf(name, sizeof(name), "hc v2 T=%u wb=%d inject=%u: inject logits", T, write_back, n_inject);
-        check_close(name, got[0][2], ref, (uint64_t)T * hc * CH * hc, 2e-5);
-        for (uint32_t t = 0; t < T; t++)
-            for (uint32_t i = hc; i < hc * CH * hc; i++)
-                require_ok(got[0][2][(uint64_t)t * hc * CH * hc + i] == 0.0f, "hc v2 inject slots past the first are zero");
-        free(ref);
+        check_close(name, sum, ij, (uint64_t)T * hc, 2e-5);
+        free(sum);
     }
     check_exact_f32("hc v2 rows alone: mixed", got[1][0], got[0][0], (uint64_t)T * E);
     check_exact_f32("hc v2 rows alone: residual", got[1][1], got[0][1], (uint64_t)T * dim);
     if (n_inject) check_exact_f32("hc v2 rows alone: inject", got[1][2], got[0][2], (uint64_t)T * hc * CH * hc);
-    for (uint32_t p2 = 0; p2 < 2; p2++) for (uint32_t k = 0; k < 3; k++) free(got[p2][k]);
+#ifdef __APPLE__
+    /* the combine / norm / GEMV / gate-mix kernels on the same rows: the same bits */
+    ds4_gpu_qwen4_set_verify_rows_exact(true);
+    ds4_gpu_tensor *lR = upload(R, (uint64_t)T * dim), *lblk = upload(blk, (uint64_t)T * E);
+    ds4_gpu_tensor *linj = upload(inj_in, (uint64_t)T * hc * CH * hc), *lxn = upload(NULL, (uint64_t)T * dim);
+    ds4_gpu_tensor *llo = upload(NULL, (uint64_t)T * rank), *lmix = upload(NULL, (uint64_t)T * E);
+    if (write_back) require_ok(ds4_gpu_qwen4_hc_combine_tensor(lR, lblk, linj, T, E, hc), "hc combine");
+    require_ok(ds4_gpu_qwen4_hc_norm_tensor(lxn, linj, lR, a->base, a->size, gamma_off, inj_off, 1u, T, E, hc, n_inject, eps) &&
+               ds4_gpu_matmul_f16_tensor(llo, a->base, a->size, down_off, dim, rank, lxn, T) &&
+               ds4_gpu_qwen4_hc_gate_mix_tensor(lmix, lxn, llo, a->base, a->size, up_off, 1u, T, E, hc, rank), "hc legacy");
+    ds4_gpu_qwen4_set_verify_rows_exact(false);
+    float *lm = malloc((uint64_t)T * E * 4), *lr = malloc((uint64_t)T * dim * 4), *li = malloc((uint64_t)T * hc * CH * hc * 4);
+    float *ll = malloc((uint64_t)T * rank * 4);
+    require_ok(ds4_gpu_tensor_read(lmix, 0, lm, (uint64_t)T * E * 4) && ds4_gpu_tensor_read(lR, 0, lr, (uint64_t)T * dim * 4) &&
+               ds4_gpu_tensor_read(linj, 0, li, (uint64_t)T * hc * CH * hc * 4) && ds4_gpu_tensor_read(llo, 0, ll, (uint64_t)T * rank * 4),
+               "hc legacy read");
+    check_exact_f32("hc v2 vs norm/GEMV/gate-mix: residual", got[0][1], lr, (uint64_t)T * dim);
+    if (n_inject) check_exact_f32("hc v2 vs norm/GEMV/gate-mix: inject partials", got[0][2], li, (uint64_t)T * hc * CH * hc);
+    check_exact_f32("hc v2 vs norm/GEMV/gate-mix: lowrank", got[0][3], ll, (uint64_t)T * rank);
+    check_exact_f32("hc v2 vs norm/GEMV/gate-mix: mixed", got[0][0], lm, (uint64_t)T * E);
+    free(lm); free(lr); free(li); free(ll);
+    ds4_gpu_tensor_free(lR); ds4_gpu_tensor_free(lblk); ds4_gpu_tensor_free(linj);
+    ds4_gpu_tensor_free(lxn); ds4_gpu_tensor_free(llo); ds4_gpu_tensor_free(lmix);
+#endif
+    for (uint32_t p2 = 0; p2 < 2; p2++) for (uint32_t k = 0; k < 4; k++) free(got[p2][k]);
     free(R); free(blk); free(inj_in); free(Rw); free(xn); free(mixed); free(ij); free(lo);
     free(g_gamma); free(g_down); free(g_up); free(g_inj);
 }

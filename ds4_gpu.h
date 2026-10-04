@@ -3386,8 +3386,9 @@ int ds4_gpu_qwen4_hc_norm_tensor(
         const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_inject, float eps);
 /* F16 hyper-connection mixer of decode rows (three dispatches, several rows four): optional
- * write-back of blk (inject gates from inj), slice sums of squares, down +
- * inject rows, up + mix; inj then holds this mixer's inject logits */
+ * write-back of blk (inject gates from inj), stream norms, down rows, up + mix
+ * and the inject rows' chunk partials, which inj then holds; the norm / GEMV /
+ * gate-mix kernels' results, bit for bit */
 int ds4_gpu_qwen4_hc_mix_v2_tensor(
         ds4_gpu_tensor *mixed, ds4_gpu_tensor *inj, ds4_gpu_tensor *R, const ds4_gpu_tensor *blk,
         ds4_gpu_tensor *ssp, ds4_gpu_tensor *xn, ds4_gpu_tensor *lo,
