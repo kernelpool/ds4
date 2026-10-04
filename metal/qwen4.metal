@@ -4210,7 +4210,7 @@ static inline void qwen4_q8_pairs_gateup_dot(device const char *grow, device con
  * 0 when another threadgroup owns them */
 static inline uint qwen4_q8_group(constant ds4_metal_args_qwen4_moe &args, device const int32_t *selected,
                                   device const int32_t *lists, device const int32_t *counts, uint slot, uint tok,
-                                  thread device const int32_t *&list, thread uint64_t &ebase) {
+                                  device const int32_t * thread &list, thread uint64_t &ebase) {
     if (slot == args.n_slots) {
         list = nullptr;
         ebase = 0;
