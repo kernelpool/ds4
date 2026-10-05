@@ -2057,7 +2057,10 @@ kernel void kernel_glm_indexer_score_one_wide(
         }
     }
     float score = 0.0f;
-    FOR_UNROLL (uint h = 0; h < 32u; h++) score += max(acc[h] * args.scale, 0.0f) * ws[h];
+    FOR_UNROLL (uint h = 0; h < 32u; h++) {
+#pragma clang fp contract(off)
+        score += max(acc[h] * args.scale, 0.0f) * ws[h];
+    }
     scores[row] = score;
 }
 

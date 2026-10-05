@@ -127,6 +127,15 @@ int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
                                      const ds4_gpu_tensor *keys,
                                      uint32_t source_rows, uint32_t rows,
                                      uint32_t start, uint32_t ratio);
+/* One-token index scores of FP4 queries/keys: the GLM scorer, plus its wide
+ * kernel for long rows (Metal only). */
+int ds4_gpu_dsv41_indexer_score_one_tensor(ds4_gpu_tensor *scores,
+                                           const ds4_gpu_tensor *q,
+                                           const ds4_gpu_tensor *weights,
+                                           const ds4_gpu_tensor *indexer_key_cache,
+                                           uint32_t n_rows, uint32_t n_head,
+                                           uint32_t head_dim, float scale,
+                                           bool cache_f16);
 int ds4_gpu_dsv41_tensor_ops_available(void);
 /* Reuse exact BF16 views of FP4 queries/keys across score tiles. Invalid
  * casts retain the F32 arithmetic for the affected tile. */

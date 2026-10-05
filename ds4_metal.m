@@ -36769,7 +36769,7 @@ static int ds4_gpu_v41_index_score_wide_off(void) {
     return off;
 }
 
-int ds4_gpu_glm_indexer_score_one_tensor(
+static int ds4_gpu_glm_indexer_score_one_impl(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights,
@@ -36778,7 +36778,8 @@ int ds4_gpu_glm_indexer_score_one_tensor(
         uint32_t              n_head,
         uint32_t              head_dim,
         float                 scale,
-        bool                  cache_f16) {
+        bool                  cache_f16,
+        bool                  fp4_inputs) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!scores || !q || !weights || !indexer_key_cache ||
         n_rows == 0 || n_head == 0 || head_dim == 0 ||
@@ -36814,9 +36815,10 @@ int ds4_gpu_glm_indexer_score_one_tensor(
         };
 
         if (n_head == 32u && head_dim == 128u) {
-            /* long rows stream one key per thread; short ones keep the per-key kernel */
+            /* long rows stream one key per thread when FP4 query and keys make
+             * its summation order exact; the rest keep the per-key kernel */
             const bool wide = (g_test_flags & DS4_GPU_TEST_INDEX_SCORE_WIDE) != 0u ||
-                ((g_test_flags & DS4_GPU_TEST_INDEX_SCORE_DIRECT) == 0u &&
+                ((g_test_flags & DS4_GPU_TEST_INDEX_SCORE_DIRECT) == 0u && fp4_inputs &&
                  n_rows >= 8192u && !ds4_gpu_v41_index_score_wide_off());
             id<MTLComputePipelineState> direct_pipeline = wide ?
                 ds4_gpu_hot_pipeline(g_glm_indexer_score_one_wide_pipeline,
@@ -36878,6 +36880,34 @@ int ds4_gpu_glm_indexer_score_one_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_glm_indexer_score_one_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        uint32_t              n_rows,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        float                 scale,
+        bool                  cache_f16) {
+    return ds4_gpu_glm_indexer_score_one_impl(scores, q, weights, indexer_key_cache,
+                                              n_rows, n_head, head_dim, scale, cache_f16, false);
+}
+
+int ds4_gpu_dsv41_indexer_score_one_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        uint32_t              n_rows,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        float                 scale,
+        bool                  cache_f16) {
+    return ds4_gpu_glm_indexer_score_one_impl(scores, q, weights, indexer_key_cache,
+                                              n_rows, n_head, head_dim, scale, cache_f16, true);
 }
 
 static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
