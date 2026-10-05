@@ -488,6 +488,11 @@ extern "C" int ds4_gpu_dsv41_hc_input(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gp
                                       uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, float,
                                       float) { return 0; }
 
+extern "C" int ds4_gpu_dsv41_indexer_topk_tensor(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
+                                                 uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
+    return ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k);
+}
+
 extern "C" int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
                                                 uint32_t width, uint32_t rows,
                                                 uint32_t start, uint32_t ratio) {

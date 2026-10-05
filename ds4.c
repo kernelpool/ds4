@@ -40900,7 +40900,7 @@ static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
         if (il == 20) {
             const uint32_t blocks = (n_comp + 7u) / 8u;
             if (!ds4_gpu_dsv41_candidate_blocks(g->block_scores, g->index_scores, n_comp, 1, pos, ratio) ||
-                !ds4_gpu_indexer_topk_tensor(g->block_selected, g->block_scores, blocks, 1, 2048u) ||
+                !ds4_gpu_dsv41_indexer_topk_tensor(g->block_selected, g->block_scores, blocks, 1, 2048u) ||
                 !ds4_gpu_dsv4_topk_mask_tensor(g->block_mask, g->block_selected, blocks, 1, 2048u)) return false;
         } else if (il > 20 &&
             !ds4_gpu_dsv41_candidate_filter(g->index_scores, g->block_mask, n_comp, 1, pos, ratio, 0)) return false;
@@ -40913,7 +40913,7 @@ static bool ds41_attention_pick(ds41_gpu_graph *g, uint32_t il) {
     const uint32_t n_comp = ratio ? (g->pos + 1u) / ratio : 0;
     const uint32_t top = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
     return ds41_attention_candidates(g, il) && (!n_comp || !ds41_index_source(il) ||
-        ds4_gpu_indexer_topk_tensor(g->selected_comp, g->index_scores, n_comp, 1, top));
+        ds4_gpu_dsv41_indexer_topk_tensor(g->selected_comp, g->index_scores, n_comp, 1, top));
 }
 
 static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *m,

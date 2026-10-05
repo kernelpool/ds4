@@ -157,6 +157,12 @@ int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected,
                                     const ds4_gpu_tensor *scores,
                                     uint32_t width, uint32_t rows,
                                     uint32_t start, uint32_t ratio);
+/* The indexer top-k, plus the radix select for wide rows (Metal); other models
+ * keep the merge ladder and its tie order. */
+int ds4_gpu_dsv41_indexer_topk_tensor(ds4_gpu_tensor *selected,
+                                      const ds4_gpu_tensor *scores,
+                                      uint32_t n_comp, uint32_t n_tokens,
+                                      uint32_t top_k);
 /* Rows with at most 512 visible keys select all of them, in key order. */
 int ds4_gpu_dsv41_indexer_all_batch(ds4_gpu_tensor *selected, uint32_t rows,
                                    uint32_t start, uint32_t ratio);

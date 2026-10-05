@@ -682,6 +682,7 @@ static id<MTLBuffer> g_indexer_topk_buffer;
 static id<MTLBuffer> g_topk_select_buffer;
 static NSUInteger g_topk_select_bytes;
 static uint32_t g_topk_select_parity;
+static uint32_t g_topk_select_rows;
 static id<MTLBuffer> g_indexed_topk_buffer;
 static id<MTLBuffer> g_f16_round_scratch_buffer;
 static id<MTLBuffer> g_q8_prefill_scratch_buffer;
@@ -19279,8 +19280,10 @@ static int ds4_gpu_indexer_topk_select(id<MTLBuffer> selbuf, NSUInteger sel_off,
     id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
     if (!cb) return 0;
     id<MTLComputeCommandEncoder> enc;
-    if (g_topk_select_buffer != before) {   /* a fresh scratch starts with empty histograms */
+    if (g_topk_select_buffer != before || rows != g_topk_select_rows) {
+        /* a fresh scratch, or one laid out for another row count, starts with empty histograms */
         const uint32_t words = (uint32_t)(g_topk_select_bytes / sizeof(uint32_t));
+        g_topk_select_rows = rows;
         enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:zero];
         [enc setBuffer:g_topk_select_buffer offset:0 atIndex:0];
@@ -19335,7 +19338,8 @@ static int ds4_gpu_indexer_topk_tensor_impl(
         uint32_t                n_tokens,
         uint32_t                top_k,
         uint32_t                causal_start,
-        uint32_t                causal_ratio) {
+        uint32_t                causal_ratio,
+        bool                    radix) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!selected || !scores || n_comp == 0 || n_tokens == 0 || top_k == 0 || top_k > n_comp) return 0;
 
@@ -19359,8 +19363,9 @@ static int ds4_gpu_indexer_topk_tensor_impl(
             fprintf(stderr, "ds4: Metal graph indexer top-k received undersized buffers\n");
             return 0;
         }
-        /* wide rows: the merge ladder's last rounds run on two or three threadgroups */
-        if (!causal_ratio && top_k <= 2048u && n_comp >= 16384u && n_comp <= (1u << 23) &&
+        /* wide V4.1 rows: the merge ladder's last rounds run on two or three
+         * threadgroups; other models keep the ladder and its tie order */
+        if (radix && !causal_ratio && top_k <= 2048u && n_comp >= 16384u && n_comp <= (1u << 23) &&
             !getenv("DS4_METAL_DISABLE_V41_TOPK_SELECT") &&
             ds4_gpu_indexer_topk_select(selbuf, ds4_gpu_tensor_offset(selected), scorebuf,
                                         ds4_gpu_tensor_offset(scores), n_comp, n_tokens, top_k)) return 1;
@@ -19485,7 +19490,12 @@ static int ds4_gpu_indexer_topk_tensor_impl(
 
 int ds4_gpu_indexer_topk_tensor(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
                                uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
-    return ds4_gpu_indexer_topk_tensor_impl(selected, scores, n_comp, n_tokens, top_k, 0, 0);
+    return ds4_gpu_indexer_topk_tensor_impl(selected, scores, n_comp, n_tokens, top_k, 0, 0, false);
+}
+
+int ds4_gpu_dsv41_indexer_topk_tensor(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
+                                      uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
+    return ds4_gpu_indexer_topk_tensor_impl(selected, scores, n_comp, n_tokens, top_k, 0, 0, true);
 }
 
 int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
@@ -19493,7 +19503,7 @@ int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const ds4_gpu_ten
     if ((ratio != 1u && ratio != 2u) || !rows || rows > UINT32_MAX - start ||
         width > INT32_MAX || rows > INT32_MAX || (start + rows) / ratio > width ||
         (start + 1u) / ratio <= 512u) return 0;
-    return ds4_gpu_indexer_topk_tensor_impl(selected, scores, width, rows, 512u, start, ratio);
+    return ds4_gpu_indexer_topk_tensor_impl(selected, scores, width, rows, 512u, start, ratio, false);
 }
 
 int ds4_gpu_dsv41_indexer_all_batch(ds4_gpu_tensor *selected, uint32_t rows,
@@ -49477,7 +49487,7 @@ int ds4_gpu_dsv41_candidate_topk_batch(ds4_gpu_tensor *selected,
     if (!rows || start > UINT32_MAX - 8u || rows > UINT32_MAX - 8u - start ||
         width > INT32_MAX || rows > INT32_MAX ||
         (start + rows + 7u) / 8u > width || (start + 8u) / 8u <= 2048u) return 0;
-    return ds4_gpu_indexer_topk_tensor_impl(selected, blocks, width, rows, 2048u, start + 7u, 8u);
+    return ds4_gpu_indexer_topk_tensor_impl(selected, blocks, width, rows, 2048u, start + 7u, 8u, false);
 }
 
 int ds4_gpu_dsv41_candidate_mask_batch(ds4_gpu_tensor *mask,

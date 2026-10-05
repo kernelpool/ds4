@@ -1140,14 +1140,15 @@ static int check_topk_select(void) {
             }
             for (size_t ki = 0; ki < sizeof(counts) / sizeof(*counts); ki++) {
                 const uint32_t k = counts[ki];
+                const uint32_t n = ki == 1 ? 1u : rows;   /* the scratch changes row layout between calls */
                 CHECK(unsetenv("DS4_METAL_DISABLE_V41_TOPK_SELECT") == 0);
-                CHECK(ds4_gpu_indexer_topk_tensor(fast, scores, width, rows, k));
+                CHECK(ds4_gpu_dsv41_indexer_topk_tensor(fast, scores, width, n, k));
                 CHECK(setenv("DS4_METAL_DISABLE_V41_TOPK_SELECT", "1", 1) == 0);
-                CHECK(ds4_gpu_indexer_topk_tensor(slow, scores, width, rows, k));
+                CHECK(ds4_gpu_indexer_topk_tensor(slow, scores, width, n, k));
                 CHECK(unsetenv("DS4_METAL_DISABLE_V41_TOPK_SELECT") == 0);
                 CHECK(ds4_gpu_synchronize());
                 const int32_t *a = ds4_gpu_tensor_contents(fast), *b = ds4_gpu_tensor_contents(slow);
-                for (uint32_t t = 0; t < rows; t++) {
+                for (uint32_t t = 0; t < n; t++) {
                     const float *row = s + (size_t)t * width;
                     const topk_entry *ref = reference + (size_t)t * width;
                     memset(seen, 0, width * sizeof(*seen));
