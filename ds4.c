@@ -40514,7 +40514,7 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
             return ds4_gpu_matmul_q8_0_bf16_tensor(out, m->map, m->size, weight->abs_offset,
                                                    width, outputs, in, count) != 0;
 #endif
-        ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, m->map, m->size,
+        ok = ds4_gpu_dsv41_matmul_q8_0_rows_tensor(out, m->map, m->size,
             weight->abs_offset, width, outputs, in, count);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F16) {
         ok = ds4_gpu_dsv41_projection_rows(out, m->map, m->size,
@@ -40571,7 +40571,7 @@ static bool ds41_output_projection_rows(ds41_gpu_graph *g, ds4_gpu_tensor *out,
     /* Head rows are independent; keep their original reduction and do not
      * add the BF16 rounding used by the attention row-slice helper. */
     if (exact && rows >= 2u && rows <= DS4_TP_BATCH_MAX_ROWS && head.type == DS4_TENSOR_Q8_0 &&
-        ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, m->map, m->size, head.abs_offset,
+        ds4_gpu_dsv41_matmul_q8_0_rows_tensor(out, m->map, m->size, head.abs_offset,
             (uint32_t)head.dim[0], (uint32_t)head.dim[1], in, rows)) return true;
     return ds41_matmul_batch(out, m, &head, in, rows, false);
 }
@@ -71485,6 +71485,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
+    if (opt->dspark && (!opt->mtp_path || !opt->mtp_path[0])) {
+        fprintf(stderr, "ds4: --dspark requires --mtp-model FILE\n");
+        free(e);
+        *out = NULL;
+        return 1;
+    }
     if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
         (!opt->directional_steering_file || !opt->directional_steering_file[0]))
     {
@@ -72136,11 +72142,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-    } else if (e->dspark && e->support_kind != DS4_SUPPORT_DSPARK) {
-        fprintf(stderr, "ds4: --dspark requires --mtp-model FILE\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
     }
 
 #ifndef DS4_NO_GPU

@@ -163,6 +163,12 @@ int ds4_gpu_dsv41_indexer_topk_tensor(ds4_gpu_tensor *selected,
                                       const ds4_gpu_tensor *scores,
                                       uint32_t n_comp, uint32_t n_tokens,
                                       uint32_t top_k);
+/* Exact Q8 rows, plus the matrix rows kernel from three rows (Metal); other
+ * models keep each row's single-row result. */
+int ds4_gpu_dsv41_matmul_q8_0_rows_tensor(ds4_gpu_tensor *out, const void *model_map,
+                                          uint64_t model_size, uint64_t weight_offset,
+                                          uint64_t in_dim, uint64_t out_dim,
+                                          const ds4_gpu_tensor *x, uint32_t n_rows);
 /* Rows with at most 512 visible keys select all of them, in key order. */
 int ds4_gpu_dsv41_indexer_all_batch(ds4_gpu_tensor *selected, uint32_t rows,
                                    uint32_t start, uint32_t ratio);

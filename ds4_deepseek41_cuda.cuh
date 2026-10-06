@@ -493,6 +493,14 @@ extern "C" int ds4_gpu_dsv41_indexer_topk_tensor(ds4_gpu_tensor *selected, const
     return ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k);
 }
 
+extern "C" int ds4_gpu_dsv41_matmul_q8_0_rows_tensor(ds4_gpu_tensor *out, const void *model_map,
+                                                     uint64_t model_size, uint64_t weight_offset,
+                                                     uint64_t in_dim, uint64_t out_dim,
+                                                     const ds4_gpu_tensor *x, uint32_t n_rows) {
+    return ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, model_map, model_size, weight_offset,
+                                                         in_dim, out_dim, x, n_rows);
+}
+
 extern "C" int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
                                                 uint32_t width, uint32_t rows,
                                                 uint32_t start, uint32_t ratio) {
