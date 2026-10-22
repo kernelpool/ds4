@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert DeepSeek V4.1 Flash to DwarfStar's Q2 or Q4_K GGUF.
+"""Convert DeepSeek V4.1 Flash to DwarfStar GGUF, including lossless native weights.
 
 Uses the project's C quantizers. Engram FP8 rows and their scales are packed
 losslessly at the end of the file, outside the main model's resident extent.
@@ -22,7 +22,7 @@ from deepseek41_metadata import GGUF_ALIGNMENT, metadata
 from glm53_quantize import (
     SourceDB, TensorPlan, Quantizer, Imatrix, QTYPE_F32, QTYPE_F16,
     QTYPE_Q8_0, QTYPE_Q2_K, QTYPE_Q4_K, QTYPE_IQ2_XXS, QTYPE_I8, QTYPE_MXFP4, align,
-    conversion_signature, kv_string, load_resume_state, print_plan,
+    conversion_signature, kv_string, kv_bool, load_resume_state, print_plan,
     qtype_nbytes, save_resume_state, tensor_header,
 )
 
@@ -30,6 +30,7 @@ QUANTIZATION = {
     "q2": "IQ2_XXS gate/up; Q2_K down; Q8_0 attention/shared/head",
     "q4": "Q4_K gate/up/down; Q8_0 attention/shared/head",
     "mxfp4": "released MXFP4 gate/up/down; Q8_0 attention/shared/head",
+    "native": "released MXFP4 experts and Engram; lossless F32 dense weights",
 }
 
 
@@ -81,6 +82,8 @@ def build_plan(db, config, quant="q2"):
 
     def regular(name, source, shape, qtype, role):
         claim(source, shape)
+        if quant == "native":
+            qtype = QTYPE_F32
         plan.append(TensorPlan(name, tuple(reversed(shape)), qtype, role, source=source))
 
     regular("token_embd.weight", "embed.weight", (vocab, dim), QTYPE_F16, "embedding")
@@ -133,7 +136,7 @@ def build_plan(db, config, quant="q2"):
             for expert in range(experts):
                 claim(pattern.format(expert=expert), (shape[0], shape[1] // 2), "I8")
             plan.append(TensorPlan(f"{dst}.ffn_{part}_exps.weight", (*reversed(shape), experts),
-                                   QTYPE_MXFP4 if quant == "mxfp4" else QTYPE_Q4_K if quant == "q4" else qt,
+                                   QTYPE_MXFP4 if quant in ("mxfp4", "native") else QTYPE_Q4_K if quant == "q4" else qt,
                                    "experts", source=pattern, expert_layer=layer,
                                    expert_part=part, expert_count=experts))
         if layer in c["engram_layer_ids"]:
@@ -320,6 +323,7 @@ def main():
     parser.add_argument("--hf", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--source-revision", required=True)
+    parser.add_argument("--source-repo", default="deepseek-ai/DeepSeek-V4.1-Flash")
     parser.add_argument("--quant", choices=QUANTIZATION, default="q2")
     parser.add_argument("--imatrix")
     parser.add_argument("--threads", type=int, default=8)
@@ -332,12 +336,25 @@ def main():
         parser.error("source revision must be a full commit hash")
     if not 1 <= args.threads <= 32:
         parser.error("threads must be between 1 and 32")
-    config, records = metadata(args.hf, args.source_revision)
+    if args.quant == "native" and args.imatrix:
+        parser.error("native weights use no imatrix")
+    config, records = metadata(args.hf, args.source_revision, args.source_repo)
     db = SourceDB(args.hf, index_validator=lambda _: None, scale_validator=validate_scales)
     try:
         plan = build_plan(db, config, args.quant)
-        records.append(kv_string("deepseek41.quantization", QUANTIZATION[args.quant]))
-        records.append(kv_string("deepseek41.calibration", "imatrix" if args.imatrix else "weight-energy bootstrap"))
+        quantization = [kv_string("deepseek41.quantization", QUANTIZATION[args.quant]),
+                        kv_string("deepseek41.calibration", "none (lossless)" if args.quant == "native" else
+                                  "imatrix" if args.imatrix else "weight-energy bootstrap")]
+        if args.quant == "native":
+            from deepseek41_metadata import array_record
+            # wo_a is evaluated as BF16 by the reference, with its activation
+            # explicitly rounded before the grouped projection. Other released
+            # FP8 linear weights require native FP8 activation rounding.
+            fp8 = [t.name for t in plan if t.role != "engram_disk" and not t.is_expert and
+                   db.info(t.source)["dtype"] == "F8_E4M3" and ".wo_a." not in t.source]
+            quantization += [kv_bool("deepseek41.native_weights", True),
+                             array_record("deepseek41.native.fp8_inputs", 8, fp8)]
+        records += quantization
         if args.imatrix:
             records.append(kv_string("quantize.imatrix.file", os.path.basename(args.imatrix)))
         if args.dry_run:

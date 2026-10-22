@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Audit a completed V4.1 GGUF and sample its payloads against the source.
+"""Audit a completed V4.1 GGUF against the source.
 
 Checks the complete tensor layout, then re-encodes selected expert tensors and
-samples native Engram rows. This is artifact validation, not inference QA.
+samples Engram rows. The native recipe audits all payloads.
+This is artifact validation, not inference QA.
 """
 import argparse
 import json
@@ -19,9 +20,21 @@ from glm53_quantize import (align, read_exact, read_u32, read_u64,
 from glm53_validate_gguf import read_selected_metadata
 
 
-def check_payload(fp, offset, item, db, quantizer, imatrix):
+def check_payload(fp, offset, item, db, quantizer, imatrix, complete=False):
     if item.role == "engram_disk":
         rows = item.shape[1]
+        if complete:
+            np = quantizer.np
+            for start in range(0, rows, 16384):
+                count = min(16384, rows - start)
+                w = b"".join(db.iter_read(item.source, start * 256, count * 256))
+                s = b"".join(db.iter_read(scale_name(item.source), start * 8, count * 8))
+                expected = np.concatenate((np.frombuffer(w, np.uint8).reshape(count, 256),
+                                           np.frombuffer(s, np.uint8).reshape(count, 8)), axis=1).tobytes()
+                fp.seek(offset + start * 264)
+                if read_exact(fp, len(expected), item.name) != expected:
+                    raise ValueError(f"{item.name}: Engram rows near {start} differ from source")
+            return
         rng = random.Random(41 + rows)
         selected = {0, 1, rows - 1, 16383, 16384, (1 << 32) // 264}
         selected.update(rng.randrange(rows) for _ in range(128))
@@ -36,7 +49,7 @@ def check_payload(fp, offset, item, db, quantizer, imatrix):
     elif item.is_expert:
         selected = {0, (item.expert_layer * 17 + 41) % item.expert_count, item.expert_count - 1}
         stride = item.nbytes // item.expert_count
-        for expert in sorted(selected):
+        for expert in range(item.expert_count) if complete else sorted(selected):
             if item.qtype == QTYPE_MXFP4:
                 expected = quantizer.to_mxfp4(db, item.source.format(expert=expert))
             else:
@@ -69,16 +82,29 @@ def validate(args):
                 key = read_gguf_string(fp, "metadata key")
                 kind = read_u32(fp, "metadata type")
                 if key in {"general.architecture", "general.alignment", "general.source.revision",
-                            "deepseek41.calibration", "deepseek41.quantization"}:
+                            "deepseek41.calibration", "deepseek41.quantization"} or (
+                        args.quant == "native" and key in {"deepseek41.native_weights", "deepseek41.native.fp8_inputs"}):
                     if key in metadata:
                         raise ValueError(f"duplicate metadata: {key}")
-                    metadata[key] = read_selected_metadata(fp, kind)
+                    if key == "deepseek41.native.fp8_inputs":
+                        if kind != 9 or read_u32(fp, "native array type") != 8:
+                            raise ValueError("native FP8 inputs must be a string array")
+                        metadata[key] = [read_gguf_string(fp, "native FP8 input")
+                                         for _ in range(read_u64(fp, "native FP8 input count"))]
+                    else:
+                        metadata[key] = read_selected_metadata(fp, kind)
                 else:
                     skip_gguf_value(fp, kind)
             expected = {"general.architecture": "deepseek41", "general.alignment": GGUF_ALIGNMENT,
                         "general.source.revision": args.source_revision,
                         "deepseek41.quantization": QUANTIZATION[args.quant],
-                        "deepseek41.calibration": "imatrix" if args.imatrix else "weight-energy bootstrap"}
+                        "deepseek41.calibration": "none (lossless)" if args.quant == "native" else
+                            "imatrix" if args.imatrix else "weight-energy bootstrap"}
+            if args.quant == "native":
+                expected["deepseek41.native_weights"] = True
+                expected["deepseek41.native.fp8_inputs"] = [t.name for t in plan
+                    if t.role != "engram_disk" and not t.is_expert and
+                    db.info(t.source)["dtype"] == "F8_E4M3" and ".wo_a." not in t.source]
             if metadata != expected:
                 raise ValueError(f"metadata mismatch: {metadata}")
             for item in plan:
@@ -101,7 +127,7 @@ def validate(args):
                 if args.imatrix and any(t.is_expert and t.name not in imatrix.entries for t in plan):
                     raise ValueError("imatrix is missing expert tensors")
                 for index, item in enumerate(plan):
-                    check_payload(fp, start + item.offset, item, db, q, imatrix)
+                    check_payload(fp, start + item.offset, item, db, q, imatrix, complete=args.quant == "native")
                     if (index + 1) % 25 == 0 or index + 1 == len(plan):
                         print(f"PASS: source payload checks {index + 1}/{len(plan)}", flush=True)
     finally:

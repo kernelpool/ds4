@@ -1991,7 +1991,7 @@ typedef decltype(kernel_mul_mv_t_t<half, half>) mul_mv_t_t;
 template [[host_name("kernel_mul_mv_f32_f32")]] kernel mul_mv_t_t kernel_mul_mv_t_t<float, float>;
 template [[host_name("kernel_mul_mv_f16_f32")]] kernel mul_mv_t_t kernel_mul_mv_t_t<half,  float>;
 
-template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t, bool ROUND = false>
+template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t, bool ROUND = false, bool NATIVE_BF16 = false>
 void kernel_mul_mv_t_t_4_impl(
         args_t args,
         device const char * src0,
@@ -2052,7 +2052,8 @@ void kernel_mul_mv_t_t_4_impl(
 
             float sumq = 0.f;
             FOR_UNROLL (short i = 0; i < NF4; ++i) {
-                sumq += dot(float4(xb4[i]), float4(yl4[i]));
+                const float4 weights = NATIVE_BF16 ? as_type<float4>(uint4(xb4[i]) << 16u) : float4(xb4[i]);
+                sumq += dot(weights, float4(yl4[i]));
             }
 
             sumf[row] += sumq;
@@ -2063,7 +2064,8 @@ void kernel_mul_mv_t_t_4_impl(
 
     for (int i = nb*NB + sgitg*NW + tiisg; i < args.ne00; i += NW*NSG) {
         for (short row = 0; row < NR0; row++) {
-            sumf[row] += ax[row][i] * y[i];
+            if (NATIVE_BF16) sumf[row] += as_type<float>(uint(ax[row][i]) << 16u) * y[i];
+            else sumf[row] += ax[row][i] * y[i];
         }
     }
 
@@ -2072,7 +2074,7 @@ void kernel_mul_mv_t_t_4_impl(
     helper_mv_reduce_and_write<NR0, ROUND>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
-template<typename T0, typename T04, typename T1, typename T14, typename args_t, bool ROUND = false>
+template<typename T0, typename T04, typename T1, typename T14, typename args_t, bool ROUND = false, bool NATIVE_BF16 = false>
 void kernel_mul_mv_t_t_4_disp(
         args_t args,
         device const char * src0,
@@ -2083,9 +2085,9 @@ void kernel_mul_mv_t_t_4_disp(
         ushort tiisg,
         ushort sgitg) {
     switch (args.nr0) {
-        case 1: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 1, args_t, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 2: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 2, args_t, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 4: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 4, args_t, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 1: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 1, args_t, ROUND, NATIVE_BF16>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 2: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 2, args_t, ROUND, NATIVE_BF16>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 4: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 4, args_t, ROUND, NATIVE_BF16>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
     };
 }
 
@@ -2366,6 +2368,18 @@ kernel void kernel_e4m3_blend_owner_r2_bf16(
     }
 
     helper_mv_reduce_and_write<NR0, true>((device float *) dst, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+// Losslessly packed native weights expand into F32 registers, retaining the
+// original F32 kernel's lane partition, dot products and reduction tree.
+kernel void kernel_dsv41_native_bf16_f32_4(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *weights, device const char *x, device char *out,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_t_t_4_disp<ushort, ushort4, float, float4,
+        constant ds4_metal_args_mul_mv &, false, true>(args, weights, x, out, shmem, group, lane, sg);
 }
 
 // The same matvec with its output rounded to bf16.
