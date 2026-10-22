@@ -40971,6 +40971,9 @@ typedef struct {
     /* Rows the unpruned sweep would run here; batched kernels that pick by
      * row count pick for these, so pruned rows match it. 0: the batch's own. */
     uint32_t plan_rows;
+    /* CED replay: decoder window keys before this position are not visible. */
+    uint32_t window_floor;
+    bool shared_folded;              /* the last FFN gate already summed the shared expert */
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
@@ -42873,7 +42876,8 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t start = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (start + count) / ratio : 0;
-    const uint32_t previous = start < 127u ? start : 127u;
+    const uint32_t visible = start > g->window_floor ? start - g->window_floor : 0u;
+    const uint32_t previous = visible < 127u ? visible : 127u;
     const uint32_t raw_start = (start - previous) % 128u;
     const uint32_t first = previous < 128u - raw_start ? previous : 128u - raw_start;
     const uint32_t n_raw = previous + count;
@@ -43106,6 +43110,46 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, l->ffn_exp_probs_b->abs_offset, DS4_N_EXPERT, DS4_N_EXPERT_USED,
             DS4_EXPERT_WEIGHT_SCALE, count);
 #endif
+#ifdef __APPLE__
+    /* Opt-in TP prefill (DS4_METAL_V41_TP_PREFILL_SHARED_SPLIT=1): each rank
+     * takes half the shared expert's hidden width and adds its partial into
+     * the routed partial, so the FFN gate sums both and no rank runs the
+     * whole shared expert. Another summation order, so off by default and
+     * under --quality. */
+    static int shared_split_on = -1;
+    /* the sweep's batched HC combine is the reader that knows the fold */
+    if (shared_split_on < 0) shared_split_on = getenv("DS4_METAL_V41_TP_PREFILL_SHARED_SPLIT") &&
+        !getenv("DS4_METAL_DISABLE_V41_BATCH_HC") && !getenv("DS4_METAL_DISABLE_V41_BATCH_ATTN");
+    const bool shared_split = shared_split_on && !g->quality && !shared_owner && shared_down && g->tp_world == 2 &&
+        !g->verify_prefix && count > DS4_TP_BATCH_MAX_ROWS &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_down_shexp->type == DS4_TENSOR_Q8_0;
+    if (shared_split) {
+        const uint32_t half = DS4_N_FF_EXP / 2u, first = g->tp_rank * half;
+        return (routed ||
+            (ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
+             ds41_route_batch(g, m, l, count))) &&
+            ds41_matmul_rows_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, first, half, count) &&
+            ds41_matmul_rows_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, first, half, count) &&
+            ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
+                count * half, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+            ds4_gpu_dsv41_quantize(b->shared_mid, half, count, DS4_V41_BF16) &&
+            ds4_gpu_matmul_q8_0_kslice_batch_tensor(b->shared, m->map, m->size,
+                l->ffn_down_shexp->abs_offset, DS4_N_FF_EXP, first, half, DS4_N_EMBD,
+                b->shared_mid, count) &&
+            ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+                m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+                gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
+                il, count, &mid_f16, true) &&
+            ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD) &&
+            ds41_sum_partial_batch(g, b->routed, il, DS4_TP_GATE_FFN, count) &&
+            (g->shared_folded = true);
+    }
+#endif
+    g->shared_folded = false;
     return (routed ||
         (ds41_router_batch(g, m, l, count) &&
          ds41_route_batch(g, m, l, count))) &&
@@ -43614,6 +43658,28 @@ static bool ds41_engram_prefetch_start(ds41_engram_prefetch *p, ds41_gpu_graph *
     return true;
 }
 
+/* CED (the V4.1 report's causal encoder-decoder with SWA bounded replay):
+ * decoder layers 20..39 read global keys published from the encoder output
+ * and only a 128-row window of their own. Replay just the last rows of a
+ * sweep through them, their windows truncated to the replayed segment. The
+ * model was post-trained for this; it is not equal to the full forward. */
+static uint32_t ds41_ced_tail(void) {
+    /* Replay 256 rows, so the last 128 see full windows: half the KL to the
+     * full forward of the report's 128-row replay, ~5% slower on 2K appends.
+     * DS4_V41_CED_TAIL=N picks another length (128 = the report's recipe). */
+    static uint32_t tail;
+    if (!tail) {
+        const char *v = getenv("DS4_V41_CED_TAIL");
+        const long t = v ? strtol(v, NULL, 10) : 256;
+        tail = t >= 128 && t <= 4096 ? (uint32_t)t : 256u;
+    }
+    return tail;
+}
+static bool ds41_ced_on(void) {
+    const char *v = getenv("DS4_V41_CED");
+    return v && v[0] == '1';
+}
+
 static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* Wider encoder tiles amortize weight reads near the next power of two.
@@ -43647,15 +43713,19 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud,
                               bool encoder_only, bool resume_encoder) {
     const uint32_t encoder_chunk = ds41_encoder_chunk_cap(g, total_count);
+    /* CED replays through the carry, so it needs the wide sweep's storage. */
+    /* TP ranks reach the same decision from the same sweep and environment. */
+    const bool ced = ds41_ced_on() && !g->streaming && !g->image_count &&
+        total_count >= ds41_ced_tail() + 256u && total_count <= g->carry_cap;
     /* Short sweeps prune the decoder suffix inside the plain schedule's
      * chunks too, with the same kernels per row, so the output is unchanged
      * (DS4_METAL_DISABLE_V41_SUFFIX_ALL=1: whole tiles only). Fresh prompts
      * of 384-511 rows changed the output, so pruning starts at 512. */
     static int suffix_all_off = -1;
     if (suffix_all_off < 0) suffix_all_off = getenv("DS4_METAL_DISABLE_V41_SUFFIX_ALL") != NULL;
-    const bool suffix_all = !suffix_all_off && !g->quality && g->tp_world == 1 && !g->streaming &&
+    const bool suffix_all = !ced && !suffix_all_off && !g->quality && g->tp_world == 1 && !g->streaming &&
         !g->image_count && total_count >= 512u && total_count < 8192u && total_count <= g->carry_cap;
-    const bool wide = total_count > encoder_chunk || suffix_all;
+    const bool wide = total_count > encoder_chunk || ced || suffix_all;
     if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
         total_count > g->ctx - g->pos || g->imatrix || !ds41_tp_batch_enabled(g))
         return false;
@@ -43668,7 +43738,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC");
     /* Layer 20 keeps 1 + (n_layer - 21) * 127 rows and replays the 127 before them. */
     const uint32_t suffix_rows = 1u + (DS4_N_LAYER - 20u) * 127u;
-    const bool decoder_suffix = suffix_all || (wide && total_count >= suffix_rows &&
+    const bool decoder_suffix = ced || suffix_all || (wide && total_count >= suffix_rows &&
         !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX"));
     if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
     uint32_t (*ids)[2][DS4_ENGRAM_COLS] = g->prefill_ids;
@@ -43759,6 +43829,12 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (il == 20u)
                 ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
+            if (ced) {
+                first = total_count - ds41_ced_tail();
+                g->window_floor = initial_start + first;
+            }
+        }
+        if (ok && decoder_suffix && il >= 20u && !ced) {
             const uint32_t needed = 1u + (DS4_N_LAYER - 1u - il) * 127u;
             first = needed < total_count ? total_count - needed : 0u;
             if (suffix_all) {
@@ -43941,7 +44017,10 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false, true);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
-                    ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
+                    ok = (g->shared_folded ?
+                          ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
+                                              (uint64_t)count * DS4_N_EMBD * sizeof(float)) :
+                          ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD)) &&
                         ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, count, DS4_V41_BF16) &&
                         ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                             active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
@@ -44002,6 +44081,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (g->streaming) ds4_gpu_stream_expert_cache_prefetch_finish(true);
 #endif
+    g->window_floor = 0;
     if (!metal_graph_stream_prepare_join_all(&prepare, 1)) ok = false;
     if (g->streaming && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (ok && !encoder_only) {
